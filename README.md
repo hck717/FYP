@@ -119,10 +119,47 @@ We implement a **Citation-Verification Loop** to ensure trust:
 ---
 
 ## 📦 7. Deliverables
-1.  ** Dashboard:** Functional Streamlit web app.
+1.  **UI:** Functional Streamlit web app.
 2.  **Source Code:** Modular Python repo (Ingestion, Agent, UI).
 3.  **Final Thesis:** Report on GraphRAG & Citation-Verification methodology.
 4.  **Investment Theses:** 2-4 distinct, AI-generated reports.
 
 ---
-*Created by Brian - Final Year Project 2026*
+# 📚 Project References & Learning Resources
+
+A curated list of technical resources defining the architecture for **Aletheia: The Agentic Investment Analyst**.
+
+---
+
+## 🛠️ 1. Agent Skills (Modular Capabilities)
+*Standardizing how the agent "loads" expertise.*
+
+*   **[Introducing Agent Skills (Claude Blog)](https://www.claude.com/blog/skills)**  
+    *Primary source for the "Skills" design pattern: standardized folders containing `SKILL.md` manifests and executable scripts.*
+*   **[In-Depth Analysis of Agent Skills (CNBlogs)](https://www.cnblogs.com/sheng-jie/p/19381647)**  
+    *Technical deep-dive on implementing the skills architecture.*
+*   **[Agent Skills Guide (ExplainThis)](https://www.explainthis.io/en/ai/agent-skills)**  
+    *Clear conceptual overview of why modular skills outperform monolithic prompts.*
+*   **[Anthropic Skills Repository (GitHub)](https://github.com/anthropics/skills/tree/main)**  
+    *Official code examples and directory structures to clone for our project.*
+
+---
+
+## 🕸️ 2. GraphRAG & Agentic Architecture
+*Combining Knowledge Graphs with AI Agents.*
+
+*   **[GraphRAG and Agentic Architecture (Neo4j Blog)](https://neo4j.com/blog/developer/graphrag-and-agentic-architecture-with-neoconverse/)**  
+    *The blueprint for our "NeoConverse-style" architecture: using an agent to route queries between Vector Search and Graph Traversal.*
+*   **[Technical Look Inside NeoConverse (Dev.to)](https://dev.to/kislay/graphrag-and-agentic-architecture-a-look-inside-neoconverse-38k7)**  
+    *Detailed implementation notes on the specific Cypher queries and agent routing logic.*
+
+---
+
+## 🧠 3. Orchestration Pattern
+*The "Brain" logic: Plan-and-Execute.*
+
+*   **[LangGraph Tutorial: Plan-and-Execute](https://langchain-ai.github.io/langgraph/tutorials/plan-and-execute/plan-and-execute/)**  
+    *Step-by-step tutorial on building the specific "Planner -> Executor -> Replanner" loop we will use.*
+*   **[Planning Agents (LangChain Blog)](https://blog.langchain.com/planning-agents/)**  
+    *Conceptual justification for why Planning agents are superior for complex, multi-step tasks like financial analysis.*
+
