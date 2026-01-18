@@ -1,4 +1,4 @@
-# 🎓 Aletheia: The Agentic Investment Analyst
+# 🎓 The Agentic Investment Analyst
 ### *An Autonomous, Graph-Augmented Reasoning Engine for Fundamental Equity Analysis*
 
 ![Python](https://img.shields.io/badge/Python-3.10%2B-blue)
@@ -12,7 +12,7 @@
 ## 📖 1. Abstract
 Current AI solutions in finance often suffer from **"black box" opacity** and **hallucinations**. While Large Language Models (LLMs) can summarize text, they lack the structural understanding to identify hidden market risks (e.g., supplier dependencies) or the rigor to justify their claims.
 
-**Aletheia** is an autonomous agent designed to mimic a human analyst’s workflow. Unlike standard retrieval systems, it utilizes a **GraphRAG (Graph Retrieval-Augmented Generation)** architecture to map complex market relationships and an **Iterative Chain-of-Thought (CoT)** engine to "plan, execute, and verify" investment theses. The system produces transparent, evidence-backed reports with pixel-perfect citations, enabling users to audit the AI's reasoning trace.
+**** is an autonomous agent designed to mimic a human analyst’s workflow. Unlike standard retrieval systems, it utilizes a **GraphRAG (Graph Retrieval-Augmented Generation)** architecture to map complex market relationships and an **Iterative Chain-of-Thought (CoT)** engine to "plan, execute, and verify" investment theses. The system produces transparent, evidence-backed reports with pixel-perfect citations, enabling users to audit the AI's reasoning trace.
 
 ---
 
@@ -119,7 +119,7 @@ We implement a **Citation-Verification Loop** to ensure trust:
 ---
 
 ## 📦 7. Deliverables
-1.  **Aletheia Dashboard:** Functional Streamlit web app.
+1.  ** Dashboard:** Functional Streamlit web app.
 2.  **Source Code:** Modular Python repo (Ingestion, Agent, UI).
 3.  **Final Thesis:** Report on GraphRAG & Citation-Verification methodology.
 4.  **Investment Theses:** 2-4 distinct, AI-generated reports.
