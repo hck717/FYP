@@ -340,26 +340,274 @@ The Synthesizer maintains three report templates:
 
 ---
 
-## 📅 8. Implementation Roadmap (12 Weeks)
+## 📅 8. Week-by-Week Implementation Roadmap
+**Project Duration:** February 1 - April 30, 2026 (13 Weeks)
 
-### Phase 1: Infrastructure & Basic Skills (Weeks 1-4)
-- [ ] Set up Docker (Qdrant, Airflow, PostgreSQL for feedback logging).
-- [ ] Build **DAG 1**: Daily Price/News/Filing ingestion.
-- [ ] Implement **Skills 1, 2, 3** (SQL-based fundamentals and valuation).
-- [ ] Create basic LangGraph Supervisor for single-skill queries.
+---
 
-### Phase 2: Multi-Agent Orchestration (Weeks 5-8)
-- [ ] Implement **Skills 4 & 5** (Sentiment and Risk).
-- [ ] Build **Plan-Execute-Synthesize** workflow in LangGraph.
-- [ ] Develop **Summarizer Agent** with three report templates.
-- [ ] Implement request type classification (Q&A / Comparison / Full Analysis).
+### 🔵 Phase 1: Foundation & Data Infrastructure (Weeks 1-4)
 
-### Phase 3: Self-Improvement & Trust (Weeks 9-12)
-- [ ] Implement **Citation-Verification Loop** with Critic Agent.
-- [ ] Build **Self-Improving RAG** feedback collection and boosting logic.
-- [ ] Develop **Streamlit UI** with reasoning visualization and interactive citations.
-- [ ] Implement automated retraining pipeline for weekly embedding updates.
-- [ ] Final Testing: Run 50 diverse queries, collect feedback, measure improvement.
+#### **Week 1: Feb 1-7 | Environment Setup & Data Pipeline Foundation**
+**Milestone:** *Development environment operational with initial data ingestion*
+
+**Tasks:**
+- [ ] Set up project repository structure (`/ingestion`, `/skills`, `/agents`, `/rag`, `/ui`)
+- [ ] Configure Docker Compose (Qdrant, Airflow, PostgreSQL)
+- [ ] Create EODHD API integration scripts for price/fundamentals data
+- [ ] Set up SQLite schema for structured financial data
+- [ ] Initialize Qdrant collection with proper metadata fields
+
+**Deliverable:** Docker stack running + ability to ingest price data for 10 test stocks
+
+---
+
+#### **Week 2: Feb 8-14 | Core Data Ingestion Pipeline**
+**Milestone:** *Automated daily data ingestion operational*
+
+**Tasks:**
+- [ ] Build **Airflow DAG 1**: Daily price/fundamentals ingestion workflow
+- [ ] Implement news article scraping (EODHD Financial News API)
+- [ ] Create ETL scripts for data cleaning and normalization
+- [ ] Set up entity resolution logic (company names → ticker symbols)
+- [ ] Test end-to-end ingestion for 50 stocks
+
+**Deliverable:** Automated pipeline ingesting daily data for S&P 100 stocks
+
+---
+
+#### **Week 3: Feb 15-21 | First Agentic Skill - Fundamental Health**
+**Milestone:** *First deterministic skill functional with SQL queries*
+
+**Tasks:**
+- [ ] Create `skills/fundamental_health/` directory with `SKILL.md` manifest
+- [ ] Implement SQL-based financial health checks:
+  - ROE calculation and thresholds
+  - Debt/EBITDA ratios
+  - Free Cash Flow margin analysis
+- [ ] Build skill testing framework with unit tests
+- [ ] Document skill inputs/outputs/dependencies
+
+**Deliverable:** Skill returns comprehensive health report for any ticker (e.g., AAPL, MSFT)
+
+---
+
+#### **Week 4: Feb 22-28 | Skills 2 & 3 - Valuation & Momentum**
+**Milestone:** *Three core financial analysis skills operational*
+
+**Tasks:**
+- [ ] Implement **Skill 2: Price & Momentum**
+  - Moving averages (50/200 SMA)
+  - RSI calculations
+  - Volume trend analysis
+- [ ] Implement **Skill 3: Valuation Reality**
+  - P/E ratio vs. sector median
+  - Historical P/E comparison
+  - PEG ratio analysis
+- [ ] Create skill orchestration testing suite
+- [ ] Build simple CLI tool to invoke skills manually
+
+**Deliverable:** CLI that accepts ticker + skill name, returns structured JSON output
+
+---
+
+### 🟢 Phase 2: Intelligent Agent Layer (Weeks 5-8)
+
+#### **Week 5: Mar 1-7 | LangGraph Supervisor Foundation**
+**Milestone:** *Basic agentic orchestration working for single-skill queries*
+
+**Tasks:**
+- [ ] Set up LangGraph project structure
+- [ ] Implement basic Supervisor agent:
+  - Intent parser (identify which skill to call)
+  - Single-skill execution flow
+  - Output formatter
+- [ ] Create prompt templates for GPT-4o Supervisor
+- [ ] Test with 20 simple queries ("What is Tesla's P/E ratio?")
+
+**Deliverable:** Agent correctly routes simple questions to appropriate skills
+
+---
+
+#### **Week 6: Mar 8-14 | Multi-Skill Orchestration & Request Classification**
+**Milestone:** *Agent handles complex multi-step queries*
+
+**Tasks:**
+- [ ] Implement request type classifier (Q&A / Comparison / Full Analysis)
+- [ ] Build skill dependency graph (which skills to call in what order)
+- [ ] Implement parallel execution for comparison queries
+- [ ] Create Plan-Execute workflow in LangGraph:
+  - Planner: Generates execution plan
+  - Executor: Runs skills and collects outputs
+- [ ] Test with 15 comparison queries ("Compare NVDA vs AMD margins")
+
+**Deliverable:** Agent executes multi-skill plans for all three query types
+
+---
+
+#### **Week 7: Mar 15-21 | Skills 4 & 5 + RAG Foundation**
+**Milestone:** *All 5 skills operational + basic RAG retrieval working*
+
+**Tasks:**
+- [ ] Implement **Skill 4: Sentiment Analysis**
+  - Integrate FinTwitBERT for news sentiment
+  - Reddit sentiment scraping (PRAW)
+  - Aggregate sentiment scores
+- [ ] Implement **Skill 5: Risk Assessment**
+  - Beta calculations
+  - Volatility metrics (VIX correlation)
+  - Portfolio correlation matrix
+- [ ] Build basic RAG retrieval:
+  - Embed news articles into Qdrant
+  - Implement semantic search
+  - Return top-k relevant chunks
+
+**Deliverable:** Agent can answer "What's the market sentiment on Tesla?" with cited sources
+
+---
+
+#### **Week 8: Mar 22-28 | Synthesizer Agent & Report Templates**
+**Milestone:** *Coherent multi-skill outputs consolidated into formatted reports*
+
+**Tasks:**
+- [ ] Create `agents/synthesizer/` with `SUMMARIZER_SKILL.md`
+- [ ] Implement three report templates:
+  - `qa_template.md` (direct answers)
+  - `comparison_template.md` (side-by-side tables)
+  - `full_analysis_template.md` (5-section report)
+- [ ] Build template rendering engine (Jinja2 or custom)
+- [ ] Implement Summarizer Agent that:
+  - Receives all skill outputs
+  - Consolidates into narrative
+  - Applies appropriate template
+- [ ] Test full analysis reports for 5 stocks
+
+**Deliverable:** Agent generates publication-ready fundamental analysis report for NVDA
+
+---
+
+### 🟪 Phase 3: Trust, Self-Improvement & UI (Weeks 9-13)
+
+#### **Week 9: Mar 29 - Apr 4 | Citation-Verification System**
+**Milestone:** *Every claim in reports backed by verifiable sources*
+
+**Tasks:**
+- [ ] Implement Stage 1: Grounded Generation
+  - Modify Summarizer to require `[chunk:id]` citations
+  - Create system prompts that forbid unsourced claims
+- [ ] Implement Stage 2: Critic Agent
+  - Build NLI-based verification module
+  - Sentence-level claim extraction
+  - Automatic flagging/removal of unsupported claims
+- [ ] Create audit trail logging (PostgreSQL)
+- [ ] Test with 25 queries, measure citation accuracy
+
+**Deliverable:** All generated reports have 90%+ verified citation rate
+
+---
+
+#### **Week 10: Apr 5-11 | Self-Improving RAG Infrastructure**
+**Milestone:** *Feedback loop operational, system learns from usage*
+
+**Tasks:**
+- [ ] Implement `SelfImprovingRAG` class with boost logic
+- [ ] Create feedback collection API:
+  - Log cited chunks per query
+  - Track user ratings
+  - Store query-chunk relevance pairs
+- [ ] Build PostgreSQL schema for:
+  - Query logs
+  - Citation tracking
+  - Performance metrics
+- [ ] Implement real-time boost factor updates
+- [ ] Create analytics dashboard (Jupyter notebook)
+
+**Deliverable:** System tracks and boosts high-performing chunks after 10 test queries
+
+---
+
+#### **Week 11: Apr 12-18 | Streamlit UI Development**
+**Milestone:** *Functional web interface with reasoning visualization*
+
+**Tasks:**
+- [ ] Build Streamlit app structure:
+  - Query input box
+  - Query type selector (Q&A / Compare / Full Analysis)
+  - Real-time streaming output display
+- [ ] Implement Chain-of-Thought visualization:
+  - Plan step (selected skills)
+  - Execute step (skill outputs)
+  - Synthesize step (final report)
+- [ ] Create interactive citation modal:
+  - Click `[chunk:id]` → show source document
+  - Highlight matching sentences
+  - Display provenance chain
+- [ ] Add charting components (Plotly):
+  - Price trends
+  - Sentiment timelines
+
+**Deliverable:** Deployed Streamlit app accessible via localhost
+
+---
+
+#### **Week 12: Apr 19-25 | Automated Retraining & Performance Optimization**
+**Milestone:** *Weekly retraining pipeline operational*
+
+**Tasks:**
+- [ ] Implement weekly retraining workflow:
+  - Extract high-rated query-chunk pairs
+  - Fine-tune embedding model (sentence-transformers)
+  - Reindex Qdrant with updated embeddings
+- [ ] Build **Airflow DAG 2**: Weekly model retraining schedule
+- [ ] Optimize chunk size/overlap based on citation rates
+- [ ] Implement A/B testing framework for retrieval strategies
+- [ ] Performance benchmarking suite:
+  - Measure citation rate improvement
+  - Track query resolution rate
+  - Monitor latency
+
+**Deliverable:** System demonstrates measurable improvement after 1 week of usage
+
+---
+
+#### **Week 13: Apr 26-30 | Final Testing, Documentation & Demo Prep**
+**Milestone:** *Production-ready system with comprehensive documentation*
+
+**Tasks:**
+- [ ] Run 50 diverse test queries:
+  - 20 specific questions
+  - 15 comparisons
+  - 15 full analyses
+- [ ] Collect and analyze performance metrics:
+  - Average citation rate
+  - User satisfaction scores (simulated)
+  - Query resolution rate
+- [ ] Write comprehensive documentation:
+  - Architecture whitepaper (Self-Improving RAG methodology)
+  - API documentation
+  - User guide
+- [ ] Create 5 demo reports (AAPL, TSLA, NVDA, MSFT, GOOGL)
+- [ ] Prepare final presentation materials
+- [ ] Deploy to cloud (optional: Railway/Render for demo)
+
+**Deliverable:** Complete system + documentation + demo reports ready for final submission
+
+---
+
+### 📋 Progress Tracking
+
+**Key Metrics to Monitor Weekly:**
+- [ ] Number of stocks in database
+- [ ] Skills implemented (target: 5)
+- [ ] Test queries passed
+- [ ] Citation accuracy rate
+- [ ] Average query latency
+- [ ] Code coverage percentage
+
+**Risk Mitigation:**
+- **Week 1-2:** If Docker issues arise, use local installations initially
+- **Week 5-6:** If LangGraph complexity is high, start with simpler ReAct pattern
+- **Week 9:** If NLI verification is slow, use rule-based fallback initially
+- **Week 12:** If fine-tuning is unstable, rely on boost factors only
 
 ---
 
