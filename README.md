@@ -611,7 +611,253 @@ The Synthesizer maintains three report templates:
 
 ---
 
-## 📦 9. Deliverables
+## 📊 9. Evaluation Methodology: Measuring Accuracy & Quality
+
+### A. Evaluation Framework Overview
+
+To ensure the system produces reliable, high-quality financial analysis, we implement a **multi-dimensional evaluation framework** that assesses both technical performance and domain-specific accuracy.
+
+---
+
+### B. Quantitative Metrics
+
+#### 1. Factual Accuracy Metrics
+
+**Citation Verification Rate (CVR)**
+- **Definition:** Percentage of factual claims that pass Critic Agent verification
+- **Target:** ≥ 95%
+- **Measurement:**
+  ```python
+  CVR = (Verified Claims / Total Claims) * 100
+  ```
+- **Evaluation Process:**
+  1. Run 50 test queries across different types
+  2. Extract all factual claims from generated reports
+  3. Measure Critic Agent pass rate
+  4. Manually validate 10% of claims against original sources
+
+**Numerical Accuracy Score (NAS)**
+- **Definition:** Precision of numerical data (P/E ratios, revenue figures, margins)
+- **Target:** 100% for SQL-based calculations, ≥ 98% for extracted values
+- **Measurement:**
+  - Compare system outputs against ground truth from official filings
+  - Test set: 100 numerical claims across 20 companies
+  - Tolerance: ±0.1% for percentages, ±$1M for revenue figures
+
+**Temporal Consistency Score (TCS)**
+- **Definition:** Correctness of time-based references (Q3 2024, FY2023, etc.)
+- **Target:** ≥ 99%
+- **Measurement:** Automated check ensuring cited data matches claimed time period
+
+---
+
+#### 2. Retrieval Quality Metrics
+
+**Retrieval Precision@K**
+- **Definition:** Relevance of top-K retrieved chunks to the query
+- **Target:** P@5 ≥ 0.85, P@10 ≥ 0.75
+- **Measurement:**
+  - Human annotators rate chunk relevance (Relevant / Partially Relevant / Irrelevant)
+  - Calculate precision for top-5 and top-10 results
+  - Test set: 30 diverse queries
+
+**Citation Utilization Rate (CUR)**
+- **Definition:** Percentage of retrieved chunks actually cited in final answer
+- **Target:** ≥ 60% (indicates efficient retrieval, not over-fetching)
+- **Measurement:**
+  ```python
+  CUR = (Cited Chunks / Retrieved Chunks) * 100
+  ```
+
+**Mean Reciprocal Rank (MRR)**
+- **Definition:** Average rank position of the first relevant chunk
+- **Target:** ≥ 0.80
+- **Formula:** 
+  \[
+  MRR = \frac{1}{|Q|} \sum_{i=1}^{|Q|} \frac{1}{\text{rank}_i}
+  \]
+
+---
+
+#### 3. System Performance Metrics
+
+**Query Resolution Rate (QRR)**
+- **Definition:** Percentage of queries successfully answered (vs. "insufficient data")
+- **Target:** ≥ 92%
+- **Breakdown by query type:**
+  - Specific Questions: ≥ 98%
+  - Comparisons: ≥ 90%
+  - Full Analyses: ≥ 88%
+
+**Average Response Latency**
+- **Target:** 
+  - Specific Questions: < 5 seconds
+  - Comparisons: < 12 seconds
+  - Full Analyses: < 20 seconds
+- **Measurement:** End-to-end time from query submission to complete report generation
+
+**Self-Improvement Rate**
+- **Definition:** Measurable quality increase over time
+- **Target:** +5% citation precision per week for first month
+- **Measurement:**
+  - Run identical 20-query benchmark at Week 10, 11, 12, 13
+  - Track CVR, P@5, CUR improvements
+
+---
+
+### C. Qualitative Evaluation
+
+#### 1. Financial Domain Accuracy Assessment
+
+**Expert Review Panel**
+- **Method:** Recruit 2-3 finance professionals (CFA holders or equity analysts)
+- **Task:** Blind evaluation of 15 full analysis reports
+- **Scoring Criteria (1-5 scale):**
+  - **Analytical Depth:** Comprehensiveness of fundamental analysis
+  - **Insight Quality:** Value-add beyond raw data retrieval
+  - **Risk Identification:** Accuracy in flagging material risks
+  - **Valuation Reasonableness:** Sound logic in valuation assessments
+  - **Recommendation Validity:** Appropriateness of investment thesis
+
+**Target:** Average score ≥ 4.0/5.0 across all criteria
+
+---
+
+#### 2. Report Quality Dimensions
+
+**Coherence & Readability**
+- **Method:** Use automated readability metrics + human evaluation
+- **Metrics:**
+  - Flesch Reading Ease Score: 50-70 (college-level)
+  - Logical flow: No contradictions within report
+  - Transition quality: Smooth section connections
+- **Measurement:** 10 reports reviewed by 3 independent readers
+
+**Completeness (Full Analysis Reports)**
+- **Checklist:**
+  - [ ] Company business model explained
+  - [ ] At least 5 key financial metrics cited
+  - [ ] Valuation vs. peers comparison included
+  - [ ] Risk factors identified (min 3)
+  - [ ] Clear investment thesis stated
+- **Target:** 100% completeness rate
+
+**Citation Quality**
+- **Dimensions:**
+  - **Density:** 0.5-1.5 citations per sentence (avoid under/over-citing)
+  - **Relevance:** Citation directly supports the claim
+  - **Recency:** Prefer sources < 6 months old (for news/sentiment)
+  - **Authority:** Prioritize official filings > analyst reports > news
+- **Measurement:** Manual audit of 50 random citations
+
+---
+
+### D. Comparative Benchmarking
+
+#### Baseline Comparisons
+
+To demonstrate system superiority, we compare against:
+
+**1. Traditional RAG (Without Self-Improvement)**
+- Same architecture minus feedback loops
+- Comparison metrics: CVR, P@5, QRR
+- Expected improvement: +8-12% across metrics
+
+**2. GPT-4o Direct Prompting (No RAG)**
+- Pure LLM with system prompt for financial analysis
+- Measures hallucination rate difference
+- Expected: 3-5x lower hallucination rate with our system
+
+**3. Public Financial AI Tools (if accessible)**
+- Bloomberg GPT, FinGPT outputs (where available)
+- Focus on citation quality and factual accuracy
+
+---
+
+### E. Test Dataset Construction
+
+#### Diverse Query Set (50 Queries)
+
+**Specific Questions (20 queries)**
+- 5 valuation queries ("What is [TICKER]'s P/E ratio?")
+- 5 fundamental queries ("What is [TICKER]'s debt-to-equity ratio?")
+- 5 sentiment queries ("What's the market sentiment on [TICKER]?")
+- 5 risk queries ("What are the key risks for [TICKER]?")
+
+**Comparative Analysis (15 queries)**
+- 5 same-sector comparisons ("Compare NVDA vs AMD margins")
+- 5 cross-sector comparisons ("Compare AAPL vs TSLA revenue growth")
+- 5 metric-focused comparisons ("Which has better FCF: GOOGL or META?")
+
+**Full Analysis (15 queries)**
+- 5 large-cap tech (AAPL, MSFT, GOOGL, AMZN, META)
+- 5 mid-cap diversified (TSM, BYD, NVDA, AMD, ASML)
+- 5 challenging cases (recent IPOs, turnaround stories, controversial stocks)
+
+---
+
+### F. Evaluation Schedule
+
+**Continuous Evaluation (During Development)**
+- Week 9: Initial CVR measurement (target: 85%)
+- Week 10: First self-improvement test (baseline)
+- Week 11: Mid-iteration improvement check
+- Week 12: Pre-deployment full evaluation
+
+**Final Evaluation (Week 13)**
+1. **Day 1-2:** Run 50-query benchmark, collect all metrics
+2. **Day 3:** Expert panel review session
+3. **Day 4:** Comparative benchmarking
+4. **Day 5:** Compile evaluation report with visualizations
+
+---
+
+### G. Success Criteria Summary
+
+| Metric | Target | Critical? |
+|--------|--------|----------|
+| Citation Verification Rate | ≥ 95% | ✅ Yes |
+| Numerical Accuracy Score | ≥ 98% | ✅ Yes |
+| Retrieval Precision@5 | ≥ 0.85 | ✅ Yes |
+| Query Resolution Rate | ≥ 92% | ✅ Yes |
+| Expert Review Score | ≥ 4.0/5.0 | ✅ Yes |
+| Response Latency (Q&A) | < 5s | ❌ No |
+| Self-Improvement Rate | +5%/week | ❌ No |
+| Citation Utilization Rate | ≥ 60% | ❌ No |
+
+**Passing Criteria:** All "Critical" metrics must meet targets for project success.
+
+---
+
+### H. Evaluation Tools & Infrastructure
+
+**Automated Testing Suite**
+```python
+# evaluation/benchmark.py
+class EvaluationFramework:
+    def run_benchmark(self, query_set):
+        results = []
+        for query in query_set:
+            response = self.agent.process(query)
+            results.append({
+                'query': query,
+                'cvr': self.calculate_cvr(response),
+                'latency': response.latency,
+                'cited_chunks': len(response.citations),
+                'critic_pass': response.critic_score
+            })
+        return self.aggregate_metrics(results)
+```
+
+**Human Evaluation Interface**
+- Streamlit app for expert reviewers
+- Side-by-side comparison of system output vs. ground truth
+- Rating forms with 5-point Likert scales
+- Citation verification checklist
+
+---
+
+## 📦 10. Deliverables
 1.  **UI:** Functional Streamlit web app with three query modes (Q&A, Comparison, Full Analysis).
 2.  **Source Code:** Modular Python repo organized by layers:
     - `/ingestion`: Airflow DAGs and ETL scripts
@@ -619,11 +865,14 @@ The Synthesizer maintains three report templates:
     - `/agents`: Supervisor, Summarizer, and Critic implementations
     - `/rag`: Self-improving retrieval logic
     - `/ui`: Streamlit interface
+    - `/evaluation`: Benchmarking and evaluation scripts
 3.  **Documentation:** 
     - Architecture whitepaper explaining Self-Improving RAG
     - Citation-Verification methodology report
     - Performance benchmarks showing improvement over time
+    - **Evaluation Report:** Comprehensive metrics + expert review findings
 4.  **Demo Reports:** 5 example outputs covering all three request types with audit trails.
+5.  **Evaluation Dataset:** Curated 50-query test set with ground truth annotations.
 
 ---
 
@@ -690,3 +939,15 @@ A curated list of technical resources defining the architecture for **The Agenti
     *Financial domain adaptation techniques and datasets.*
 *   **[Financial Statement Analysis with LLMs (Papers with Code)](https://paperswithcode.com/task/financial-statement-analysis)**  
     *Latest research on automating fundamental analysis.*
+
+---
+
+## 📊 6. RAG Evaluation & Benchmarking
+*Methodologies for measuring RAG system quality.*
+
+*   **[RAGAS: RAG Assessment Framework](https://github.com/explodinggradients/ragas)**  
+    *Automated metrics for RAG evaluation including faithfulness and answer relevancy.*
+*   **[TruLens for LLM Evaluation](https://www.trulens.org/)**  
+    *Observability and evaluation tools for LLM applications.*
+*   **[LangChain Evaluators](https://python.langchain.com/docs/guides/evaluation/)**  
+    *Built-in evaluation tools for assessing agent performance.*
