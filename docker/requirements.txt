@@ -1,0 +1,10 @@
+apache-airflow-providers-postgres
+langchain
+langgraph
+qdrant-client
+openai
+pandas
+numpy
+yfinance
+plotly
+requests
