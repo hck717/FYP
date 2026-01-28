@@ -11,7 +11,8 @@ x-airflow-common:
     AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
     AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
     AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
-    AIRFLOW_UID: ${AIRFLOW_UID}
+    # Hardcoded UID to avoid missing variable issues
+    AIRFLOW_UID: 50000
   volumes:
     - ./ingestion/dags:/opt/airflow/dags
     - ./data/logs:/opt/airflow/logs
@@ -37,9 +38,10 @@ services:
     image: postgres:15
     container_name: fyp-postgres
     environment:
-      POSTGRES_USER: ${POSTGRES_USER}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-      POSTGRES_DB: ${POSTGRES_DB}
+      # HARDCODED CREDENTIALS to fix startup error
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
     volumes:
       - ./data/postgres_data:/var/lib/postgresql/data
     healthcheck:

@@ -1,4 +1,5 @@
-FROM apache/airflow:2.8.1
+# Changed from 2.8.1 to 2.9.1-python3.11 to support LangGraph
+FROM apache/airflow:2.9.1-python3.11
 
 USER root
 RUN apt-get update \
