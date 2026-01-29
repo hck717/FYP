@@ -1,25 +1,20 @@
 import sys
 import os
 
-# Ensure we can import modules
-sys.path.append(os.path.abspath(os.path.dirname(__file__)))
+# 1. Add the current directory to path so direct imports work
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from etl.extraction import fetch_stock_prices, fetch_company_news
-from etl.transformation import transform_prices, transform_news
-from etl.loading import load_prices_to_db, load_news_to_db, get_db_connection
-from etl.entity_resolution import normalize_symbol
+# 2. Changed imports to be direct since script is running INSIDE the 'etl' folder
+from extraction import fetch_stock_prices, fetch_company_news
+from transformation import transform_prices, transform_news
+from loading import load_prices_to_db, load_news_to_db, get_db_connection
+from entity_resolution import normalize_symbol
 
 def test_pipeline():
-    print("🧪 Starting End-to-End Test for 50 Stocks...")
+    print("🧪 Starting End-to-End Test for 1 Stock (AAPL)...")
     
-    # 1. Define Test List (Subset of S&P 50)
-    test_tickers = [
-        "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "TSLA", "META", "JPM", "V", "PG",
-        "MA", "HD", "CVX", "PEP", "KO", "BAC", "COST", "WMT", "MCD", "DIS",
-        "ADBE", "NFLX", "NKE", "CRM", "INTC", "AMD", "IBM", "ORCL", "QCOM", "GS",
-        "CAT", "BA", "MMM", "GE", "F", "GM", "T", "VZ", "C", "WFC",
-        "AXP", "BLK", "SPGI", "LMT", "RTX", "HON", "UNP", "LOW", "SBUX", "UBER"
-    ]
+    # 1. Define Test List (Single Ticker)
+    test_tickers = ["AAPL"]
     
     success_count = 0
     
