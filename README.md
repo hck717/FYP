@@ -19,6 +19,21 @@ docker-compose up --build -d
 - Airflow UI: http://localhost:8080 (admin/admin)
 - Qdrant dashboard: http://localhost:6333/dashboard
 
+### 🔍 Visual Inspection (Recommended)
+
+You can inspect the ingested SQLite database locally using [DB Browser for SQLite](https://sqlitebrowser.org/).
+
+1. **Copy the database out of Docker to your Mac:**
+   ```bash
+   docker cp fyp-airflow-scheduler-1:/opt/airflow/data/finance.db ./finance_backup.db
+   ```
+
+2. **Open it in DB Browser:**
+   - Open **DB Browser for SQLite**
+   - Click **Open Database** → select `finance_backup.db`
+   - Go to **Browse Data** tab
+   - Choose tables: `stock_prices` or `financial_news`
+
 For full setup details, see `docs/setup_guide.md`.
 
 ---
