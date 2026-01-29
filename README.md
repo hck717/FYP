@@ -19,7 +19,7 @@ docker-compose up --build -d
 - Airflow UI: http://localhost:8080 (admin/admin)
 - Qdrant dashboard: http://localhost:6333/dashboard
 
-### 🔍 Visual Inspection (Recommended)
+### 🔍 Visual Inspection for data in SQLlite (Recommended)
 
 You can inspect the ingested SQLite database locally using [DB Browser for SQLite](https://sqlitebrowser.org/).
 
@@ -35,6 +35,73 @@ You can inspect the ingested SQLite database locally using [DB Browser for SQLit
    - Choose tables: `stock_prices` or `financial_news`
 
 For full setup details, see `docs/setup_guide.md`.
+
+### Commands needed to excute the 6 DAGs
+These are the CLI commands to manually execute each of your 6 DAGs (from the DAG files currently under `ingestion/dags/`) .
+
+## 0) Set scheduler container var
+Use this so you don’t need to hardcode `...-1`:
+
+```bash
+# Works on most setups (docker compose v2). If you use docker-compose v1, use the second line.
+SCHED=$(docker compose ps -q airflow-scheduler)
+# SCHED=$(docker-compose ps -q airflow-scheduler)
+
+docker exec -it $SCHED airflow dags list
+```
+
+## 1) Trigger each DAG
+Run these one by one:
+
+```bash
+docker exec -it $SCHED airflow dags unpause daily_equity_ingestion
+docker exec -it $SCHED airflow dags trigger  daily_equity_ingestion
+```
+
+```bash
+docker exec -it $SCHED airflow dags unpause macro_data_ingestion
+docker exec -it $SCHED airflow dags trigger  macro_data_ingestion
+```
+
+```bash
+docker exec -it $SCHED airflow dags unpause risk_metrics_ingestion
+docker exec -it $SCHED airflow dags trigger  risk_metrics_ingestion
+```
+
+```bash
+docker exec -it $SCHED airflow dags unpause social_media_ingestion
+docker exec -it $SCHED airflow dags trigger  social_media_ingestion
+```
+
+```bash
+docker exec -it $SCHED airflow dags unpause sentiment_processing
+docker exec -it $SCHED airflow dags trigger  sentiment_processing
+```
+
+```bash
+docker exec -it $SCHED airflow dags unpause weekly_model_retraining
+docker exec -it $SCHED airflow dags trigger  weekly_model_retraining
+```
+
+## 2) Check run status
+Example (replace DAG_ID as needed):
+
+```bash
+docker exec -it $SCHED airflow dags list-runs -d daily_equity_ingestion
+```
+
+## 3) View task logs (quick way)
+1) List tasks in a DAG:
+```bash
+docker exec -it $SCHED airflow tasks list daily_equity_ingestion
+```
+
+2) After you get the `run_id` from `list-runs`, fetch logs:
+```bash
+# Replace TASK_ID and RUN_ID with what you see in Airflow
+docker exec -it $SCHED airflow tasks logs daily_equity_ingestion ingest_equity_data RUN_ID
+```
+
 
 ---
 
