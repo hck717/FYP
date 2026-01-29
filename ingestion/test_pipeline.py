@@ -1,14 +1,14 @@
 import sys
 import os
 
-# 1. Add the current directory to path so direct imports work
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+# Ensure we can import modules
+# Since this script will be run from /opt/airflow/, we ensure that path is in sys.path
+sys.path.append('/opt/airflow')
 
-# 2. Changed imports to be direct since script is running INSIDE the 'etl' folder
-from extraction import fetch_stock_prices, fetch_company_news
-from transformation import transform_prices, transform_news
-from loading import load_prices_to_db, load_news_to_db, get_db_connection
-from entity_resolution import normalize_symbol
+from etl.extraction import fetch_stock_prices, fetch_company_news
+from etl.transformation import transform_prices, transform_news
+from etl.loading import load_prices_to_db, load_news_to_db, get_db_connection
+from etl.entity_resolution import normalize_symbol
 
 def test_pipeline():
     print("🧪 Starting End-to-End Test for 1 Stock (AAPL)...")
