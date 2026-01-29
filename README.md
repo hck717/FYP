@@ -370,7 +370,77 @@ The Synthesizer maintains three report templates:
 
 ---
 
-## 📅 8. Week-by-Week Implementation Roadmap
+Based on your project's architecture and the specific data sources you listed, here is the Markdown text for the new README section.
+
+I have organized it into **Primary Ingestion DAGs** (fetching raw data) and **Processing/Enrichment DAGs** (calculating derived metrics like sentiment). I also added the **Self-Improvement DAG** which is critical for your "Agentic" goals.
+
+***
+
+## 8.⚙️ Data Pipelines (Airflow DAGs)
+
+The system relies on **6 core Airflow DAGs** to ensure the Knowledge Base remains fresh, comprehensive, and increasingly intelligent.
+
+### 1. Core Equity Data (`daily_equity_ingestion`)
+*   **Frequency:** Daily (@market_close)
+*   **Source:** EODHD
+*   **Data Points:**
+    *   **Price:** OHLCV (Open, High, Low, Close, Volume)
+    *   **Fundamentals:** P/E, EPS, Debt-to-Equity, Free Cash Flow (updated on new filings)
+    *   **Corporate News:** Official press releases and major financial news wires
+*   **Purpose:** The backbone of the system. Provides the raw quantitative and qualitative data required for **Skill 1 (Health)** and **Skill 2 (Momentum)**.
+
+### 2. Macroeconomic Context (`macro_data_ingestion`)
+*   **Frequency:** Weekly (Friday)
+*   **Source:** FRED (Federal Reserve Economic Data) / EODHD Macro
+*   **Data Points:**
+    *   GDP Growth Rate
+    *   CPI / Inflation Data
+    *   Fed Funds Rate & 10Y Treasury Yields
+    *   Unemployment Rate
+*   **Purpose:** Allows the Supervisor Agent to adjust investment strategies based on the economic cycle (e.g., defensive vs. growth positioning).
+
+### 3. Market Risk & Volatility (`risk_metrics_ingestion`)
+*   **Frequency:** Daily
+*   **Source:** yfinance / EODHD
+*   **Data Points:**
+    *   **VIX:** The "Fear Index" to gauge market stress
+    *   **Sector Performance:** Tracking rotation (e.g., Tech vs. Utilities)
+    *   **Beta Calculation:** Rolling 60-day beta for all tracked stocks
+*   **Purpose:** Feeds **Skill 5 (Risk Assessment)** to warn users if a stock is behaving erratically compared to the broader market.
+
+### 4. Social Sentiment (`social_media_ingestion`)
+*   **Frequency:** Daily (or Hourly during high volatility)
+*   **Source:** Reddit API (PRAW)
+*   **Targets:** r/investing, r/stocks, r/wallstreetbets, r/SecurityAnalysis
+*   **Data Points:** Top daily discussions, ticker mentions, and upvote ratios.
+*   **Purpose:** Captures "Retail Sentiment" which often diverges from institutional news, crucial for detecting meme-stock behavior.
+
+### 5. NLP Enrichment Engine (`sentiment_processing`)
+*   **Frequency:** Triggered after DAG 1 & 4
+*   **Source:** Local LLM / Hugging Face (FinTwitBERT)
+*   **Action:**
+    *   Reads raw text from `financial_news` and `social_posts` tables.
+    *   Runs inference to generate a scalar sentiment score (-1.0 to +1.0).
+    *   Extracts named entities (CEO names, product launches).
+*   **Purpose:** Feeds **Skill 4 (Sentiment Analysis)**. We pre-compute this because running BERT models in real-time during a user query is too slow.
+
+### 6. System Self-Improvement (`weekly_model_retraining`)
+*   **Frequency:** Weekly (Sunday)
+*   **Source:** System Query Logs (PostgreSQL)
+*   **Action:**
+    *   Identifies "Successful Retrievals" (chunks cited in highly-rated answers).
+    *   Fine-tunes the embedding model or updates Qdrant payload weights.
+*   **Purpose:** The "Learning" component. Ensures the RAG system gets smarter about *what* to retrieve based on what users actually find useful.
+
+***
+
+### 🔮 Potential Future DAGs
+*   **SEC Filing Parser:** If EODHD fundamentals lack granularity, a dedicated DAG to parse 10-K/10-Q HTML files directly from EDGAR.
+*   **Insider Trading Tracker:** Monitoring Form 4 filings for C-suite buy/sell activity.
+
+
+
+## 📅 9. Week-by-Week Implementation Roadmap
 **Project Duration:** February 1 - April 30, 2026 (13 Weeks)
 
 ---
