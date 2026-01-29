@@ -8,10 +8,10 @@ def load_prices_to_db(df: pd.DataFrame):
     
     conn = get_db_connection()
     try:
-        # Append data, ignore duplicates handled by DB constraint if possible
-        # Or simpler: Iterative insert with 'OR IGNORE'
         cursor = conn.cursor()
-        data = df.to_records(index=False)
+        # Convert DataFrame to list of tuples (standard Python types)
+        # using to_records() passes numpy types which can be stored as BLOBs in SQLite
+        data = df.values.tolist()
         
         cursor.executemany('''
             INSERT OR IGNORE INTO stock_prices (symbol, date, open, high, low, close, volume)
@@ -30,7 +30,8 @@ def load_news_to_db(df: pd.DataFrame):
     conn = get_db_connection()
     try:
         cursor = conn.cursor()
-        data = df.to_records(index=False)
+        # Convert to list of python types to avoid numpy/adapter issues
+        data = df.values.tolist()
         
         cursor.executemany('''
             INSERT OR IGNORE INTO financial_news (symbol, date, title, content, source, url, sentiment_score)
