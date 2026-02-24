@@ -8,25 +8,26 @@ Provides:
   - PostgreSQL: sentiment_trends data
   - Utility: JSON extraction, BM25 scoring
 
-Host resolution strategy:
-  .env sets Docker-internal hostnames (neo4j, qdrant, postgres) for Airflow DAGs
-  running inside Docker. When the agent is run from the Mac terminal, those
-  hostnames don't DNS-resolve. Each connector tries the configured host first,
-  then automatically retries with 'localhost'. No .env changes required.
+Host resolution:
+  Each connector tries .env hostname (Docker-internal) first, then localhost.
+  No .env changes needed when running from Mac terminal.
 
-Import design — ALL heavy packages are lazy-imported inside their getter:
-  neo4j            → get_neo4j_driver()
-  qdrant_client    → get_qdrant()
-  sentence_transformers / torch → get_embedder() / get_reranker()
-  rank_bm25        → inside hybrid_retrieve()
+Import design — ALL heavy packages lazy-imported inside getters:
+  neo4j / pandas       → get_neo4j_driver()
+  qdrant_client        → get_qdrant()
+  sentence_transformers→ get_embedder() / get_reranker()
 
-This means the module can be imported (and all unit tests collected) on ANY
-venv regardless of whether neo4j, torch, or pandas are working correctly.
+Embedding model resolution:
+  .env may set EMBEDDING_MODEL=nomic-embed-text (Ollama name).
+  sentence-transformers uses HuggingFace IDs, not Ollama names.
+  We map known Ollama names → HuggingFace equivalents, then fall back
+  to all-MiniLM-L6-v2 if the resolved model still fails to load.
 """
 import os
 import re
 import json
 import logging
+import warnings
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -34,20 +35,19 @@ import psycopg2
 import psycopg2.extras
 from dotenv import load_dotenv
 
-# rank_bm25 — lightweight, safe to import at module level
 try:
     from rank_bm25 import BM25Okapi
     BM25_AVAILABLE = True
 except ImportError:
     BM25_AVAILABLE = False
 
-# NOTE: neo4j, qdrant_client, sentence_transformers are NOT imported here.
-# They are imported lazily inside their respective getter functions.
-
 load_dotenv(dotenv_path=Path(__file__).resolve().parents[2] / ".env")
 logger = logging.getLogger(__name__)
 
-# ── Config ─────────────────────────────────────────────────────────────────────
+# Suppress neo4j schema-warning noise (missing props/rels printed for every query)
+logging.getLogger("neo4j.notifications").setLevel(logging.ERROR)
+
+# ── Config ──────────────────────────────────────────────────────────────────
 NEO4J_URI      = os.getenv("NEO4J_URI",      "bolt://localhost:7687")
 NEO4J_USER     = os.getenv("NEO4J_USER",     "neo4j")
 NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "changeme_neo4j_password")
@@ -63,18 +63,34 @@ PG_DB          = os.getenv("POSTGRES_DB",       "airflow")
 PG_USER        = os.getenv("POSTGRES_USER",     "airflow")
 PG_PASS        = os.getenv("POSTGRES_PASSWORD", "airflow")
 
-EMBED_MODEL    = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
-RERANK_MODEL   = os.getenv("RERANKER_MODEL",  "cross-encoder/ms-marco-MiniLM-L-6-v2")
+_EMBED_MODEL_RAW = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
+RERANK_MODEL     = os.getenv("RERANKER_MODEL",  "cross-encoder/ms-marco-MiniLM-L-6-v2")
+
+# ── Embedding model name resolution ──────────────────────────────────────────────
+# .env may use Ollama model names. Map them to HuggingFace sentence-transformers IDs.
+_OLLAMA_TO_HF: Dict[str, str] = {
+    "nomic-embed-text":          "nomic-ai/nomic-embed-text-v1",
+    "nomic-embed-text:latest":   "nomic-ai/nomic-embed-text-v1",
+    "mxbai-embed-large":         "mixedbread-ai/mxbai-embed-large-v1",
+    "mxbai-embed-large:latest":  "mixedbread-ai/mxbai-embed-large-v1",
+    "all-minilm":                "all-MiniLM-L6-v2",
+    "all-minilm:latest":         "all-MiniLM-L6-v2",
+    "bge-large":                 "BAAI/bge-large-en-v1.5",
+    "bge-m3":                    "BAAI/bge-m3",
+}
+_EMBED_FALLBACK = "all-MiniLM-L6-v2"  # always works, 384-dim, no HF login needed
+
+EMBED_MODEL = _OLLAMA_TO_HF.get(_EMBED_MODEL_RAW, _EMBED_MODEL_RAW)
 
 # ── Lazy-loaded singletons ─────────────────────────────────────────────────────
 _embedder:      Any = None
 _reranker:      Any = None
 _neo4j_driver:  Any = None
 _qdrant_client: Any = None
+_embed_model_used: str = EMBED_MODEL  # track which model actually loaded
 
 
 def _neo4j_localhost_uri() -> str:
-    """Swap Docker hostname in NEO4J_URI for 'localhost'."""
     m = re.match(r"(bolt://)([^:]+)(:\d+)", NEO4J_URI)
     return f"{m.group(1)}localhost{m.group(3)}" if m else "bolt://localhost:7687"
 
@@ -82,17 +98,37 @@ def _neo4j_localhost_uri() -> str:
 # ── Getters ────────────────────────────────────────────────────────────────────
 
 def get_embedder():
-    """Lazy-load SentenceTransformer — torch is only touched here."""
-    global _embedder
-    if _embedder is None:
-        from sentence_transformers import SentenceTransformer  # noqa: lazy
-        logger.info(f"[tools] Loading embedder: {EMBED_MODEL}")
-        _embedder = SentenceTransformer(EMBED_MODEL)
-    return _embedder
+    """
+    Lazy-load SentenceTransformer.
+    Tries EMBED_MODEL (HF-resolved from .env) first.
+    Falls back to all-MiniLM-L6-v2 if that model fails (e.g. needs HF login,
+    wrong dimension, download error).
+    """
+    global _embedder, _embed_model_used
+    if _embedder is not None:
+        return _embedder
+
+    from sentence_transformers import SentenceTransformer  # noqa: lazy
+
+    models_to_try = [EMBED_MODEL]
+    if EMBED_MODEL != _EMBED_FALLBACK:
+        models_to_try.append(_EMBED_FALLBACK)
+
+    for model_name in models_to_try:
+        try:
+            logger.info(f"[tools] Loading embedder: {model_name}")
+            _embedder = SentenceTransformer(model_name, trust_remote_code=True)
+            _embed_model_used = model_name
+            logger.info(f"[tools] Embedder ready: {model_name}")
+            return _embedder
+        except Exception as e:
+            logger.warning(f"[tools] Embedder load failed ({model_name}): {e}")
+
+    raise RuntimeError(f"[tools] Could not load any embedding model. Tried: {models_to_try}")
 
 
 def get_reranker():
-    """Lazy-load CrossEncoder — torch is only touched here."""
+    """Lazy-load CrossEncoder."""
     global _reranker
     if _reranker is None:
         from sentence_transformers import CrossEncoder  # noqa: lazy
@@ -103,15 +139,14 @@ def get_reranker():
 
 def get_neo4j_driver():
     """
-    Lazy-import neo4j (+ its pandas dep) only when first called.
-    Tries NEO4J_URI (Docker host) first, then localhost fallback.
+    Lazy-import neo4j. Tries Docker URI first, then localhost fallback.
     """
     global _neo4j_driver
     if _neo4j_driver is not None:
         return _neo4j_driver
 
     try:
-        from neo4j import GraphDatabase  # noqa: lazy
+        from neo4j import GraphDatabase  # noqa: lazy (pulls pandas)
     except Exception as e:
         logger.warning(f"[tools] neo4j import failed: {e}")
         return None
@@ -138,8 +173,7 @@ def get_neo4j_driver():
 
 def get_qdrant():
     """
-    Lazy-import qdrant_client only when first called.
-    Tries QDRANT_HOST (Docker host) first, then localhost fallback.
+    Lazy-import qdrant_client. Tries Docker host first, then localhost fallback.
     """
     global _qdrant_client
     if _qdrant_client is not None:
@@ -172,10 +206,7 @@ def get_qdrant():
 # ── PostgreSQL: Sentiment ──────────────────────────────────────────────────────
 
 def fetch_sentiment(ticker: str) -> Dict:
-    """
-    Fetch latest sentiment_trends row for ticker.
-    Tries PG_HOST (Docker name) first, then localhost.
-    """
+    """Fetch latest sentiment_trends row. Tries PG_HOST then localhost."""
     hosts = [PG_HOST]
     if PG_HOST != "localhost":
         hosts.append("localhost")
@@ -216,7 +247,7 @@ def fetch_sentiment(ticker: str) -> Dict:
         trend  = "stable"
         if len(rows) == 2:
             diff = float(latest.get("bullish_pct") or 0) - float(rows[1].get("bullish_pct") or 0)
-            if diff > 3:   trend = "improving"
+            if diff > 3:    trend = "improving"
             elif diff < -3: trend = "deteriorating"
 
         return {
@@ -231,7 +262,7 @@ def fetch_sentiment(ticker: str) -> Dict:
         return {}
 
 
-# ── Neo4j: Company properties ──────────────────────────────────────────────────
+# ── Neo4j queries ────────────────────────────────────────────────────────────────
 
 def fetch_company_profile(ticker: str) -> Dict:
     driver = get_neo4j_driver()
@@ -261,19 +292,42 @@ def fetch_company_profile(ticker: str) -> Dict:
 
 
 def fetch_graph_facts(ticker: str, keyword: str = "business") -> List[str]:
+    """
+    Flexible Cypher that works even when graph edges don't exist yet.
+    Falls back to a broader company-description search if no relationship edges found.
+    """
     driver = get_neo4j_driver()
     if not driver:
         return []
     try:
         with driver.session() as session:
+            # Primary: structured relationship traversal
             result = session.run("""
-                MATCH (c:Company {ticker: $ticker})-[:HAS_STRATEGY|FACES_RISK|OFFERS_PRODUCT]->(n)
-                WHERE toLower(n.description) CONTAINS toLower($keyword)
-                   OR toLower(coalesce(n.title,'')) CONTAINS toLower($keyword)
-                RETURN coalesce(n.title,'') + ': ' + coalesce(n.description,'') AS text
+                MATCH (c:Company {ticker: $ticker})-[r]->(n)
+                WHERE type(r) IN ['HAS_STRATEGY','FACES_RISK','OFFERS_PRODUCT']
+                  AND (
+                    toLower(coalesce(n.description,'')) CONTAINS toLower($keyword)
+                    OR toLower(coalesce(n.name,''))  CONTAINS toLower($keyword)
+                    OR toLower(coalesce(n.text,''))  CONTAINS toLower($keyword)
+                  )
+                RETURN coalesce(n.name, n.title, '') + ': '
+                     + coalesce(n.description, n.text, '') AS text
                 LIMIT 12
             """, ticker=ticker, keyword=keyword)
-            return [r["text"] for r in result if r["text"].strip()]
+            rows = [r["text"] for r in result if r["text"].strip(" :")]
+
+            # Fallback: if no edge data, return Company description as context
+            if not rows:
+                fb = session.run(
+                    "MATCH (c:Company {ticker: $ticker}) "
+                    "RETURN coalesce(c.Description, c.description, '') AS text",
+                    ticker=ticker,
+                )
+                rec = fb.single()
+                if rec and rec["text"]:
+                    rows = [rec["text"][:800]]
+
+        return rows
     except Exception as e:
         logger.warning(f"[tools] Neo4j graph traversal failed: {e}")
         return []
@@ -336,10 +390,12 @@ def qdrant_news_search(query: str, ticker: str, k: int = RAG_TOP_K) -> List[str]
 # ── Hybrid Retrieval ───────────────────────────────────────────────────────────
 
 def hybrid_retrieve(query: str, ticker: str, k_final: int = 5) -> Tuple[List[str], float]:
-    """Neo4j vector + Cypher graph + Qdrant news → BM25 + Cross-Encoder rerank."""
+    """Neo4j vector + graph + Qdrant news → BM25 + Cross-Encoder rerank."""
     q_lower = query.lower()
-    keyword = next((kw for kw in ["risk","strategy","revenue","growth","competition","supply"]
-                    if kw in q_lower), "business")
+    keyword = next(
+        (kw for kw in ["risk","strategy","revenue","growth","competition","supply","moat"]
+         if kw in q_lower), "business"
+    )
 
     vec_docs   = neo4j_vector_search(query, ticker, k=15)
     graph_docs = fetch_graph_facts(ticker, keyword)
