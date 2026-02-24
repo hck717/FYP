@@ -189,11 +189,23 @@ def save_data(agent_name, ticker, data_name, data, metadata, storage_dest):
     with open(agent_dir / f"{data_name}.json", 'w') as f:
         json.dump(data, f, indent=2)
 
-    if isinstance(data, list) and len(data) > 0:
-        try:
+    # FIX: write CSV for both list and dict responses
+    try:
+        if isinstance(data, list) and len(data) > 0:
             pd.DataFrame(data).to_csv(agent_dir / f"{data_name}.csv", index=False)
-        except Exception as e:
-            print(f"  Warning: Could not save CSV: {e}")
+        elif isinstance(data, dict):
+            # Unwrap single-item lists wrapped in a dict key (e.g. FMP profile endpoint)
+            # Try to find a list value first
+            list_val = next((v for v in data.values() if isinstance(v, list) and len(v) > 0), None)
+            if list_val:
+                pd.DataFrame(list_val).to_csv(agent_dir / f"{data_name}.csv", index=False)
+            else:
+                # Flatten top-level dict — drop nested dicts/lists
+                flat_row = {k: str(v) for k, v in data.items() if not isinstance(v, (dict, list))}
+                if flat_row:
+                    pd.DataFrame([flat_row]).to_csv(agent_dir / f"{data_name}.csv", index=False)
+    except Exception as e:
+        print(f"  Warning: Could not save CSV for {data_name}: {e}")
 
     metadata[data_name] = {
         'hash': data_hash,
