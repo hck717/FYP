@@ -1,0 +1,9 @@
+[tool.pytest.ini_options]
+# Makes pytest add the repo root to sys.path automatically,
+# so `from agents.x.y import ...` works in all test files.
+pythonpath = ["."]
+testpaths = ["agents"]
+addopts = "-v"
+markers = [
+    "integration: marks tests as requiring live Docker services + Ollama (deselect with -m 'not integration')",
+]
