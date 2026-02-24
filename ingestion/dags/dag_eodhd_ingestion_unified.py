@@ -157,8 +157,11 @@ def save_data(agent_name, ticker_symbol, data_name, data, metadata, storage_dest
     try:
         if isinstance(data, list) and len(data) > 0:
             pd.DataFrame(data).to_csv(agent_dir / f"{data_name}.csv", index=False)
-        elif isinstance(data, dict) and 'General' not in data:
-            pd.DataFrame([data]).to_csv(agent_dir / f"{data_name}.csv", index=False)
+        elif isinstance(data, dict):
+            # Flatten one level — extract General section if present, else use root
+            flat = data.get("General", data)
+            flat_row = {k: str(v) for k, v in flat.items() if not isinstance(v, (dict, list))}
+            pd.DataFrame([flat_row]).to_csv(agent_dir / f"{data_name}.csv", index=False)
     except Exception as e:
         print(f"  Warning: Could not save CSV: {e}")
 
