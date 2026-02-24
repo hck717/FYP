@@ -19,6 +19,8 @@ PERPLEXITY_API_KEY = os.getenv("PERPLEXITY_API_KEY", "").strip()
 DEFAULT_MODEL      = os.getenv("WEB_SEARCH_MODEL", "sonar-pro")
 
 
+import time
+
 def perplexity_chat_completions(
     messages: List[Dict],
     model: str = DEFAULT_MODEL,
@@ -26,27 +28,10 @@ def perplexity_chat_completions(
     temperature: float = 0.1,
     max_tokens: int = 4096,
     timeout_s: int = 90,
+    max_retries: int = 3,        # ← new
 ) -> Dict:
-    """
-    Calls Perplexity Sonar API — OpenAI-compatible /chat/completions endpoint.
-    Endpoint: https://api.perplexity.ai/chat/completions
-    Reads PERPLEXITY_API_KEY from .env automatically.
-
-    Args:
-        messages:        Full message list including system prompt.
-        model:           Perplexity model. Default: sonar-pro.
-        recency_filter:  "day" | "week" | "month" | "year"
-        temperature:     Keep low (0.1) for factual finance output.
-        max_tokens:      Max output tokens.
-        timeout_s:       Request timeout in seconds.
-
-    Returns:
-        {"content": "<assistant text>", "citations": [<url strings>]}
-    """
     if not PERPLEXITY_API_KEY:
-        raise EnvironmentError(
-            "PERPLEXITY_API_KEY not found. Add it to your .env file."
-        )
+        raise EnvironmentError("PERPLEXITY_API_KEY not found.")
 
     headers = {
         "Authorization": f"Bearer {PERPLEXITY_API_KEY}",
@@ -61,26 +46,44 @@ def perplexity_chat_completions(
         "search_recency_filter": recency_filter,
     }
 
-    logger.debug(f"[tools] POST {PERPLEXITY_API_URL} model={model} recency={recency_filter}")
+    last_error = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            logger.debug(f"[tools] Attempt {attempt}/{max_retries} POST {PERPLEXITY_API_URL} model={model}")
+            resp = requests.post(PERPLEXITY_API_URL, headers=headers, json=payload, timeout=timeout_s)
+            resp.raise_for_status()
+            data = resp.json()
 
-    resp = requests.post(
-        PERPLEXITY_API_URL,
-        headers=headers,
-        json=payload,
-        timeout=timeout_s,
-    )
-    resp.raise_for_status()
-    data = resp.json()
+            content = ""
+            if "choices" in data:
+                content = data["choices"][0]["message"]["content"]
+            elif "content" in data:
+                content = data["content"]
 
-    # Parse OpenAI-compatible response
-    content: str = ""
-    if "choices" in data:
-        content = data["choices"][0]["message"]["content"]
-    elif "content" in data:
-        content = data["content"]
+            citations = data.get("citations", [])
+            return {"content": content, "citations": citations}
 
-    citations: List[str] = data.get("citations", [])
-    return {"content": content, "citations": citations}
+        except requests.exceptions.HTTPError as e:
+            status = e.response.status_code if e.response is not None else 0
+            if status in (502, 503, 504) and attempt < max_retries:
+                wait = 2 ** attempt   # 2s, 4s, 8s
+                logger.warning(f"[tools] {status} error, retrying in {wait}s... (attempt {attempt}/{max_retries})")
+                time.sleep(wait)
+                last_error = e
+                continue
+            raise   # non-retryable or final attempt
+
+        except requests.exceptions.Timeout as e:
+            if attempt < max_retries:
+                wait = 2 ** attempt
+                logger.warning(f"[tools] Timeout, retrying in {wait}s... (attempt {attempt}/{max_retries})")
+                time.sleep(wait)
+                last_error = e
+                continue
+            raise
+
+    raise last_error
+
 
 
 def extract_json_from_response(content: str) -> Optional[dict]:
