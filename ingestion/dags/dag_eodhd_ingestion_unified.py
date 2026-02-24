@@ -53,9 +53,13 @@ RATE_LIMIT_DELAY = 60.0 / EODHD_RATE_LIMIT
 AGENT_CONFIGS = {
     "business_analyst": {
         "endpoints": [
-            ("financial_news",    "news",                  {"s": "{ticker_symbol}", "limit": 100}, "qdrant_prep"),
-            ("sentiment_trends",  "sentiments",            {"s": "{ticker_symbol}"},               "qdrant_prep"),
-            ("company_profile",   "fundamentals/{ticker}", {},                                    "neo4j"),
+            # financial_news → Qdrant (news embeddings for RAG)
+            ("financial_news",   "news",                  {"s": "{ticker_symbol}", "limit": 100}, "qdrant_prep"),
+            # sentiment_trends → PostgreSQL (structured scores: bearish/bullish %)
+            # NOT qdrant_prep — single-row dict has no embeddable text
+            ("sentiment_trends", "sentiments",            {"s": "{ticker_symbol}"},               "postgresql"),
+            # company_profile → Neo4j (company node with 40+ properties)
+            ("company_profile",  "fundamentals/{ticker}", {},                                    "neo4j"),
         ]
     },
     "quantitative_fundamental": {
@@ -75,17 +79,17 @@ AGENT_CONFIGS = {
     },
     "financial_modeling": {
         "endpoints": [
-            ("historical_prices_weekly",  "eod/{ticker}",          {"from": (datetime.now() - timedelta(days=365)).strftime('%Y-%m-%d'), "period": "w"}, "postgresql"),
-            ("historical_prices_monthly", "eod/{ticker}",          {"from": (datetime.now() - timedelta(days=730)).strftime('%Y-%m-%d'), "period": "m"}, "postgresql"),
-            ("dividends_history",         "div/{ticker}",          {},                                                                                    "postgresql"),
-            ("splits_history",            "splits/{ticker}",       {},                                                                                    "postgresql"),
-            ("earnings_history",          "calendar/earnings",     {"symbols": "{ticker_symbol}"},                                                        "postgresql"),
-            ("ipo_calendar",              "calendar/ipos",         {"from": (datetime.now() - timedelta(days=365)).strftime('%Y-%m-%d')},                 "postgresql"),
-            ("fundamentals_full",         "fundamentals/{ticker}", {},                                                                                    "postgresql"),
-            ("analyst_estimates_eodhd",   "fundamentals/{ticker}", {},                                                                                    "postgresql"),
-            ("economic_calendar",         "economic-events",       {"from": (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')},                  "postgresql"),
-            ("exchange_details",          "exchange-details/{ticker}", {},                                                                                "postgresql"),
-            ("bulk_eod_us",               "eod-bulk-last-day/US",  {},                                                                                    "postgresql"),
+            ("historical_prices_weekly",  "eod/{ticker}",              {"from": (datetime.now() - timedelta(days=365)).strftime('%Y-%m-%d'), "period": "w"}, "postgresql"),
+            ("historical_prices_monthly", "eod/{ticker}",              {"from": (datetime.now() - timedelta(days=730)).strftime('%Y-%m-%d'), "period": "m"}, "postgresql"),
+            ("dividends_history",         "div/{ticker}",              {},                                                                                    "postgresql"),
+            ("splits_history",            "splits/{ticker}",           {},                                                                                    "postgresql"),
+            ("earnings_history",          "calendar/earnings",         {"symbols": "{ticker_symbol}"},                                                        "postgresql"),
+            ("ipo_calendar",              "calendar/ipos",             {"from": (datetime.now() - timedelta(days=365)).strftime('%Y-%m-%d')},                 "postgresql"),
+            ("fundamentals_full",         "fundamentals/{ticker}",     {},                                                                                    "postgresql"),
+            ("analyst_estimates_eodhd",   "fundamentals/{ticker}",     {},                                                                                    "postgresql"),
+            ("economic_calendar",         "economic-events",           {"from": (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')},                  "postgresql"),
+            ("exchange_details",          "exchange-details/{ticker}", {},                                                                                    "postgresql"),
+            ("bulk_eod_us",               "eod-bulk-last-day/US",      {},                                                                                    "postgresql"),
         ]
     }
 }
@@ -141,13 +145,12 @@ def _flatten_eodhd_fundamentals(data: dict) -> dict:
     EODHD fundamentals/{ticker} returns a deeply nested dict.
     Strategy:
       1. Pull the 'General' section (company metadata) as the primary flat row.
-      2. Merge in select scalar fields from other top-level sections.
-      3. Drop any remaining nested dicts/lists so the result is always a flat row.
+      2. Merge in select scalar fields from Highlights + Valuation sections.
+      3. Drop any remaining nested dicts/lists so the result is always flat.
     """
     general = data.get("General", {})
     flat = {k: v for k, v in general.items() if not isinstance(v, (dict, list))}
 
-    # Add a few useful scalars from other sections if present
     highlights = data.get("Highlights", {})
     for key in ["MarketCapitalization", "EBITDA", "PERatio", "EPS",
                 "DividendYield", "ProfitMargin", "RevenueGrowthYoY",
@@ -182,17 +185,15 @@ def save_data(agent_name, ticker_symbol, data_name, data, metadata, storage_dest
     with open(agent_dir / f"{data_name}.json", 'w') as f:
         json.dump(data, f, indent=2)
 
-    # Write CSV — must succeed for neo4j destination
+    # Write CSV
     try:
         if isinstance(data, list) and len(data) > 0:
             pd.DataFrame(data).to_csv(agent_dir / f"{data_name}.csv", index=False)
 
         elif isinstance(data, dict):
-            # Check if it's an EODHD fundamentals-style nested dict
             if "General" in data:
                 flat_row = _flatten_eodhd_fundamentals(data)
             else:
-                # Generic dict — try unwrap list values, else flatten scalars
                 list_val = next(
                     (v for v in data.values() if isinstance(v, list) and len(v) > 0),
                     None
@@ -326,6 +327,9 @@ with DAG(
                 task_id=f'eodhd_load_qdrant_{agent_name}_{ticker_symbol}',
                 python_callable=load_qdrant_for_agent_ticker,
                 op_kwargs={'agent_name': agent_name, 'ticker_symbol': ticker_symbol},
+                # Qdrant tasks get extra retries since Ollama may need warm-up time
+                retries=3,
+                retry_delay=timedelta(minutes=2),
             )
 
     summary_task = PythonOperator(

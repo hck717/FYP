@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import time
 from pathlib import Path
 import uuid
 import pandas as pd
@@ -20,13 +21,56 @@ EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "nomic-embed-text")
 # nomic-embed-text → 768-dim; mxbai-embed-large → 1024-dim
 EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIMENSION", "768"))
 
-EMBEDDING_BATCH_SIZE = 20   # keep small for local Ollama
-MIN_TEXT_LEN = 10            # characters — skip trivially short texts
-MAX_TEXT_LEN = 2000          # characters — nomic-embed-text context window ~8192 tokens
-                             # 2000 chars ≈ 500 tokens, safe headroom
+EMBEDDING_BATCH_SIZE = 20    # keep small for local Ollama
+MIN_TEXT_LEN = 10             # characters — skip trivially short texts
+MAX_TEXT_LEN = 2000           # characters — safe within nomic-embed-text context
 
-# Sentinel values that mean "no text"
+# How long to wait for Ollama to become ready (seconds)
+OLLAMA_WARMUP_TIMEOUT = int(os.getenv("OLLAMA_WARMUP_TIMEOUT", "60"))
+OLLAMA_WARMUP_INTERVAL = 5   # seconds between probes
+
 _NULL_SENTINELS = {"", "nan", "none", "null", "n/a", "na", "undefined"}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+def wait_for_ollama() -> bool:
+    """
+    Probe Ollama /api/tags until it responds or timeout expires.
+    Returns True if ready, raises RuntimeError if not available within timeout.
+    This causes the Airflow task to FAIL and trigger its retry policy
+    instead of silently producing payload-only (vector-less) points.
+    """
+    deadline = time.time() + OLLAMA_WARMUP_TIMEOUT
+    attempt = 0
+    while time.time() < deadline:
+        attempt += 1
+        try:
+            resp = requests.get(
+                f"{OLLAMA_BASE_URL}/api/tags",
+                timeout=5,
+            )
+            if resp.status_code == 200:
+                models = [m["name"] for m in resp.json().get("models", [])]
+                if any(EMBEDDING_MODEL in m for m in models):
+                    print(
+                        f"[Qdrant Loader] Ollama ready — "
+                        f"{EMBEDDING_MODEL} available (probe #{attempt})"
+                    )
+                    return True
+                else:
+                    print(
+                        f"[Qdrant Loader] Ollama up but {EMBEDDING_MODEL} "
+                        f"not loaded yet (available: {models}) — waiting..."
+                    )
+        except Exception as e:
+            print(f"[Qdrant Loader] Ollama probe #{attempt} failed: {e} — retrying...")
+        time.sleep(OLLAMA_WARMUP_INTERVAL)
+
+    raise RuntimeError(
+        f"[Qdrant Loader] Ollama not available after {OLLAMA_WARMUP_TIMEOUT}s. "
+        f"Ensure Ollama is running with `{EMBEDDING_MODEL}` pulled. "
+        f"Task will retry per DAG retry policy."
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -44,8 +88,6 @@ def sanitise_text(raw: str) -> str | None:
       6. Reject if below MIN_TEXT_LEN
     """
     text = raw.strip()
-
-    # Null-sentinel check
     if text.lower() in _NULL_SENTINELS:
         return None
 
@@ -63,21 +105,16 @@ def sanitise_text(raw: str) -> str | None:
     # Strip bare URLs
     text = re.sub(r"https?://\S+", "", text)
     text = re.sub(r"www\.\S+", "", text)
-
-    # Remove non-printable / control characters (keep CJK and common unicode)
+    # Remove control characters (keep CJK and standard unicode)
     text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text)
-
-    # Collapse runs of whitespace into single space
+    # Collapse whitespace
     text = re.sub(r"\s+", " ", text).strip()
 
-    # Truncate — cut at word boundary if possible
+    # Truncate at word boundary
     if len(text) > MAX_TEXT_LEN:
         text = text[:MAX_TEXT_LEN].rsplit(" ", 1)[0]
 
-    if len(text) < MIN_TEXT_LEN:
-        return None
-
-    return text
+    return text if len(text) >= MIN_TEXT_LEN else None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -101,10 +138,7 @@ def ensure_collection(client: QdrantClient):
 
 
 def _embed_single(text: str) -> list[float] | None:
-    """
-    Embed one pre-sanitised text via Ollama /api/embeddings.
-    Returns None on failure — caller drops the point.
-    """
+    """Embed one pre-sanitised text. Returns None on failure."""
     try:
         resp = requests.post(
             f"{OLLAMA_BASE_URL}/api/embeddings",
@@ -122,19 +156,16 @@ def get_embeddings(
     texts: list[str],
 ) -> tuple[list[list[float]], list[int]]:
     """
-    Sanitise then embed texts in batches via Ollama.
-
-    Returns:
-        embeddings — valid embedding vectors
-        valid_idx  — original indices that were successfully embedded
+    Sanitise + embed texts in batches.
+    Returns (vectors, valid_idx) — only successfully embedded entries.
     """
     embeddings: list[list[float]] = []
     valid_idx: list[int] = []
     skipped_sanitise = 0
     skipped_embed = 0
 
-    # Pre-sanitise all texts; track which originals survive
-    clean: list[tuple[int, str]] = []   # (original_index, clean_text)
+    # Pre-sanitise — track which original indices survive
+    clean: list[tuple[int, str]] = []
     for i, raw in enumerate(texts):
         cleaned = sanitise_text(raw)
         if cleaned:
@@ -170,6 +201,14 @@ def get_embeddings(
 
 # ─────────────────────────────────────────────────────────────────────────────
 def load_qdrant_for_agent_ticker(agent_name: str, ticker_symbol: str) -> int:
+    """
+    Main entry point called by the Airflow DAG.
+    Probes Ollama first — raises RuntimeError (triggering task retry) if
+    Ollama is not available, so vectors are never silently skipped.
+    """
+    # ── 1. Ensure Ollama is alive before doing any work ────────────────────
+    wait_for_ollama()   # raises RuntimeError → Airflow marks task FAILED → retries
+
     agent_dir = BASE_ETL_DIR / agent_name / ticker_symbol
     metadata_path = agent_dir / "metadata.json"
 
@@ -196,7 +235,6 @@ def load_qdrant_for_agent_ticker(agent_name: str, ticker_symbol: str) -> int:
             print(f"[Qdrant Loader] Missing CSV for {data_name} — skipping")
             continue
 
-        # Guard: skip 0-byte or header-only files
         if csv_path.stat().st_size < 4:
             print(f"[Qdrant Loader] Empty file for {data_name} — skipping")
             continue
@@ -228,10 +266,8 @@ def load_qdrant_for_agent_ticker(agent_name: str, ticker_symbol: str) -> int:
 
         for _, row in df.iterrows():
             raw_text = str(row.get(text_col, ""))
-            # Quick null check before sanitise (saves regex overhead)
             if raw_text.strip().lower() in _NULL_SENTINELS:
                 continue
-
             payload = row.to_dict()
             payload.update({
                 "agent_name":    agent_name,
@@ -240,7 +276,7 @@ def load_qdrant_for_agent_ticker(agent_name: str, ticker_symbol: str) -> int:
                 "source":        info.get("source", "unknown"),
             })
             all_ids.append(str(uuid.uuid4()))
-            all_texts.append(raw_text)       # sanitise happens inside get_embeddings
+            all_texts.append(raw_text)
             all_payloads.append(payload)
 
     if not all_texts:
@@ -275,6 +311,6 @@ def load_qdrant_for_agent_ticker(agent_name: str, ticker_symbol: str) -> int:
 
 if __name__ == "__main__":
     import sys
-    agent = sys.argv[1] if len(sys.argv) > 1 else "business_analyst"
+    agent  = sys.argv[1] if len(sys.argv) > 1 else "business_analyst"
     ticker = sys.argv[2] if len(sys.argv) > 2 else "AAPL"
     print(load_qdrant_for_agent_ticker(agent, ticker))
