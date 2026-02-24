@@ -1,0 +1,54 @@
+# ─── Secrets & Environment ──────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+
+# ─── Agent Data (scraped CSVs, JSONs — never commit raw data) ───────────────
+ingestion/etl/agent_data/
+agent_data/
+
+# ─── Database files ──────────────────────────────────────────────────────────
+*.db
+*.sqlite
+*.sqlite3
+
+# ─── Python ──────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+
+# ─── Jupyter ─────────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+
+# ─── macOS ───────────────────────────────────────────────────────────────────
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# ─── Logs ────────────────────────────────────────────────────────────────────
+*.log
+logs/
+airflow/logs/
+
+# ─── Airflow state ───────────────────────────────────────────────────────────
+airflow/plugins/
+airflow/dags/__pycache__/
+
+# ─── IDE ─────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ─── Misc artifacts ──────────────────────────────────────────────────────────
+*.csv.bak
+*.parquet
+tmp/
+.cache/
