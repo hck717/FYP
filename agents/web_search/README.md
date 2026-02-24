@@ -1,159 +1,104 @@
-# 🔍 Web Search Agent
+# 🔍 Web Search Agent (Poe / DeepSeek)
 
-> **語言說明：** 本文件以廣東話書寫，所有技術術語保留英文原名。
+> **語言說明：** 本文件以廣東話書寫，所有技術術語保留英文原名。  
+> **Status:** Production-ready skeleton (Supervisor-callable, JSON output, tests).  
+> **Model:** `deepseek-v3.2-exp` via Poe API (primary).  
 
 ---
 
 ## 🎯 Agent 職能
 
-Web Search Agent 負責搜尋 **實時、最新嘅網絡資訊**，展作其他 agent 唔能從静態 database 獲得嘅資訊。主要用途包括最新盈利公告、監管消息、繼任 CEO 老闆雙、突發事件等。
+Web Search Agent 負責搜尋 **實時、最新嘅網絡資訊**，用嚟補足其他 agents 從本地靜態 knowledge base（PostgreSQL / Qdrant / Neo4j）攞唔到嘅 breaking updates，例如盈利速報、監管消息、訴訟、CEO/CFO 變動、重大 M&A、突發事故等。
 
-```
-用戶問題
-    │
-    ▼
-[Web Search Agent]
-    │
-    ├── 生成 search queries
-    ├── 呼叫 Tavily / DuckDuckGo Search tool
-    ├── 筋選高相關結果
-    ├── 提取主要內容與來源
-    └── 回傳 structured 結果給 Supervisor
-```
+本 Agent 係 **stateless**：每次呼叫獨立，輸出一個可被 Supervisor 直接 ingest 嘅 structured JSON。
 
 ---
 
-## 📦 負責範圍
+## 🧠 設計理念（同你 FYP 架構一致）
 
-### 適用場景
-
-- 最新盈利報告、沪期上市 / 退市公告
-- 監管機構對公司嘅調查、罰款、訴訟
-- 產品發布會、策略轉變、重大并購
-- 主要管理層變動（CEO、CFO 老闆雙）
-- EODHD 數據庫尚未更新嘅突發事件
-
-### 不適用場景（由其他 agent 處理）
-
-- 歷史股價數據 → Financial Modelling Agent
-- 公司財務報告基本面 → Business Analyst Agent
-- GDP、CPI 等完年資料 → Macro Metrics Agent
+- **Step-Back Prompting**：先從宏觀/同業/供應鏈角度諗「可能發生咩」再落 query。
+- **HyDE**：用 hypothetical ideal article 去校準語意方向，提升 search precision。
+- **Freshness reranking**：偏好近 7 日內容；超過 30 日標記 `[HISTORICAL]`。
+- **Hallucination guard**：每個 factual claim 必須有 URL + date；single-source 要標記 `⚠️ UNCONFIRMED`。
+- **Supervisor-ready output**：輸出固定 schema JSON，Supervisor/Synthesizer 可直接做 conflict detection。
 
 ---
 
-## 🛠️ 技術實現
+## 🧩 目錄結構
 
-### Tools
-
-| Tool | 用途 | 實現 |
-|---|---|---|
-| `TavilySearchResults` | 主要搜尋工具，返回結構化結果 | LangChain `langchain-community` |
-| `DuckDuckGoSearchRun` | Fallback 搜尋（唔需要 API key） | LangChain `langchain-community` |
-| `WebBaseLoader` | 抓取指定 URL 嘅全文內容 | LangChain document loaders |
-
-### LLM 設定
-
-```python
-# 使用 Ollama 本地 LLM
-llm = ChatOllama(
-    model="qwen2.5:7b",          # 主要推理 model
-    base_url="http://localhost:11434",
-    temperature=0.1,             # 保持較低，減少虜構
-)
-```
-
-### Agent 工作流（LangGraph）
-
-```
-START
-  │
-  ▼
-plan_queries        ←  LLM 將用戶問題分解為 2–3 個 search queries
-  │
-  ▼
-execute_search      ←  並行呼叫 Tavily，每個 query 最多取 5 個結果
-  │
-  ▼
-filter_results      ←  去除重複、邎期文章（> 7 日）、低相關度結果
-  │
-  ▼
-format_output       ←  整理成 structured JSON 和 markdown 摘要
-  │
-  ▼
- END → 回傳 Supervisor
-```
-
-### Output 格式
-
-```json
-{
-  "agent": "web_search",
-  "ticker": "AAPL",
-  "query_used": "Apple Inc latest news 2026",
-  "results": [
-    {
-      "title": "Apple Reports Record Q1 2026 Revenue",
-      "url": "https://...",
-      "snippet": "Apple Inc. today announced...",
-      "published_date": "2026-02-20",
-      "relevance_score": 0.92
-    }
-  ],
-  "summary": "Apple 報告 2026 Q1 创紀錄盈利..."
-}
-```
-
----
-
-## 📁 目錄結構
-
-```
 agents/web_search/
-├── README.md          # 本文件
-├── agent.py           # Agent 主體逻輯（LangGraph）
-├── tools.py           # Tavily / DuckDuckGo 封裝
-├── prompts.py         # System prompt 和 query 生成 template
+├── README.md
+├── agent.py # LangGraph node wrapper + agent runtime
+├── tools.py # Poe API client + (optional) DuckDuckGo fallback
+├── prompts.py # System prompt + templates (Step-back / HyDE)
 └── tests/
-    └── test_agent.py     # 單元測試
-```
+└── test_agent.py # Unit tests (API mocked)
+
+text
 
 ---
 
 ## ⚙️ 環境變數
 
-```bash
-# .env 檔案加入
-TAVILY_API_KEY=your_tavily_api_key     # 從 https://tavily.com 獲得
-OLLAMA_BASE_URL=http://localhost:11434
-WEB_SEARCH_MODEL=qwen2.5:7b
-WEB_SEARCH_MAX_RESULTS=5               # 每個 query 返回最多結果數
-WEB_SEARCH_MAX_AGE_DAYS=7              # 邎期文章過濾間隔
-```
-
----
-
-## 🧪 快速測試
+加入到 `.env`：
 
 ```bash
-# 啟動 virtual environment
-source .venv/bin/activate
+POE_API_KEY=your_key_here
+WEB_SEARCH_MODEL=deepseek-v3.2-exp
+WEB_SEARCH_RECENCY_FILTER=week
+你如果用 docker / airflow，記得將 .env 注入 scheduler / worker containers。
 
-# 直接執行 agent
-python agents/web_search/agent.py --ticker AAPL --query "latest news"
+✅ Output Schema（Supervisor Consumption）
+Agent 必須 return JSON：
 
-# 執行測試
-python -m pytest agents/web_search/tests/ -v
-```
+json
+{
+  "agent": "web_search",
+  "ticker": "AAPL",
+  "query_date": "2026-02-24",
+  "breaking_news": [
+    {
+      "title": "...",
+      "url": "...",
+      "published_date": "2026-02-24",
+      "source_tier": 1,
+      "relevance_score": 0.92,
+      "verified": true
+    }
+  ],
+  "sentiment_signal": "MIXED",
+  "sentiment_rationale": "1 sentence with a cited URL",
+  "unknown_risk_flags": [
+    {"risk": "...", "source_url": "...", "severity": "HIGH"}
+  ],
+  "competitor_signals": [
+    {"company": "...", "signal": "...", "source_url": "..."}
+  ],
+  "supervisor_escalation": {
+    "action": "CONFLICT_SIGNAL",
+    "rationale": "...",
+    "conflict_with_agent": "consensus_strategy"
+  },
+  "fallback_triggered": false,
+  "confidence": 0.75,
+  "raw_citations": ["https://..."],
+  "error": null
+}
+🧪 測試
+bash
+pip install -r requirements.txt
+pytest agents/web_search/tests/ -v
+🔌 Supervisor / LangGraph Integration
+Supervisor graph 中加入：
 
----
+python
+from agents.web_search.agent import web_search_node
+graph.add_node("web_search", web_search_node)
 
-## 📝 設計容訊
+# outputs:
+state["web_search_output"]["breaking_news"]
+state["web_search_output"]["unknown_risk_flags"]
+state["web_search_output"]["supervisor_escalation"]
+最後更新：2026-02-24 | 作者：hck717
 
-- **Stateless** 設計：每次呼叫都是独立的，唔依賴 session state
-- **Fallback chain**：Tavily 失敗→ DuckDuckGo 备用
-- **Hallucination guard**：所有搜尋結果必須附上原始 URL，由 Critic Agent 核實
-- **Rate limiting**：預設每次呼叫間隔 1 秒，防止被封 IP
 
----
-
-*最後更新：2026-02-24 | 作者：hck717*
