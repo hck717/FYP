@@ -10,14 +10,18 @@ Provides:
 
 Host resolution strategy:
   .env sets Docker-internal hostnames (neo4j, qdrant, postgres) for Airflow DAGs
-  running inside Docker. When the agent is run locally from the Mac terminal,
-  those hostnames don't resolve. Each connector tries the configured host first,
-  then automatically retries with 'localhost' on DNS / connection failure.
-  No .env changes required.
+  running inside Docker. When the agent is run from the Mac terminal, those
+  hostnames don't DNS-resolve. Each connector tries the configured host first,
+  then automatically retries with 'localhost'. No .env changes required.
 
-Import design:
-  sentence_transformers / torch are LAZY-IMPORTED inside get_embedder() /
-  get_reranker() only. Unit tests import this module without needing the ML stack.
+Import design — ALL heavy packages are lazy-imported inside their getter:
+  neo4j            → get_neo4j_driver()
+  qdrant_client    → get_qdrant()
+  sentence_transformers / torch → get_embedder() / get_reranker()
+  rank_bm25        → inside hybrid_retrieve()
+
+This means the module can be imported (and all unit tests collected) on ANY
+venv regardless of whether neo4j, torch, or pandas are working correctly.
 """
 import os
 import re
@@ -30,37 +34,27 @@ import psycopg2
 import psycopg2.extras
 from dotenv import load_dotenv
 
-try:
-    from neo4j import GraphDatabase
-    NEO4J_AVAILABLE = True
-except ImportError:
-    NEO4J_AVAILABLE = False
-    print("⚠️  neo4j driver not installed: pip install neo4j")
-
+# rank_bm25 — lightweight, safe to import at module level
 try:
     from rank_bm25 import BM25Okapi
     BM25_AVAILABLE = True
 except ImportError:
     BM25_AVAILABLE = False
 
-try:
-    from qdrant_client import QdrantClient
-    QDRANT_AVAILABLE = True
-except ImportError:
-    QDRANT_AVAILABLE = False
-    QdrantClient = None  # type: ignore
+# NOTE: neo4j, qdrant_client, sentence_transformers are NOT imported here.
+# They are imported lazily inside their respective getter functions.
 
 load_dotenv(dotenv_path=Path(__file__).resolve().parents[2] / ".env")
 logger = logging.getLogger(__name__)
 
-# ── Config (read from .env, Docker-internal names are expected) ──────────────────
+# ── Config ─────────────────────────────────────────────────────────────────────
 NEO4J_URI      = os.getenv("NEO4J_URI",      "bolt://localhost:7687")
 NEO4J_USER     = os.getenv("NEO4J_USER",     "neo4j")
 NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "changeme_neo4j_password")
 
 QDRANT_HOST    = os.getenv("QDRANT_HOST",           "localhost")
 QDRANT_PORT    = int(os.getenv("QDRANT_PORT",        "6333"))
-COLLECTION    = os.getenv("QDRANT_COLLECTION_NAME", "financial_documents")
+COLLECTION     = os.getenv("QDRANT_COLLECTION_NAME", "financial_documents")
 RAG_TOP_K      = int(os.getenv("RAG_TOP_K",          "8"))
 
 PG_HOST        = os.getenv("POSTGRES_HOST",     "localhost")
@@ -72,93 +66,96 @@ PG_PASS        = os.getenv("POSTGRES_PASSWORD", "airflow")
 EMBED_MODEL    = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
 RERANK_MODEL   = os.getenv("RERANKER_MODEL",  "cross-encoder/ms-marco-MiniLM-L-6-v2")
 
-# ── Localhost fallback URIs (used when Docker hostname fails DNS) ────────────────
-# We extract the port from NEO4J_URI so it stays in sync with .env
-def _neo4j_localhost_uri() -> str:
-    """Swap Docker hostname in NEO4J_URI for localhost."""
-    import re as _re
-    m = _re.match(r"(bolt://)([^:]+)(:.*)", NEO4J_URI)
-    if m:
-        return f"{m.group(1)}localhost{m.group(3)}"
-    return "bolt://localhost:7687"
-
-
-# ── Lazy-loaded singletons ──────────────────────────────────────────────────────
-_embedder: Any = None
-_reranker: Any = None
-_neo4j_driver: Any = None
+# ── Lazy-loaded singletons ─────────────────────────────────────────────────────
+_embedder:      Any = None
+_reranker:      Any = None
+_neo4j_driver:  Any = None
 _qdrant_client: Any = None
 
 
+def _neo4j_localhost_uri() -> str:
+    """Swap Docker hostname in NEO4J_URI for 'localhost'."""
+    m = re.match(r"(bolt://)([^:]+)(:\d+)", NEO4J_URI)
+    return f"{m.group(1)}localhost{m.group(3)}" if m else "bolt://localhost:7687"
+
+
+# ── Getters ────────────────────────────────────────────────────────────────────
+
 def get_embedder():
+    """Lazy-load SentenceTransformer — torch is only touched here."""
     global _embedder
     if _embedder is None:
-        try:
-            from sentence_transformers import SentenceTransformer
-            logger.info(f"[tools] Loading embedder: {EMBED_MODEL}")
-            _embedder = SentenceTransformer(EMBED_MODEL)
-        except Exception as e:
-            logger.error(f"[tools] Could not load embedder: {e}")
-            raise
+        from sentence_transformers import SentenceTransformer  # noqa: lazy
+        logger.info(f"[tools] Loading embedder: {EMBED_MODEL}")
+        _embedder = SentenceTransformer(EMBED_MODEL)
     return _embedder
 
 
 def get_reranker():
+    """Lazy-load CrossEncoder — torch is only touched here."""
     global _reranker
     if _reranker is None:
-        try:
-            from sentence_transformers import CrossEncoder
-            logger.info(f"[tools] Loading reranker: {RERANK_MODEL}")
-            _reranker = CrossEncoder(RERANK_MODEL)
-        except Exception as e:
-            logger.error(f"[tools] Could not load reranker: {e}")
-            raise
+        from sentence_transformers import CrossEncoder  # noqa: lazy
+        logger.info(f"[tools] Loading reranker: {RERANK_MODEL}")
+        _reranker = CrossEncoder(RERANK_MODEL)
     return _reranker
 
 
 def get_neo4j_driver():
     """
-    Try NEO4J_URI first (Docker hostname).
-    On DNS / connection failure, automatically retry with localhost.
+    Lazy-import neo4j (+ its pandas dep) only when first called.
+    Tries NEO4J_URI (Docker host) first, then localhost fallback.
     """
     global _neo4j_driver
-    if _neo4j_driver is not None or not NEO4J_AVAILABLE:
+    if _neo4j_driver is not None:
         return _neo4j_driver
 
-    uris_to_try = [NEO4J_URI]
-    localhost_uri = _neo4j_localhost_uri()
-    if localhost_uri != NEO4J_URI:
-        uris_to_try.append(localhost_uri)
+    try:
+        from neo4j import GraphDatabase  # noqa: lazy
+    except Exception as e:
+        logger.warning(f"[tools] neo4j import failed: {e}")
+        return None
 
-    for uri in uris_to_try:
+    uris = [NEO4J_URI]
+    lb   = _neo4j_localhost_uri()
+    if lb != NEO4J_URI:
+        uris.append(lb)
+
+    for uri in uris:
         try:
-            driver = GraphDatabase.driver(uri, auth=(NEO4J_USER, NEO4J_PASSWORD))
-            with driver.session() as s:
+            drv = GraphDatabase.driver(uri, auth=(NEO4J_USER, NEO4J_PASSWORD))
+            with drv.session() as s:
                 s.run("RETURN 1")
             logger.info(f"[tools] Neo4j connected via {uri}")
-            _neo4j_driver = driver
+            _neo4j_driver = drv
             return _neo4j_driver
         except Exception as e:
-            logger.warning(f"[tools] Neo4j connection failed ({uri}): {e}")
+            logger.warning(f"[tools] Neo4j failed ({uri}): {e}")
 
-    logger.warning("[tools] Neo4j unavailable on all attempted URIs")
+    logger.warning("[tools] Neo4j unavailable on all URIs")
     return None
 
 
 def get_qdrant():
     """
-    Try QDRANT_HOST first (Docker hostname).
-    On DNS / connection failure, automatically retry with localhost.
+    Lazy-import qdrant_client only when first called.
+    Tries QDRANT_HOST (Docker host) first, then localhost fallback.
     """
     global _qdrant_client
-    if _qdrant_client is not None or not QDRANT_AVAILABLE:
+    if _qdrant_client is not None:
         return _qdrant_client
 
-    hosts_to_try = [QDRANT_HOST]
-    if QDRANT_HOST != "localhost":
-        hosts_to_try.append("localhost")
+    try:
+        from qdrant_client import QdrantClient  # noqa: lazy
+    except Exception as e:
+        logger.warning(f"[tools] qdrant_client import failed: {e}")
+        return None
 
-    for host in hosts_to_try:
+    hosts = [QDRANT_HOST]
+    if QDRANT_HOST != "localhost":
+        hosts.append("localhost")
+
+    for host in hosts:
         try:
             client = QdrantClient(host=host, port=QDRANT_PORT)
             client.get_collections()
@@ -166,39 +163,35 @@ def get_qdrant():
             _qdrant_client = client
             return _qdrant_client
         except Exception as e:
-            logger.warning(f"[tools] Qdrant connection failed ({host}:{QDRANT_PORT}): {e}")
+            logger.warning(f"[tools] Qdrant failed ({host}:{QDRANT_PORT}): {e}")
 
-    logger.warning("[tools] Qdrant unavailable on all attempted hosts")
+    logger.warning("[tools] Qdrant unavailable on all hosts")
     return None
 
 
 # ── PostgreSQL: Sentiment ──────────────────────────────────────────────────────
-def _pg_connect(host: str):
-    """Open a psycopg2 connection to the given host."""
-    return psycopg2.connect(
-        host=host, port=PG_PORT, dbname=PG_DB,
-        user=PG_USER, password=PG_PASS,
-        connect_timeout=5,
-    )
-
 
 def fetch_sentiment(ticker: str) -> Dict:
     """
-    Fetch latest sentiment_trends row for a ticker from PostgreSQL.
-    Tries PG_HOST (Docker name) first, then localhost on failure.
+    Fetch latest sentiment_trends row for ticker.
+    Tries PG_HOST (Docker name) first, then localhost.
     """
-    hosts_to_try = [PG_HOST]
+    hosts = [PG_HOST]
     if PG_HOST != "localhost":
-        hosts_to_try.append("localhost")
+        hosts.append("localhost")
 
     conn = None
-    for host in hosts_to_try:
+    for host in hosts:
         try:
-            conn = _pg_connect(host)
+            conn = psycopg2.connect(
+                host=host, port=PG_PORT, dbname=PG_DB,
+                user=PG_USER, password=PG_PASS,
+                connect_timeout=5,
+            )
             logger.debug(f"[tools] PostgreSQL connected via {host}")
             break
         except Exception as e:
-            logger.warning(f"[tools] PostgreSQL connection failed ({host}): {e}")
+            logger.warning(f"[tools] PostgreSQL failed ({host}): {e}")
 
     if conn is None:
         return {}
@@ -220,15 +213,11 @@ def fetch_sentiment(ticker: str) -> Dict:
             return {}
 
         latest = dict(rows[0])
-        trend = "stable"
+        trend  = "stable"
         if len(rows) == 2:
-            prev_bull = float(rows[1].get("bullish_pct") or 0)
-            curr_bull = float(latest.get("bullish_pct") or 0)
-            diff = curr_bull - prev_bull
-            if diff > 3:
-                trend = "improving"
-            elif diff < -3:
-                trend = "deteriorating"
+            diff = float(latest.get("bullish_pct") or 0) - float(rows[1].get("bullish_pct") or 0)
+            if diff > 3:   trend = "improving"
+            elif diff < -3: trend = "deteriorating"
 
         return {
             "bullish_pct": float(latest.get("bullish_pct") or 0),
@@ -243,6 +232,7 @@ def fetch_sentiment(ticker: str) -> Dict:
 
 
 # ── Neo4j: Company properties ──────────────────────────────────────────────────
+
 def fetch_company_profile(ticker: str) -> Dict:
     driver = get_neo4j_driver()
     if not driver:
@@ -258,15 +248,15 @@ def fetch_company_profile(ticker: str) -> Dict:
                 return {}
             props = dict(record["props"])
         return {
-            "name":          props.get("Name") or props.get("name") or ticker,
-            "sector":        props.get("Sector") or props.get("sector"),
+            "name":          props.get("Name")    or props.get("name")    or ticker,
+            "sector":        props.get("Sector")  or props.get("sector"),
             "market_cap":    _safe_float(props.get("Highlights_MarketCapitalization")),
             "pe_ratio":      _safe_float(props.get("Valuation_TrailingPE") or props.get("Highlights_PERatio")),
             "profit_margin": _safe_float(props.get("Highlights_ProfitMargin")),
             "description":   props.get("Description") or props.get("description") or "",
         }
     except Exception as e:
-        logger.warning(f"[tools] Neo4j company profile fetch failed: {e}")
+        logger.warning(f"[tools] Neo4j company profile failed: {e}")
         return {}
 
 
@@ -283,8 +273,7 @@ def fetch_graph_facts(ticker: str, keyword: str = "business") -> List[str]:
                 RETURN coalesce(n.title,'') + ': ' + coalesce(n.description,'') AS text
                 LIMIT 12
             """, ticker=ticker, keyword=keyword)
-            rows = [r["text"] for r in result if r["text"].strip()]
-        return rows
+            return [r["text"] for r in result if r["text"].strip()]
     except Exception as e:
         logger.warning(f"[tools] Neo4j graph traversal failed: {e}")
         return []
@@ -304,44 +293,39 @@ def neo4j_vector_search(query: str, ticker: str, k: int = 10) -> List[str]:
                 RETURN node.text AS text, node.chunk_id AS chunk_id, score
                 ORDER BY score DESC
             """, k=k, embedding=embedding, ticker=ticker)
-            rows = []
-            for r in result:
-                text = r.get("text", "")
-                cid  = r.get("chunk_id", "unknown")
-                if text:
-                    rows.append(f"[{cid}] {text}")
-        return rows
+            return [
+                f"[{r.get('chunk_id','unknown')}] {r.get('text','')}"
+                for r in result if r.get("text")
+            ]
     except Exception as e:
         logger.warning(f"[tools] Neo4j vector search failed: {e}")
         return []
 
 
 # ── Qdrant: News semantic search ───────────────────────────────────────────────
+
 def qdrant_news_search(query: str, ticker: str, k: int = RAG_TOP_K) -> List[str]:
     client = get_qdrant()
     if not client:
         return []
     try:
+        from qdrant_client.models import Filter, FieldCondition, MatchValue  # noqa: lazy
         embedding = get_embedder().encode(query).tolist()
-        from qdrant_client.models import Filter, FieldCondition, MatchValue
         hits = client.search(
             collection_name=COLLECTION,
             query_vector=embedding,
-            query_filter=Filter(
-                must=[FieldCondition(
-                    key="ticker_symbol",
-                    match=MatchValue(value=ticker),
-                )]
-            ) if ticker else None,
+            query_filter=Filter(must=[FieldCondition(
+                key="ticker_symbol", match=MatchValue(value=ticker),
+            )]) if ticker else None,
             limit=k,
             with_payload=True,
         )
         results = []
         for hit in hits:
-            payload = hit.payload or {}
-            title   = payload.get("title", "")
-            content = payload.get("content") or payload.get("text") or ""
-            date    = payload.get("date") or payload.get("published_date") or "unknown"
+            p       = hit.payload or {}
+            title   = p.get("title", "")
+            content = p.get("content") or p.get("text") or ""
+            date    = p.get("date") or p.get("published_date") or "unknown"
             results.append(f"[news|{date}] {title}: {content[:400]}")
         return results
     except Exception as e:
@@ -349,18 +333,13 @@ def qdrant_news_search(query: str, ticker: str, k: int = RAG_TOP_K) -> List[str]
         return []
 
 
-# ── Hybrid Retrieval + CRAG ────────────────────────────────────────────────────
+# ── Hybrid Retrieval ───────────────────────────────────────────────────────────
+
 def hybrid_retrieve(query: str, ticker: str, k_final: int = 5) -> Tuple[List[str], float]:
-    """
-    Neo4j vector + Cypher graph + BM25 → Cross-Encoder rerank.
-    Returns (top_k_docs, crag_confidence_score).
-    """
+    """Neo4j vector + Cypher graph + Qdrant news → BM25 + Cross-Encoder rerank."""
     q_lower = query.lower()
-    keyword = "business"
-    for kw in ["risk", "strategy", "revenue", "growth", "competition", "supply"]:
-        if kw in q_lower:
-            keyword = kw
-            break
+    keyword = next((kw for kw in ["risk","strategy","revenue","growth","competition","supply"]
+                    if kw in q_lower), "business")
 
     vec_docs   = neo4j_vector_search(query, ticker, k=15)
     graph_docs = fetch_graph_facts(ticker, keyword)
@@ -382,11 +361,10 @@ def hybrid_retrieve(query: str, ticker: str, k_final: int = 5) -> Tuple[List[str
             pass
 
     reranker  = get_reranker()
-    pairs     = [[query, doc] for doc in all_docs]
-    ce_scores = reranker.predict(pairs).tolist()
+    ce_scores = reranker.predict([[query, d] for d in all_docs]).tolist()
 
-    hybrid   = [0.3 * bm25_scores[i] + 0.7 * ce_scores[i] for i in range(len(all_docs))]
-    ranked   = sorted(zip(all_docs, hybrid), key=lambda x: x[1], reverse=True)
+    hybrid    = [0.3 * bm25_scores[i] + 0.7 * ce_scores[i] for i in range(len(all_docs))]
+    ranked    = sorted(zip(all_docs, hybrid), key=lambda x: x[1], reverse=True)
     top_docs  = [doc for doc, _ in ranked[:k_final]]
     top_score = ranked[0][1] if ranked else 0.0
 
@@ -395,23 +373,21 @@ def hybrid_retrieve(query: str, ticker: str, k_final: int = 5) -> Tuple[List[str
 
 
 def crag_evaluate(score: float) -> str:
-    if score > 0.7:  return "CORRECT"
+    if score > 0.7:    return "CORRECT"
     elif score >= 0.5: return "AMBIGUOUS"
     else:              return "INCORRECT"
 
 
-# ── Utilities ─────────────────────────────────────────────────────────────────
+# ── Utilities ──────────────────────────────────────────────────────────────────
+
 def extract_json_from_response(content: str) -> Optional[dict]:
-    match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", content, re.DOTALL)
-    if match:
-        try:    return json.loads(match.group(1))
-        except: pass
+    for pattern in [r"```(?:json)?\s*(\{.*?\})\s*```", r"\{.*\}"]:
+        m = re.search(pattern, content, re.DOTALL)
+        if m:
+            try:    return json.loads(m.group(1) if "```" in pattern else m.group(0))
+            except: pass
     try:    return json.loads(content.strip())
     except: pass
-    match2 = re.search(r"\{.*\}", content, re.DOTALL)
-    if match2:
-        try:    return json.loads(match2.group(0))
-        except: pass
     logger.warning("[tools] Could not extract JSON from response")
     return None
 
