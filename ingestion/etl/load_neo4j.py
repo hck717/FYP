@@ -1,5 +1,6 @@
 import os
 import json
+import hashlib
 from pathlib import Path
 import pandas as pd
 from neo4j import GraphDatabase
@@ -64,6 +65,29 @@ def _load_strategy(tx, ticker_symbol, row, label="Strategy"):
     )
 
 
+# FIX 3: Replaced CREATE with MERGE using deterministic fact_id to prevent duplicate Fact nodes
+def _load_fact(tx, ticker_symbol, data_name, row):
+    props = {k: v for k, v in row.to_dict().items() if pd.notna(v)}
+    # Build a deterministic ID from ticker + data_name + sorted props content
+    fact_id = hashlib.md5(
+        f"{ticker_symbol}:{data_name}:{json.dumps(props, sort_keys=True)}".encode()
+    ).hexdigest()
+    props["fact_id"] = fact_id
+    tx.run(
+        """
+        MERGE (c:Company {ticker: $ticker})
+        MERGE (f:Fact {fact_id: $fact_id})
+        SET f += $props
+        SET f.data_name = $data_name
+        MERGE (f)-[:ABOUT]->(c)
+        """,
+        ticker=ticker_symbol,
+        fact_id=fact_id,
+        data_name=data_name,
+        props=props,
+    )
+
+
 def load_neo4j_for_agent_ticker(agent_name: str, ticker_symbol: str) -> int:
     agent_dir = BASE_ETL_DIR / agent_name / ticker_symbol
     metadata_path = agent_dir / "metadata.json"
@@ -121,19 +145,9 @@ def load_neo4j_for_agent_ticker(agent_name: str, ticker_symbol: str) -> int:
                     count += 1
 
             else:
+                # FIX 3: MERGE with deterministic fact_id (was CREATE → duplicates)
                 for _, row in df.iterrows():
-                    props = {k: v for k, v in row.to_dict().items() if pd.notna(v)}
-                    session.run(
-                        """
-                        MERGE (c:Company {ticker: $ticker})
-                        CREATE (f:Fact {data_name: $data_name})
-                        SET f += $props
-                        MERGE (f)-[:ABOUT]->(c)
-                        """,
-                        ticker=ticker_symbol,
-                        data_name=data_name,
-                        props=props,
-                    )
+                    session.execute_write(_load_fact, ticker_symbol, data_name, row)
                     count += 1
 
     driver.close()

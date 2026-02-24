@@ -5,13 +5,21 @@ import uuid
 import pandas as pd
 from qdrant_client import QdrantClient
 from qdrant_client.http import models as qmodels
+import requests
 
 BASE_ETL_DIR = Path(os.getenv("BASE_ETL_DIR", "/opt/airflow/etl/agent_data"))
 
 QDRANT_HOST = os.getenv("QDRANT_HOST", "fyp-qdrant")
 QDRANT_PORT = int(os.getenv("QDRANT_PORT", "6333"))
 QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION_NAME", "agentic_analyst_docs")
-EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIMENSION", "1536"))
+
+# Ollama instead of OpenAI
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://host.docker.internal:11434")
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "nomic-embed-text")
+# nomic-embed-text → 768-dim; if using mxbai-embed-large → 1024-dim
+EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIMENSION", "768"))
+
+EMBEDDING_BATCH_SIZE = 20  # Ollama is local, keep batches small
 
 
 def get_client():
@@ -19,18 +27,49 @@ def get_client():
 
 
 def ensure_collection(client: QdrantClient):
-    client.recreate_collection(
-        collection_name=QDRANT_COLLECTION,
-        vectors_config=qmodels.VectorParams(
-            size=EMBEDDING_DIM,
-            distance=qmodels.Distance.COSINE,
-        ),
-    )
+    existing = [c.name for c in client.get_collections().collections]
+    if QDRANT_COLLECTION not in existing:
+        client.create_collection(
+            collection_name=QDRANT_COLLECTION,
+            vectors_config=qmodels.VectorParams(
+                size=EMBEDDING_DIM,
+                distance=qmodels.Distance.COSINE,
+            ),
+        )
+        print(f"[Qdrant Loader] Created collection: {QDRANT_COLLECTION}")
+    else:
+        print(f"[Qdrant Loader] Collection exists: {QDRANT_COLLECTION}")
 
 
-def get_embeddings(texts):
-    import numpy as np
-    return [np.zeros(EMBEDDING_DIM).tolist() for _ in texts]
+def get_embeddings(texts: list[str]) -> list[list[float]]:
+    """Generate embeddings via local Ollama — no API key needed."""
+    all_embeddings = []
+
+    for i in range(0, len(texts), EMBEDDING_BATCH_SIZE):
+        batch = texts[i: i + EMBEDDING_BATCH_SIZE]
+
+        for text in batch:
+            text = text.strip() or "N/A"
+            try:
+                response = requests.post(
+                    f"{OLLAMA_BASE_URL}/api/embeddings",
+                    json={"model": EMBEDDING_MODEL, "prompt": text},
+                    timeout=30,
+                )
+                response.raise_for_status()
+                embedding = response.json()["embedding"]
+                all_embeddings.append(embedding)
+            except Exception as e:
+                print(f"[Qdrant Loader] Embedding failed for text snippet: {e}")
+                # Fallback: zero vector so the batch doesn't crash
+                all_embeddings.append([0.0] * EMBEDDING_DIM)
+
+        print(
+            f"[Qdrant Loader] Embedded batch "
+            f"{i // EMBEDDING_BATCH_SIZE + 1} ({len(batch)} texts)"
+        )
+
+    return all_embeddings
 
 
 def load_qdrant_for_agent_ticker(agent_name: str, ticker_symbol: str) -> int:
