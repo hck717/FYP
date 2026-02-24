@@ -8,11 +8,16 @@ Provides:
   - PostgreSQL: sentiment_trends data
   - Utility: JSON extraction, BM25 scoring
 
+Host resolution strategy:
+  .env sets Docker-internal hostnames (neo4j, qdrant, postgres) for Airflow DAGs
+  running inside Docker. When the agent is run locally from the Mac terminal,
+  those hostnames don't resolve. Each connector tries the configured host first,
+  then automatically retries with 'localhost' on DNS / connection failure.
+  No .env changes required.
+
 Import design:
-  sentence_transformers and torch are LAZY-IMPORTED inside get_embedder() /
-  get_reranker() only. This means the module can be safely imported (and all
-  unit tests can run) without the ML stack being present or even installed.
-  The heavy models are only loaded the first time hybrid_retrieve() is called.
+  sentence_transformers / torch are LAZY-IMPORTED inside get_embedder() /
+  get_reranker() only. Unit tests import this module without needing the ML stack.
 """
 import os
 import re
@@ -25,7 +30,6 @@ import psycopg2
 import psycopg2.extras
 from dotenv import load_dotenv
 
-# neo4j — optional, guarded
 try:
     from neo4j import GraphDatabase
     NEO4J_AVAILABLE = True
@@ -33,39 +37,31 @@ except ImportError:
     NEO4J_AVAILABLE = False
     print("⚠️  neo4j driver not installed: pip install neo4j")
 
-# rank_bm25 — optional, guarded
 try:
     from rank_bm25 import BM25Okapi
     BM25_AVAILABLE = True
 except ImportError:
     BM25_AVAILABLE = False
 
-# qdrant_client — optional, guarded
 try:
     from qdrant_client import QdrantClient
-    from qdrant_client.models import ScoredPoint
     QDRANT_AVAILABLE = True
 except ImportError:
     QDRANT_AVAILABLE = False
     QdrantClient = None  # type: ignore
-    ScoredPoint = None   # type: ignore
-
-# NOTE: sentence_transformers / torch are NOT imported here.
-# They are imported lazily inside get_embedder() and get_reranker().
-# This lets unit tests import tools.py without needing torch installed.
 
 load_dotenv(dotenv_path=Path(__file__).resolve().parents[2] / ".env")
 logger = logging.getLogger(__name__)
 
-# ── Config ─────────────────────────────────────────────────────────────────────
+# ── Config (read from .env, Docker-internal names are expected) ──────────────────
 NEO4J_URI      = os.getenv("NEO4J_URI",      "bolt://localhost:7687")
 NEO4J_USER     = os.getenv("NEO4J_USER",     "neo4j")
 NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "changeme_neo4j_password")
 
-QDRANT_HOST    = os.getenv("QDRANT_HOST",            "localhost")
-QDRANT_PORT    = int(os.getenv("QDRANT_PORT",         "6333"))
-COLLECTION    = os.getenv("QDRANT_COLLECTION_NAME",  "financial_documents")
-RAG_TOP_K      = int(os.getenv("RAG_TOP_K",           "8"))
+QDRANT_HOST    = os.getenv("QDRANT_HOST",           "localhost")
+QDRANT_PORT    = int(os.getenv("QDRANT_PORT",        "6333"))
+COLLECTION    = os.getenv("QDRANT_COLLECTION_NAME", "financial_documents")
+RAG_TOP_K      = int(os.getenv("RAG_TOP_K",          "8"))
 
 PG_HOST        = os.getenv("POSTGRES_HOST",     "localhost")
 PG_PORT        = int(os.getenv("POSTGRES_PORT", "5432"))
@@ -76,8 +72,18 @@ PG_PASS        = os.getenv("POSTGRES_PASSWORD", "airflow")
 EMBED_MODEL    = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
 RERANK_MODEL   = os.getenv("RERANKER_MODEL",  "cross-encoder/ms-marco-MiniLM-L-6-v2")
 
-# ── Lazy-loaded ML singletons ──────────────────────────────────────────────────────
-# Types are Any here because the actual classes are only imported at call time.
+# ── Localhost fallback URIs (used when Docker hostname fails DNS) ────────────────
+# We extract the port from NEO4J_URI so it stays in sync with .env
+def _neo4j_localhost_uri() -> str:
+    """Swap Docker hostname in NEO4J_URI for localhost."""
+    import re as _re
+    m = _re.match(r"(bolt://)([^:]+)(:.*)", NEO4J_URI)
+    if m:
+        return f"{m.group(1)}localhost{m.group(3)}"
+    return "bolt://localhost:7687"
+
+
+# ── Lazy-loaded singletons ──────────────────────────────────────────────────────
 _embedder: Any = None
 _reranker: Any = None
 _neo4j_driver: Any = None
@@ -85,15 +91,10 @@ _qdrant_client: Any = None
 
 
 def get_embedder():
-    """
-    Lazily load SentenceTransformer.
-    torch/sentence_transformers are imported HERE, not at module level.
-    This means importing tools.py (and running unit tests) never touches torch.
-    """
     global _embedder
     if _embedder is None:
         try:
-            from sentence_transformers import SentenceTransformer  # lazy import
+            from sentence_transformers import SentenceTransformer
             logger.info(f"[tools] Loading embedder: {EMBED_MODEL}")
             _embedder = SentenceTransformer(EMBED_MODEL)
         except Exception as e:
@@ -103,14 +104,10 @@ def get_embedder():
 
 
 def get_reranker():
-    """
-    Lazily load CrossEncoder.
-    Same lazy-import pattern as get_embedder().
-    """
     global _reranker
     if _reranker is None:
         try:
-            from sentence_transformers import CrossEncoder  # lazy import
+            from sentence_transformers import CrossEncoder
             logger.info(f"[tools] Loading reranker: {RERANK_MODEL}")
             _reranker = CrossEncoder(RERANK_MODEL)
         except Exception as e:
@@ -120,46 +117,93 @@ def get_reranker():
 
 
 def get_neo4j_driver():
+    """
+    Try NEO4J_URI first (Docker hostname).
+    On DNS / connection failure, automatically retry with localhost.
+    """
     global _neo4j_driver
-    if _neo4j_driver is None and NEO4J_AVAILABLE:
+    if _neo4j_driver is not None or not NEO4J_AVAILABLE:
+        return _neo4j_driver
+
+    uris_to_try = [NEO4J_URI]
+    localhost_uri = _neo4j_localhost_uri()
+    if localhost_uri != NEO4J_URI:
+        uris_to_try.append(localhost_uri)
+
+    for uri in uris_to_try:
         try:
-            _neo4j_driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
-            with _neo4j_driver.session() as s:
+            driver = GraphDatabase.driver(uri, auth=(NEO4J_USER, NEO4J_PASSWORD))
+            with driver.session() as s:
                 s.run("RETURN 1")
-            logger.info("[tools] Neo4j connected")
+            logger.info(f"[tools] Neo4j connected via {uri}")
+            _neo4j_driver = driver
+            return _neo4j_driver
         except Exception as e:
-            logger.warning(f"[tools] Neo4j connection failed: {e}")
-            _neo4j_driver = None
-    return _neo4j_driver
+            logger.warning(f"[tools] Neo4j connection failed ({uri}): {e}")
+
+    logger.warning("[tools] Neo4j unavailable on all attempted URIs")
+    return None
 
 
 def get_qdrant():
+    """
+    Try QDRANT_HOST first (Docker hostname).
+    On DNS / connection failure, automatically retry with localhost.
+    """
     global _qdrant_client
-    if _qdrant_client is None and QDRANT_AVAILABLE:
+    if _qdrant_client is not None or not QDRANT_AVAILABLE:
+        return _qdrant_client
+
+    hosts_to_try = [QDRANT_HOST]
+    if QDRANT_HOST != "localhost":
+        hosts_to_try.append("localhost")
+
+    for host in hosts_to_try:
         try:
-            _qdrant_client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
-            _qdrant_client.get_collections()
-            logger.info("[tools] Qdrant connected")
+            client = QdrantClient(host=host, port=QDRANT_PORT)
+            client.get_collections()
+            logger.info(f"[tools] Qdrant connected via {host}:{QDRANT_PORT}")
+            _qdrant_client = client
+            return _qdrant_client
         except Exception as e:
-            logger.warning(f"[tools] Qdrant connection failed: {e}")
-            _qdrant_client = None
-    return _qdrant_client
+            logger.warning(f"[tools] Qdrant connection failed ({host}:{QDRANT_PORT}): {e}")
+
+    logger.warning("[tools] Qdrant unavailable on all attempted hosts")
+    return None
 
 
 # ── PostgreSQL: Sentiment ──────────────────────────────────────────────────────
+def _pg_connect(host: str):
+    """Open a psycopg2 connection to the given host."""
+    return psycopg2.connect(
+        host=host, port=PG_PORT, dbname=PG_DB,
+        user=PG_USER, password=PG_PASS,
+        connect_timeout=5,
+    )
+
+
 def fetch_sentiment(ticker: str) -> Dict:
     """
     Fetch latest sentiment_trends row for a ticker from PostgreSQL.
-    Table schema (from ingestion/etl/load_postgres.py):
-      sentiment_trends(ticker, date, bullish_pct, bearish_pct, neutral_pct, ingested_at)
-    Returns dict with pct fields, or empty dict on failure.
+    Tries PG_HOST (Docker name) first, then localhost on failure.
     """
+    hosts_to_try = [PG_HOST]
+    if PG_HOST != "localhost":
+        hosts_to_try.append("localhost")
+
+    conn = None
+    for host in hosts_to_try:
+        try:
+            conn = _pg_connect(host)
+            logger.debug(f"[tools] PostgreSQL connected via {host}")
+            break
+        except Exception as e:
+            logger.warning(f"[tools] PostgreSQL connection failed ({host}): {e}")
+
+    if conn is None:
+        return {}
+
     try:
-        conn = psycopg2.connect(
-            host=PG_HOST, port=PG_PORT, dbname=PG_DB,
-            user=PG_USER, password=PG_PASS,
-            connect_timeout=5,
-        )
         with conn:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                 cur.execute("""
@@ -194,7 +238,7 @@ def fetch_sentiment(ticker: str) -> Dict:
             "source":      "postgresql:sentiment_trends",
         }
     except Exception as e:
-        logger.warning(f"[tools] PostgreSQL sentiment fetch failed: {e}")
+        logger.warning(f"[tools] PostgreSQL query failed: {e}")
         return {}
 
 
@@ -213,7 +257,6 @@ def fetch_company_profile(ticker: str) -> Dict:
             if not record:
                 return {}
             props = dict(record["props"])
-
         return {
             "name":          props.get("Name") or props.get("name") or ticker,
             "sector":        props.get("Sector") or props.get("sector"),
@@ -310,7 +353,6 @@ def qdrant_news_search(query: str, ticker: str, k: int = RAG_TOP_K) -> List[str]
 def hybrid_retrieve(query: str, ticker: str, k_final: int = 5) -> Tuple[List[str], float]:
     """
     Neo4j vector + Cypher graph + BM25 → Cross-Encoder rerank.
-    get_embedder() / get_reranker() are called here — first call loads models.
     Returns (top_k_docs, crag_confidence_score).
     """
     q_lower = query.lower()
@@ -328,29 +370,23 @@ def hybrid_retrieve(query: str, ticker: str, k_final: int = 5) -> Tuple[List[str
     if not all_docs:
         return [], 0.0
 
-    # BM25 sparse scoring
     bm25_scores = [0.0] * len(all_docs)
     if BM25_AVAILABLE:
         try:
-            from rank_bm25 import BM25Okapi
-            tokenized = [d.lower().split() for d in all_docs]
-            bm25      = BM25Okapi(tokenized)
-            raw       = bm25.get_scores(query.lower().split())
-            max_raw   = max(raw) if max(raw) > 0 else 1.0
+            tokenized   = [d.lower().split() for d in all_docs]
+            bm25        = BM25Okapi(tokenized)
+            raw         = bm25.get_scores(query.lower().split())
+            max_raw     = max(raw) if max(raw) > 0 else 1.0
             bm25_scores = [s / max_raw for s in raw]
         except Exception:
             pass
 
-    # Cross-Encoder rerank (lazy-loads torch here)
     reranker  = get_reranker()
     pairs     = [[query, doc] for doc in all_docs]
     ce_scores = reranker.predict(pairs).tolist()
 
-    hybrid = [
-        0.3 * bm25_scores[i] + 0.7 * ce_scores[i]
-        for i in range(len(all_docs))
-    ]
-    ranked    = sorted(zip(all_docs, hybrid), key=lambda x: x[1], reverse=True)
+    hybrid   = [0.3 * bm25_scores[i] + 0.7 * ce_scores[i] for i in range(len(all_docs))]
+    ranked   = sorted(zip(all_docs, hybrid), key=lambda x: x[1], reverse=True)
     top_docs  = [doc for doc, _ in ranked[:k_final]]
     top_score = ranked[0][1] if ranked else 0.0
 
@@ -359,40 +395,27 @@ def hybrid_retrieve(query: str, ticker: str, k_final: int = 5) -> Tuple[List[str
 
 
 def crag_evaluate(score: float) -> str:
-    """Map confidence score to CRAG status."""
-    if score > 0.7:
-        return "CORRECT"
-    elif score >= 0.5:
-        return "AMBIGUOUS"
-    else:
-        return "INCORRECT"
+    if score > 0.7:  return "CORRECT"
+    elif score >= 0.5: return "AMBIGUOUS"
+    else:              return "INCORRECT"
 
 
 # ── Utilities ─────────────────────────────────────────────────────────────────
 def extract_json_from_response(content: str) -> Optional[dict]:
-    """Extract JSON from LLM response (handles markdown fences)."""
     match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", content, re.DOTALL)
     if match:
-        try:
-            return json.loads(match.group(1))
-        except json.JSONDecodeError:
-            pass
-    try:
-        return json.loads(content.strip())
-    except json.JSONDecodeError:
-        pass
+        try:    return json.loads(match.group(1))
+        except: pass
+    try:    return json.loads(content.strip())
+    except: pass
     match2 = re.search(r"\{.*\}", content, re.DOTALL)
     if match2:
-        try:
-            return json.loads(match2.group(0))
-        except json.JSONDecodeError:
-            pass
+        try:    return json.loads(match2.group(0))
+        except: pass
     logger.warning("[tools] Could not extract JSON from response")
     return None
 
 
 def _safe_float(val) -> Optional[float]:
-    try:
-        return float(val) if val is not None else None
-    except (TypeError, ValueError):
-        return None
+    try:    return float(val) if val is not None else None
+    except: return None
