@@ -53,8 +53,8 @@ RATE_LIMIT_DELAY = 60.0 / EODHD_RATE_LIMIT
 AGENT_CONFIGS = {
     "business_analyst": {
         "endpoints": [
-            ("financial_news",    "news",                 {"s": "{ticker_symbol}", "limit": 100}, "qdrant_prep"),
-            ("sentiment_trends",  "sentiments",           {"s": "{ticker_symbol}"},               "qdrant_prep"),
+            ("financial_news",    "news",                  {"s": "{ticker_symbol}", "limit": 100}, "qdrant_prep"),
+            ("sentiment_trends",  "sentiments",            {"s": "{ticker_symbol}"},               "qdrant_prep"),
             ("company_profile",   "fundamentals/{ticker}", {},                                    "neo4j"),
         ]
     },
@@ -75,19 +75,17 @@ AGENT_CONFIGS = {
     },
     "financial_modeling": {
         "endpoints": [
-            ("historical_prices_weekly",  "eod/{ticker}",         {"from": (datetime.now() - timedelta(days=365)).strftime('%Y-%m-%d'), "period": "w"}, "postgresql"),
-            ("historical_prices_monthly", "eod/{ticker}",         {"from": (datetime.now() - timedelta(days=730)).strftime('%Y-%m-%d'), "period": "m"}, "postgresql"),
-            ("dividends_history",         "div/{ticker}",         {},                                                                                    "postgresql"),
-            ("splits_history",            "splits/{ticker}",      {},                                                                                    "postgresql"),
-            ("earnings_history",          "calendar/earnings",    {"symbols": "{ticker_symbol}"},                                                         "postgresql"),
-            # Global datasets — load_postgres.py routes these to shared tables
-            ("ipo_calendar",              "calendar/ipos",        {"from": (datetime.now() - timedelta(days=365)).strftime('%Y-%m-%d')},                  "postgresql"),
+            ("historical_prices_weekly",  "eod/{ticker}",          {"from": (datetime.now() - timedelta(days=365)).strftime('%Y-%m-%d'), "period": "w"}, "postgresql"),
+            ("historical_prices_monthly", "eod/{ticker}",          {"from": (datetime.now() - timedelta(days=730)).strftime('%Y-%m-%d'), "period": "m"}, "postgresql"),
+            ("dividends_history",         "div/{ticker}",          {},                                                                                    "postgresql"),
+            ("splits_history",            "splits/{ticker}",       {},                                                                                    "postgresql"),
+            ("earnings_history",          "calendar/earnings",     {"symbols": "{ticker_symbol}"},                                                        "postgresql"),
+            ("ipo_calendar",              "calendar/ipos",         {"from": (datetime.now() - timedelta(days=365)).strftime('%Y-%m-%d')},                 "postgresql"),
             ("fundamentals_full",         "fundamentals/{ticker}", {},                                                                                    "postgresql"),
             ("analyst_estimates_eodhd",   "fundamentals/{ticker}", {},                                                                                    "postgresql"),
-            ("economic_calendar",         "economic-events",      {"from": (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')},                   "postgresql"),
+            ("economic_calendar",         "economic-events",       {"from": (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')},                  "postgresql"),
             ("exchange_details",          "exchange-details/{ticker}", {},                                                                                "postgresql"),
-            # Global dataset — stored once per day by load_postgres.py
-            ("bulk_eod_us",              "eod-bulk-last-day/US", {},                                                                                     "postgresql"),
+            ("bulk_eod_us",               "eod-bulk-last-day/US",  {},                                                                                    "postgresql"),
         ]
     }
 }
@@ -138,6 +136,35 @@ def fetch_data(endpoint, params=None):
         return None
 
 
+def _flatten_eodhd_fundamentals(data: dict) -> dict:
+    """
+    EODHD fundamentals/{ticker} returns a deeply nested dict.
+    Strategy:
+      1. Pull the 'General' section (company metadata) as the primary flat row.
+      2. Merge in select scalar fields from other top-level sections.
+      3. Drop any remaining nested dicts/lists so the result is always a flat row.
+    """
+    general = data.get("General", {})
+    flat = {k: v for k, v in general.items() if not isinstance(v, (dict, list))}
+
+    # Add a few useful scalars from other sections if present
+    highlights = data.get("Highlights", {})
+    for key in ["MarketCapitalization", "EBITDA", "PERatio", "EPS",
+                "DividendYield", "ProfitMargin", "RevenueGrowthYoY",
+                "EPSEstimateCurrentYear", "WallStreetTargetPrice"]:
+        if key in highlights and not isinstance(highlights[key], (dict, list)):
+            flat[f"Highlights_{key}"] = highlights[key]
+
+    valuation = data.get("Valuation", {})
+    for key in ["TrailingPE", "ForwardPE", "PriceSalesTTM",
+                "PriceBookMRQ", "EnterpriseValue", "EnterpriseValueRevenue",
+                "EnterpriseValueEbitda"]:
+        if key in valuation and not isinstance(valuation[key], (dict, list)):
+            flat[f"Valuation_{key}"] = valuation[key]
+
+    return flat
+
+
 def save_data(agent_name, ticker_symbol, data_name, data, metadata, storage_dest):
     if not data:
         print(f"  ⊘ Skipped (no data): {data_name}")
@@ -151,19 +178,40 @@ def save_data(agent_name, ticker_symbol, data_name, data, metadata, storage_dest
         print(f"  = Skipped (no changes): {data_name}")
         return False
 
+    # Always write JSON
     with open(agent_dir / f"{data_name}.json", 'w') as f:
         json.dump(data, f, indent=2)
 
+    # Write CSV — must succeed for neo4j destination
     try:
         if isinstance(data, list) and len(data) > 0:
             pd.DataFrame(data).to_csv(agent_dir / f"{data_name}.csv", index=False)
+
         elif isinstance(data, dict):
-            # Flatten one level — extract General section if present, else use root
-            flat = data.get("General", data)
-            flat_row = {k: str(v) for k, v in flat.items() if not isinstance(v, (dict, list))}
-            pd.DataFrame([flat_row]).to_csv(agent_dir / f"{data_name}.csv", index=False)
+            # Check if it's an EODHD fundamentals-style nested dict
+            if "General" in data:
+                flat_row = _flatten_eodhd_fundamentals(data)
+            else:
+                # Generic dict — try unwrap list values, else flatten scalars
+                list_val = next(
+                    (v for v in data.values() if isinstance(v, list) and len(v) > 0),
+                    None
+                )
+                if list_val:
+                    pd.DataFrame(list_val).to_csv(agent_dir / f"{data_name}.csv", index=False)
+                    flat_row = None
+                else:
+                    flat_row = {k: str(v) for k, v in data.items()
+                                if not isinstance(v, (dict, list))}
+
+            if flat_row is not None:
+                if flat_row:
+                    pd.DataFrame([flat_row]).to_csv(agent_dir / f"{data_name}.csv", index=False)
+                else:
+                    print(f"  Warning: flat_row empty for {data_name}, skipping CSV")
+
     except Exception as e:
-        print(f"  Warning: Could not save CSV: {e}")
+        print(f"  Warning: Could not save CSV for {data_name}: {e}")
 
     metadata[data_name] = {
         'hash': data_hash,
@@ -243,15 +291,15 @@ with DAG(
     'eodhd_complete_ingestion',
     default_args=default_args,
     description='EODHD Complete ingestion - all agents, all tickers',
-    schedule_interval='0 1 * * *',   # Daily 1am — no longer every hour
+    schedule_interval='0 1 * * *',
     start_date=days_ago(1),
     catchup=False,
     tags=['eodhd', 'complete', 'production'],
 ) as dag:
 
-    scrape_tasks     = {}
-    load_pg_tasks    = {}
-    load_neo4j_tasks = {}
+    scrape_tasks      = {}
+    load_pg_tasks     = {}
+    load_neo4j_tasks  = {}
     load_qdrant_tasks = {}
 
     for agent_name in AGENT_CONFIGS.keys():
