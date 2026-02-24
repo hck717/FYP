@@ -12,12 +12,11 @@ load_dotenv(dotenv_path=Path(__file__).resolve().parents[2] / ".env")
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MODEL = os.getenv("WEB_SEARCH_MODEL", "deepseek-v3.2-exp")
-POE_API_KEY   = os.getenv("POE_API_KEY", "").strip()
+# tools.py — remove POE_API_URL entirely
+PERPLEXITY_API_URL = "https://api.perplexity.ai/chat/completions"
+PERPLEXITY_API_KEY = os.getenv("PERPLEXITY_API_KEY", "").strip()
+DEFAULT_MODEL      = os.getenv("WEB_SEARCH_MODEL", "sonar")
 
-# Always append /chat/completions — guards against bare base URL in .env
-_POE_BASE = os.getenv("POE_API_URL", "https://api.poe.com/v1").rstrip("/")
-POE_API_URL = _POE_BASE if _POE_BASE.endswith("/chat/completions") else f"{_POE_BASE}/chat/completions"
 
 
 def poe_chat_completions(
