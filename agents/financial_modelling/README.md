@@ -23,7 +23,7 @@ It does **NOT** generate numbers via LLM. The LLM is only used to interpret the 
 
 **Handled by other agents (do not overlap):**
 - News sentiment and qualitative strategy → Business Analyst Agent
-- Macroeconomic rates and FX → Macro Economic Agent
+- Macroeconomic rates and FX → (Phase 3 — not yet implemented)
 - Real-time breaking news → Web Search Agent
 
 ---

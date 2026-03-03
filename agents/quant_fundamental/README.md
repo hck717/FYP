@@ -22,7 +22,7 @@ It does **NOT** use RAG, DuckDB, or cloud databases. All data comes from local D
 
 **Handled by other agents (do not overlap):**
 - DCF valuation and peer Comps → Financial Modelling Agent
-- Macro rate environment and FX → Macro Economic Agent
+- Macro rate environment and FX → (Phase 3 — not yet implemented)
 - Qualitative strategy and filings → Business Analyst Agent
 - Real-time news → Web Search Agent
 

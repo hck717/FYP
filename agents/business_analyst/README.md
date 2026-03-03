@@ -21,7 +21,7 @@ It does **NOT** make buy/sell judgements. It surfaces grounded facts and gaps fo
 **Handled by other agents (do not overlap):**
 - Real-time news and breaking events → Web Search Agent
 - Financial ratios, DCF, valuation → Financial Modelling Agent
-- Macro environment → Macro Metrics Agent
+- Macro environment → (Phase 3 — not yet implemented)
 
 ---
 

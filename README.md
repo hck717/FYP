@@ -1,834 +1,972 @@
-# 🎓 The Agentic Investment Analyst
+# The Agentic Investment Analyst
 ### *A Multi-Agent, Self-Improving RAG System for Fundamental Equity Analysis*
 
-![Python](https://img.shields.io/badge/Python-3.10%2B-blue)
+![Python](https://img.shields.io/badge/Python-3.11%2B-blue)
 ![LangGraph](https://img.shields.io/badge/LangGraph-Orchestration-orange)
 ![Qdrant](https://img.shields.io/badge/Qdrant-VectorDB-red)
 ![Neo4j](https://img.shields.io/badge/Neo4j-GraphDB-green)
 ![PostgreSQL](https://img.shields.io/badge/PostgreSQL-StructuredDB-blue)
-![License](https://img.shields.io/badge/License-MIT-green)
+![Ollama](https://img.shields.io/badge/Ollama-LocalLLM-purple)
 
 ---
 
-## 🚀 Quick Start (Infra)
+## Quick Start
 
 ```bash
-git pull
-cp .env.example .env
-docker-compose up --build -d
+# 1. Clone and configure
+git clone https://github.com/hck717/FYP.git
+cd FYP
+cp .env.example .env          # fill in API keys
+
+# 2. Start Ollama and pull required models
+ollama serve &
+ollama pull nomic-embed-text  # 768-dim embeddings
+ollama pull llama3.2:latest   # planner + quant narrative
+ollama pull deepseek-r1:8b    # business analyst + summarizer
+
+# 3. Start all Docker services (PostgreSQL, Qdrant, Neo4j, Airflow)
+docker compose up --build -d
+sleep 30                       # wait for containers to initialise
+
+# 4. Run the full analysis pipeline (Python API)
+source .venv/bin/activate
+python - <<'EOF'
+from orchestration.graph import run
+result = run("What is Apple's competitive moat and current valuation?")
+print(result["final_summary"])
+EOF
+
+# 5. Launch the Streamlit UI
+streamlit run POC/streamlit/streamlit.py
 ```
 
-- **Airflow UI:** http://localhost:8080 (admin/admin)
-- **Qdrant Dashboard:** http://localhost:6333/dashboard
-- **Neo4j Browser:** http://localhost:7474
-- **PostgreSQL:** localhost:5432
+**Service endpoints once running:**
 
-### 🔍 Inspect Local Databases
+| Service | URL | Credentials |
+|---|---|---|
+| Airflow UI | http://localhost:8080 | airflow / airflow |
+| Qdrant Dashboard | http://localhost:6333/dashboard | — |
+| Neo4j Browser | http://localhost:7474 | neo4j / changeme_neo4j_password |
+| PostgreSQL | localhost:5432 | airflow / airflow |
+| Ollama API | http://localhost:11434 | — |
+| Streamlit UI | http://localhost:8501 | — |
 
-**PostgreSQL (via psql):**
+---
+
+## Table of Contents
+
+1. [Abstract](#1-abstract)
+2. [Architecture Overview](#2-architecture-overview)
+3. [The Four Agent System (Implemented)](#3-the-four-agent-system-implemented)
+4. [Orchestration Layer](#4-orchestration-layer)
+5. [Database Architecture](#5-database-architecture)
+6. [Ingestion Pipeline](#6-ingestion-pipeline)
+7. [Running Agents](#7-running-agents)
+8. [Running the Orchestration](#8-running-the-orchestration)
+9. [Testing](#9-testing)
+10. [Streamlit UI](#10-streamlit-ui)
+11. [Environment Variables](#11-environment-variables)
+12. [Project Roadmap](#12-project-roadmap)
+13. [Evaluation Framework](#13-evaluation-framework)
+
+---
+
+## 1. Abstract
+
+Current AI solutions in finance suffer from **"black box" opacity**, **hallucinations**, and an inability to reconcile conflicting signals from multiple data sources. While Large Language Models can summarise text, they lack the structural reasoning to provide reliable investment analysis or justify their conclusions with auditable evidence.
+
+**The Agentic Investment Analyst** is an autonomous, multi-agent platform designed to replicate the workflow of a senior buy-side research team. It deploys **4 specialised domain agents** coordinated by a **LangGraph orchestration graph** operating on a **Global Plan-and-Execute / Local ReAct** architecture. Every agent uses a purpose-built RAG or deterministic reasoning strategy matched to its data type. All numeric outputs are Python-computed — never LLM-generated. Every qualitative claim cites a specific retrieved chunk ID.
+
+**Supported tickers (Phase 1–2):** AAPL, MSFT, GOOGL, TSLA, NVDA
+
+---
+
+## 2. Architecture Overview
+
+The platform operates in three runtime layers:
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  LAYER 1: INGESTION  (Offline / Airflow Scheduled)                  │
+│                                                                     │
+│  EODHD DAG (01:00 UTC) ──► scrape ──► load_postgres.py             │
+│  FMP DAG   (02:00 UTC)              ──► load_neo4j.py               │
+│                                     ──► load_qdrant.py (+ Ollama)   │
+│                                                                     │
+│  Databases: PostgreSQL 15 | Qdrant | Neo4j 5.15  (all Docker)      │
+└───────────────────────────────────┬─────────────────────────────────┘
+                                    │ data at rest
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  LAYER 2: INFERENCE  (Real-Time / LangGraph)                        │
+│                                                                     │
+│  [user query]                                                       │
+│       │                                                             │
+│       ▼                                                             │
+│  node_planner  (llama3.2:latest)                                    │
+│  ├── classifies intent & complexity (1=simple, 2=moderate, 3=full) │
+│  ├── resolves ticker symbol(s)                                      │
+│  ├── selects which agents to invoke                                 │
+│  └── runs data availability check (Neo4j + Qdrant + PG + Ollama)   │
+│       │                                                             │
+│       ▼                                                             │
+│  node_parallel_agents  (ThreadPoolExecutor)                         │
+│  ├── Business Analyst  (CRAG + hybrid retrieval)                    │
+│  ├── Quant Fundamental (deterministic SQL → Python math)            │
+│  ├── Financial Modelling (DCF + Comps + Technicals)                 │
+│  └── Web Search        (Perplexity sonar-pro, live web)             │
+│       │                                                             │
+│       ▼                                                             │
+│  node_react_check                                                   │
+│  └── loops back to parallel_agents if gaps + iterations remaining   │
+│       │                                                             │
+│       ▼                                                             │
+│  node_summarizer  (deepseek-r1:8b)                                  │
+│  └── synthesises all outputs → structured research note            │
+└───────────────────────────────────┬─────────────────────────────────┘
+                                    │ final_summary + citations
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  LAYER 3: SYNTHESIS & UI  (Streamlit)                               │
+│                                                                     │
+│  POC/streamlit/streamlit.py                                         │
+│  ├── streaming CoT display (plan → agents → synthesise)             │
+│  ├── per-agent result cards                                         │
+│  └── final research note with citations                             │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### Orchestration Pattern
+
+| Level | Pattern | Component | Description |
+|:---|:---|:---|:---|
+| **Global** | Plan-and-Execute | `node_planner` (llama3.2:latest) | Classifies intent, selects agents, caps ReAct iterations |
+| **Local** | ReAct loop | `node_react_check` | Re-runs gap agents; stops at complexity-derived iteration cap |
+| **Synthesis** | Prompt chaining | `node_summarizer` (deepseek-r1:8b) | Narrates all agent outputs into a 11-section research note |
+
+---
+
+## 3. The Four Agent System (Implemented)
+
+### Agent 1: Business Analyst — "The Deep Reader"
+
+**Status:** Complete | Live-tested, all 5 tickers validated
+
+**Goal:** Extract strategy, risk, and moat from financial news/filings with zero hallucinations.
+
+**Architecture:** Graph-Augmented Corrective RAG (CRAG) — 8-node LangGraph pipeline
+
+```
+Query + Ticker
+    │
+    ▼
+fetch_sentiment_data   ←  PostgreSQL: sentiment_trends table (bullish/bearish/neutral %)
+    │
+    ▼
+hybrid_retrieval       ←  Qdrant dense search (768-dim, nomic-embed-text)  [primary]
+                       ←  Neo4j vector index (384-dim, all-MiniLM-L6-v2)   [fallback]
+                       ←  BM25 keyword scoring
+    │
+    ▼
+hybrid_rerank          ←  30% BM25 + 70% Cross-Encoder (ms-marco-MiniLM-L-6-v2)
+    │
+    ▼
+crag_evaluate          ←  Confidence score:  CORRECT (>0.55) / AMBIGUOUS (0.35–0.55) / INCORRECT (<0.35)
+    │
+    ├─ CORRECT    ──►  generate_analysis   (deepseek-r1:8b on retrieved context)
+    ├─ AMBIGUOUS  ──►  rewrite_query  ──►  retry retrieval (max 1 loop)
+    └─ INCORRECT  ──►  web_search_fallback (calls Web Search Agent)
+    │
+    ▼
+format_json_output     ←  Structured JSON with chunk_id citations
+```
+
+**Key design choices:**
+- All JSON fields cite `qdrant::TICKER::title-slug` chunk IDs — no unsourced claims
+- `_strip_ungrounded_inline_citations()` post-processes output to remove hallucinated IDs
+- `deepseek-r1:8b` with `think=False`; defensive `_strip_think_tags()` also applied
+- Qdrant is the primary source (~2,390 vectors across 5 tickers); Neo4j returns 0 (no Chunk nodes yet)
+
+**CLI:**
 ```bash
-docker exec -it fyp-postgres psql -U airflow -d airflow
-\dt          -- list tables
-SELECT * FROM raw_timeseries LIMIT 10;
+# Default task: competitive moat
+.venv/bin/python -m agents.business_analyst.agent --ticker AAPL --log-level WARNING
+
+# Custom task
+.venv/bin/python -m agents.business_analyst.agent \
+  --ticker TSLA \
+  --task "What are Tesla's key business risks and competitive vulnerabilities?" \
+  --log-level WARNING
 ```
 
-**Qdrant (via Dashboard):**
-Navigate to http://localhost:6333/dashboard → Collections → `financial_documents`
+**Programmatic API:**
+```python
+from agents.business_analyst import run, run_full_analysis
 
-**Neo4j (via Browser):**
-Navigate to http://localhost:7474 → `MATCH (n) RETURN n LIMIT 25`
+result = run(task="What is Apple's competitive moat?", ticker="AAPL")
+dossier = run_full_analysis(ticker="AAPL")   # all 5 pillars in one pass
+```
 
-For full setup details, see `docs/setup_guide.md`.
+---
 
-### DAG Execution Commands
+### Agent 2: Quantitative Fundamental — "The Math Auditor"
 
+**Status:** Complete | Live-tested, all 5 tickers validated
+
+**Goal:** Compute fundamental factors deterministically — all numbers from Python/SQL, never LLM.
+
+**Architecture:** 8-node deterministic LangGraph pipeline (Non-RAG)
+
+```
+ticker / natural-language prompt
+    │
+    ▼
+fetch_financials         ←  PostgreSQL: raw_fundamentals
+                               (ratios_ttm, key_metrics_ttm, financial_scores,
+                                earnings_history, analyst_estimates_eodhd)
+    │
+    ▼
+chain_of_table_reasoning ←  SELECT → FILTER → CALCULATE → RANK → IDENTIFY
+    │
+    ▼
+data_quality_check       ←  Validates field presence + numeric ranges
+    │
+    ▼
+calculate_value_factors  ←  P/E trailing, EV/EBITDA, P/FCF, EV/Revenue
+    │
+    ▼
+calculate_quality_factors←  ROE, ROIC, Piotroski F-Score (9-pt), Beneish M-Score
+    │
+    ▼
+calculate_momentum_risk  ←  Beta (60-day), Sharpe Ratio (12M), 12M return
+    │
+    ▼
+flag_anomalies           ←  Z-score > 2 on gross_margin, ebit_margin, roe
+    │
+    ▼
+format_json_output       ←  LLM writes quantitative_summary only (no arithmetic)
+```
+
+**CLI:**
 ```bash
-# Set scheduler container variable (docker compose v2)
-SCHED=$(docker compose ps -q airflow-scheduler)
-
-# List all DAGs
-docker exec -it $SCHED airflow dags list
-
-# Trigger a specific DAG (replace DAG_ID)
-docker exec -it $SCHED airflow dags unpause <DAG_ID>
-docker exec -it $SCHED airflow dags trigger  <DAG_ID>
-
-# Check run status
-docker exec -it $SCHED airflow dags list-runs -d <DAG_ID>
-
-# View task logs
-docker exec -it $SCHED airflow tasks list <DAG_ID>
-docker exec -it $SCHED airflow tasks logs <DAG_ID> <TASK_ID> <RUN_ID>
-```
-
----
-
-## 📖 1. Abstract
-
-Current AI solutions in finance suffer from **"black box" opacity**, **hallucinations**, and an inability to reconcile conflicting signals from multiple data sources. While Large Language Models can summarize text, they lack the structural reasoning to provide reliable investment analysis or justify their conclusions with auditable evidence.
-
-**The Agentic Investment Analyst** is an autonomous, multi-agent platform designed to replicate the workflow of a senior buy-side research team. It deploys **9 specialized agents** — 7 domain experts, 1 Orchestrator (Supervisor), and 1 Synthesizer — operating on a **Global Plan-and-Execute / Local ReAct** architecture. Every agent uses a purpose-built RAG or reasoning strategy matched to its data type. The system handles queries from simple stock questions to full fundamental analyses, producing transparent, citation-verified reports with a full audit trail.
-
----
-
-## 🎯 2. Project Objectives
-
-- **Eliminate Hallucinations:** All numerical claims are computed deterministically via Python/SQL (dual-path verification). All qualitative claims must cite a specific retrieved chunk.
-- **Visible Reasoning:** A full Chain-of-Thought trace — Plan → Execute → Conflict-Resolve → Synthesize — is displayed in the UI for every query.
-- **Conflict-Aware Synthesis:** When agents disagree (e.g., Quant says "undervalued", Consensus says "earnings miss"), the Synthesizer explicitly resolves the conflict with a named winner and rationale.
-- **All-Local Data Stack:** All databases (PostgreSQL, Qdrant, Neo4j) run in Docker on localhost — zero cloud dependency for data storage.
-- **Cost-Effective LLM Strategy:** Local Ollama models (Qwen 2.5, Llama 3.2) handle high-volume offline tasks; cloud LLMs (GPT-4o, GPT-4o-mini) handle real-time reasoning only.
-
----
-
-## 🏗️ 3. High-Level Architecture
-
-The platform is structured in three runtime layers:
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│  LAYER 1: INGESTION (Offline / Airflow Scheduled)               │
-│  Airflow DAGs → ETL → PostgreSQL | Qdrant | Neo4j (All Local)   │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  LAYER 2: INFERENCE (Real-Time / LangGraph)                     │
-│  Supervisor (GPT-4o) → Parallel Agent Execution (7 Agents)      │
-│  Global Plan-and-Execute  +  Per-Agent Local ReAct Loops        │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  LAYER 3: SYNTHESIS (Real-Time / GPT-4o)                        │
-│  Conflict Resolution → Citation Verification → Report Assembly  │
-│  Streamlit UI with streaming CoT + clickable citations          │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-### Orchestration Pattern: Global Plan-and-Execute + Local ReAct
-
-| Level | Pattern | Agent | Description |
-| :--- | :--- | :--- | :--- |
-| **Global** | Plan-and-Execute | Supervisor (GPT-4o) | Classifies intent, selects agents, runs them in parallel, routes to Synthesizer |
-| **Local** | ReAct | Each of the 7 Expert Agents | Each agent runs its own Thought → Action → Observation loop internally |
-
----
-
-## 🤖 4. The Nine-Agent System
-
-### Orchestration Agents
-
-#### 🎯 Supervisor Agent (The "Senior PM")
-- **Model:** GPT-4o
-- **Role:** Global Plan-and-Execute orchestrator.
-- **Responsibilities:**
-  - Classify user intent (Specific Question / Comparative Analysis / Full Fundamental Analysis)
-  - Select which of the 7 expert agents to invoke
-  - Execute agents in parallel via LangGraph
-  - Detect conflicts between agent outputs
-  - Route consolidated outputs to the Synthesizer
-- **Conflict Resolution Examples:**
-  - *Analyst Optimism vs. Competitor Reality* → "⚠️ TRAP DETECTED. Street estimates ignore sector-wide warning signals from market leader."
-  - *Insider Buying vs. Negative News* → "💡 CONTRARIAN OPPORTUNITY. Market overreacting to rumours. Insiders betting heavily on recovery."
-  - *Cheap Valuation vs. Macro Headwind* → "⚠️ VALUE TRAP. FX headwinds will wipe out earnings gains. Wait for stabilization."
-
-#### 📝 Synthesizer Agent (The "Editor-in-Chief")
-- **Model:** GPT-4o
-- **Role:** Post-execution consolidation, conflict narration, and final report formatting.
-- **Responsibilities:**
-  - Receive all 7 agent outputs as structured JSON
-  - Resolve detected conflicts with explicit winner selection and rationale
-  - Render one of three output templates (Q&A / Comparison / Full Analysis)
-  - Enforce `[chunk:id]` citation protocol — every factual claim requires a source
-  - Produce the Agent Consensus Matrix
-- **Output Templates:**
-
-```
-# Q&A Template
-## Answer: {direct_answer}
-## Supporting Evidence: {cited_bullet_points}
-
-# Comparison Template
-## Executive Summary: {key_differences}
-## Side-by-Side Table: {comparison_table_with_citations}
-## Recommendation: {synthesized_insight}
-
-# Full Analysis Template
-## 1. Company Overview        → Business Analyst
-## 2. Financial Health        → Quant Fundamental + Financial Modelling
-## 3. Valuation               → Financial Modelling + Quant
-## 4. Macro & FX Risk         → Macro Economic
-## 5. Market Consensus Gaps   → Consensus & Strategy
-## 6. Insider & Sentiment     → Insider & Sentiment
-## 7. Breaking Developments   → Web Search
-## 8. Conflict Resolution     → Synthesizer Narrative
-## 9. Investment Thesis       → Conviction Level + Entry/Target/Stop
-```
-
----
-
-### 7 Expert Domain Agents
-
----
-
-#### 1. 🧠 Business Analyst Agent (The "Deep Reader")
-**Goal:** Extract strategy and risk from 10-K/10-Q filings with zero hallucinations.
-
-**Architecture:** Graph-Augmented Corrective RAG (CRAG) with Proposition Chunking.
-
-**Ingestion — Proposition-Based Chunking:**
-- An LLM decomposes each 10-K/10-Q section into atomic, self-contained propositions.
-- Example: `"Risk Factor 1: The company derives 65% of revenue from semiconductor customers, creating concentration risk."` → one complete Qdrant vector.
-- Benefit: 25–30% better context preservation vs. naive character chunking.
-- Storage: Qdrant with metadata `{filing_date, section, ticker, proposition_id}`.
-
-**Retrieval — Hybrid Search (3 Paths):**
-- **Dense (Vector):** Neo4j vector index (384-dim, `all-MiniLM-L6-v2`) for filing chunks; Qdrant semantic search (`nomic-embed-text`, 768-dim) for news embeddings.
-- **Sparse (Keyword):** BM25 for exact financial terms (e.g., "goodwill impairment", "covenant breach").
-- **Structural (Graph):** Neo4j Cypher traversal — `MATCH (:Strategy)-[:DEPENDS_ON]->(:Technology)`.
-
-**Refinement — Corrective RAG (CRAG):**
-- A BERT/small-LLM evaluator scores each retrieved document (0–1).
-- Score < 0.5: Discard and trigger the Web Search Agent as fallback.
-- Score 0.5–0.7: Rewrite the query and retry retrieval once; fall back to web search if still ambiguous.
-- Score > 0.7: Use directly.
-
----
-
-#### 2. 📊 Quantitative Fundamental Agent (The "Math Auditor")
-**Goal:** Detect financial anomalies and compute fundamental factors with mathematical accuracy.
-
-**Architecture:** LangGraph `StateGraph` — 8-node deterministic pipeline (Non-RAG). All numeric fields are Python-computed from PostgreSQL; the LLM is used only to generate the plain-text `quantitative_summary` narrative.
-
-**Data Sources:** PostgreSQL (local Docker) — tables `raw_fundamentals`, `raw_timeseries`, `market_eod_us`.
-
-**8-Node Pipeline:**
-
-| # | Node | Description |
-| :- | :--- | :--- |
-| 1 | `fetch_fundamentals` | Pulls `ratios_ttm`, `key_metrics_ttm`, `financial_scores`, `earnings_history`, `analyst_estimates_eodhd` from `raw_fundamentals` |
-| 2 | `fetch_price_history` | Pulls `historical_prices_eod` from `raw_timeseries` (252 trading days) |
-| 3 | `compute_value_factors` | Python: P/E, EV/EBITDA, P/FCF, EV/Revenue |
-| 4 | `compute_quality_factors` | Python: ROE, ROIC, Piotroski F-Score, Beneish M-Score |
-| 5 | `compute_momentum_risk` | Python: Beta (60-day), Sharpe Ratio, 12-month return |
-| 6 | `detect_anomalies` | Z-score flagging across computed factor set |
-| 7 | `data_quality_check` | Validates field presence and numeric range from PostgreSQL data |
-| 8 | `generate_summary` | LLM (Ollama `llama3.2:latest`) narrates findings as plain text |
-
-**Factor Analysis:**
-
-| Category | Metrics |
-| :--- | :--- |
-| **Value** | P/E trailing, EV/EBITDA, P/FCF, EV/Revenue |
-| **Quality** | ROE, ROIC, Piotroski F-Score, Beneish M-Score |
-| **Momentum/Risk** | Beta (60-day rolling), Sharpe Ratio (12M), 12-Month Return % |
-| **Key Metrics** | Gross Margin, EBIT Margin, FCF Conversion, DSO Days, Current Ratio, D/E |
-
-**Output Schema:**
-```json
-{
-  "agent": "quant_fundamental",
-  "ticker": "AAPL",
-  "as_of_date": "2026-02-28",
-  "time_range": "TTM",
-  "value_factors":    { "pe_trailing": 33.08, "ev_ebitda": 25.6, "p_fcf": 31.85, "ev_revenue": 9.02 },
-  "quality_factors":  { "roe": 1.5994, "roic": 0.5101, "piotroski_f_score": 9, "beneish_m_score": null, "manipulation_risk": null },
-  "momentum_risk":    { "beta_60d": null, "sharpe_ratio_12m": 0.6906, "return_12m_pct": 2.38 },
-  "key_metrics":      { "gross_margin": 0.4733, "ebit_margin": 0.3238, "fcf_conversion": null, "dso_days": 58.92, "current_ratio": 0.9737, "debt_to_equity": 1.0263 },
-  "anomaly_flags":    [],
-  "data_quality":     { "status": "PASSED", "checks_passed": 9, "checks_total": 9, "issues": [] },
-  "quantitative_summary": "<plain-text narrative from LLM — no calculations, no invented numbers>",
-  "data_sources": {
-    "fundamentals": "postgresql:raw_fundamentals",
-    "price_history": "postgresql:raw_timeseries",
-    "benchmark":    "postgresql:market_eod_us",
-    "llm_scope":    "quantitative_summary narrative only",
-    "llm_model":    "llama3.2:latest"
-  }
-}
-```
-
-**CLI Usage:**
-
-Two input modes are supported. `--ticker` and `--prompt` are mutually exclusive.
-
-```bash
-# Mode 1: Direct ticker symbol
+# Direct ticker
 .venv/bin/python -m agents.quant_fundamental.agent --ticker AAPL --log-level WARNING
 .venv/bin/python -m agents.quant_fundamental.agent --ticker MSFT --log-level WARNING
 .venv/bin/python -m agents.quant_fundamental.agent --ticker GOOGL --log-level WARNING
 .venv/bin/python -m agents.quant_fundamental.agent --ticker TSLA --log-level WARNING
 .venv/bin/python -m agents.quant_fundamental.agent --ticker NVDA --log-level WARNING
 
-# Mode 2: Natural-language prompt (planner-agent compatible)
-# The ticker is extracted automatically from the prompt text.
-.venv/bin/python -m agents.quant_fundamental.agent --prompt "Analyze AAPL fundamentals" --log-level WARNING
-.venv/bin/python -m agents.quant_fundamental.agent --prompt "Run quant fundamental analysis for MSFT" --log-level WARNING
-.venv/bin/python -m agents.quant_fundamental.agent --prompt "What are the fundamentals for ticker GOOGL?" --log-level WARNING
-.venv/bin/python -m agents.quant_fundamental.agent --prompt "TSLA analysis please" --log-level WARNING
-.venv/bin/python -m agents.quant_fundamental.agent --prompt "Please run the quantitative fundamental report for NVDA stock" --log-level WARNING
+# Natural-language prompt (ticker extracted automatically)
+.venv/bin/python -m agents.quant_fundamental.agent \
+  --prompt "Analyze AAPL fundamentals" --log-level WARNING
 
-# Programmatic usage (planner/synthesizer agent)
-# from agents.quant_fundamental.agent import run_full_analysis
-# run_full_analysis(ticker="AAPL")
-# run_full_analysis(prompt="Analyze AAPL fundamentals")
-
-# Run unit + integration tests
-.venv/bin/python -m pytest agents/quant_fundamental/tests/test_agent.py -v
+# Override LLM model
+LLM_MODEL_QUANTITATIVE=deepseek-r1:8b \
+  .venv/bin/python -m agents.quant_fundamental.agent --ticker AAPL
 ```
 
----
-
-#### 3. 💰 Financial Modelling Agent (The "Valuation Engine")
-**Goal:** Build rigorous, assumption-driven valuation models and stress-test scenarios.
-
-**Architecture:** Deterministic Python computation engine (Non-RAG). All outputs are calculated — never generated by LLM directly.
-
-**Data Sources:** PostgreSQL (local) — historical financials, analyst estimates, WACC inputs.
-
-**Models Implemented:**
-
-**Discounted Cash Flow (DCF):**
-- Inputs: Revenue growth assumptions (Base / Bull / Bear), EBIT margins, D&A, Capex, NWC changes.
-- WACC calculation: `WACC = (E/V × Re) + (D/V × Rd × (1 - Tax))`
-- Terminal Value: Gordon Growth Model — `TV = FCF_n × (1 + g) / (WACC - g)`
-- Output: Intrinsic Value per share + Sensitivity Matrix (WACC × Terminal Growth Rate).
-
-**Comparable Company Analysis (Comps):**
-- Pulls peer group EV/EBITDA, P/E, EV/Revenue multiples from PostgreSQL.
-- Applies median/mean peer multiples to target company metrics.
-- Output: Implied valuation range across multiples.
-
-**Precedent Transactions:**
-- Historical M&A deal multiples (from FMP) for sector benchmarking.
-
-**Scenario Analysis:**
+**Programmatic API:**
 ```python
-scenarios = {
-    "Bear": {"revenue_growth": -0.05, "margin": 0.10, "wacc": 0.12},
-    "Base": {"revenue_growth":  0.08, "margin": 0.18, "wacc": 0.10},
-    "Bull": {"revenue_growth":  0.20, "margin": 0.25, "wacc": 0.09},
-}
-# Returns: {"Bear": $85, "Base": $130, "Bull": $195}
+from agents.quant_fundamental.agent import run, run_full_analysis
+
+result = run(ticker="AAPL")
+result = run(prompt="Analyze AAPL fundamentals")
+result["value_factors"]["pe_trailing"]         # → 33.08 (Python-computed)
+result["quality_factors"]["piotroski_f_score"] # → 9
 ```
 
-**LBO Analysis (Optional):**
-- Models leveraged buyout entry/exit multiples and IRR for private-equity context.
+**Live results (validated):**
 
-**Output:** Intrinsic value range, upside/downside to current price, scenario probability weighting.
-
----
-
-#### 4. 🤨 Market Consensus & Strategy Agent (The "Skeptic")
-**Goal:** Understand "The Narrative" vs. "The Reality" — verify, don't trust.
-
-**Architecture:** Contrastive RAG (Internal Company View vs. Street View vs. Competitor View).
-
-**Data Sources:**
-- **PostgreSQL (local):** FMP Analyst Estimates (EPS/Rev consensus), Price Targets, Ratings, Upgrades/Downgrades.
-- **Qdrant (local):** Scraped competitor 10-K "Item 1A" (Risk) and "Item 7" (MD&A) sections from SEC EDGAR for top-5 peers; financial news summaries (Yahoo Finance / CNBC); FMP Earnings Transcripts.
-
-**Process — Gap Analysis:**
-1. Retrieve target company's stated strategy (from Business Analyst Agent).
-2. Retrieve sell-side analyst thesis (from scraped summaries in Qdrant).
-3. Retrieve competitor strategy (from peer filings in Qdrant).
-4. Generate Gap Analysis:
-   - Is the market ignoring a risk that a competitor highlighted?
-   - Is the analyst's growth target higher than the company's own guidance?
-   - Are consensus estimates above/below recent management tone?
-
-**Output:** `Consensus Gap Score` (High gap = Opportunity or Trap, requires Synthesizer arbitration).
+| Ticker | Data Quality | Piotroski | P/E | Sharpe 12M |
+|---|---|---|---|---|
+| AAPL | PASSED (9/9) | 9 | 33.08 | 0.69 |
+| MSFT | PASSED (9/9) | 7 | 24.47 | -5.19 |
+| GOOGL | PASSED (9/9) | 7 | 28.48 | -3.66 |
+| TSLA | PASSED (9/9) | 6 | 342.78 | -2.49 |
+| NVDA | PASSED (9/9) | 6 | 35.87 | -1.76 |
 
 ---
 
-#### 5. 🌍 Macro Economic Agent (The "Economist")
-**Goal:** Analyze economic cycles, interest rates, and FX impact on the target company.
+### Agent 3: Financial Modelling — "The Valuation Engine"
 
-**Architecture:** Text-to-SQL Time-Series Analysis + RAG on Central Bank Communications.
+**Status:** Complete | Live-tested, all 5 tickers validated
 
-**Data Sources:**
-- **PostgreSQL (local):** 30+ macro indicators — GDP, CPI, PPI, Unemployment, PMI, Yield Curve, Fed Funds Rate, 10Y/2Y Treasury Yields (EODHD & FMP).
-- **Qdrant (local):** Fed/ECB meeting minutes, FOMC transcripts, economic news articles.
+**Goal:** Build rigorous, assumption-driven valuation models — all numbers are computed, never LLM-generated.
 
-**Analysis:**
-- **Economic Cycle Classification:** Expansion / Peak / Contraction / Trough (via Yield Curve inversion + PMI trend).
-- **FX Impact:** Calculate interest rate differential; overlay with company's reported geographic revenue exposure from 10-K.
-- **Rate Sensitivity:** Duration analysis for debt-heavy companies; discount rate impact on DCF valuations.
+**Architecture:** 8-node deterministic computation engine (Non-RAG)
 
-**Output:** `{cycle_stage, fx_risk_score, rate_sensitivity_rating, macro_narrative}`.
+```
+Query + Ticker
+    │
+    ▼
+fetch_price_history      ←  PostgreSQL: raw_timeseries (1-year EOD, split-adjusted)
+    │
+    ▼
+fetch_fundamentals       ←  PostgreSQL: raw_fundamentals (PE, EPS, EBITDA, FCF, Debt)
+    │
+    ▼
+fetch_earnings_history   ←  PostgreSQL: raw_fundamentals (earnings_history)
+    │
+    ▼
+calculate_technicals     ←  SMA 20/50/200, EMA 12/26, RSI(14), MACD, Bollinger Bands,
+                             ATR(14), HV30, Stochastic Oscillator
+    │
+    ▼
+run_dcf_model            ←  Python: 5-year FCF projection + WACC (CAPM) + Terminal Value
+                             → Bear / Base / Bull scenarios
+                             → Sensitivity matrix (WACC × Terminal Growth Rate)
+    │
+    ▼
+run_comparable_analysis  ←  PostgreSQL: peer EV/EBITDA, P/E, EV/Revenue
+                             Neo4j: COMPETES_WITH / BELONGS_TO edges for peer selection
+    │
+    ▼
+assess_analyst_estimates ←  EPS/Revenue consensus vs actuals, surprise %, beat streak
+    │
+    ▼
+format_json_output       ←  deepseek-r1:8b writes quantitative_summary narrative only
+```
+
+**Models implemented:**
+
+| Model | Key Outputs |
+|---|---|
+| **DCF** | Intrinsic value (Bear/Base/Bull), WACC via CAPM, sensitivity matrix (WACC × g) |
+| **Comps** | EV/EBITDA, P/E, P/S, EV/Revenue vs peer median; `vs_sector_avg` premium/discount |
+| **Technicals** | RSI, MACD, Bollinger Bands, ATR, HV30, SMA 50/200, Golden/Death Cross |
+| **Factor Scores** | Piotroski F-Score, Beneish M-Score, Altman Z-Score |
+
+**CLI:**
+```bash
+# Full valuation dossier
+python -m agents.financial_modelling.agent --ticker AAPL --log-level WARNING
+python -m agents.financial_modelling.agent --ticker NVDA --log-level WARNING
+
+# With explicit LLM model
+LLM_MODEL_FINANCIAL_MODELING=deepseek-r1:8b \
+  python -m agents.financial_modelling.agent --ticker MSFT --log-level WARNING
+```
+
+**Programmatic API:**
+```python
+from agents.financial_modelling import run, run_full_analysis
+
+dossier = run_full_analysis(ticker="AAPL")
+dossier["valuation"]["dcf"]["intrinsic_value_base"]  # → 195.20
+dossier["technicals"]["rsi_14"]                       # → 58.3
+dossier["earnings"]["beat_streak"]                    # → 6
+```
 
 ---
 
-#### 6. 🐋 Insider & Sentiment Agent (The "Psychologist")
-**Goal:** Detect divergence between what management says and what insiders actually do.
+### Agent 4: Web Search — "The News Desk"
 
-**Architecture:** Temporal Contrastive RAG (Time-Travel Comparison).
+**Status:** Complete | Live-tested | 6/6 tests passing
 
-**Data Sources:**
-- **Qdrant (local):** Earnings call transcripts (chunked by speaker turn); investor day presentation PDFs (scraped → text).
-- **PostgreSQL (local):** SEC Form 4 insider trades; 13F institutional holdings.
+**Goal:** Surface "unknown unknowns" — breaking developments not yet in the local static knowledge base.
 
-**Retrieval — Time-Travel:**
-- Compare current quarter's transcript embeddings vs. prior quarter.
-- Cosine similarity between Q_n guidance language and Q_{n-1} guidance language.
+**Architecture:** HyDE + Step-Back Prompting → Perplexity sonar-pro (live web)
 
-**Analysis — Difference Engine:**
-- **Semantic Drift:** Low cosine similarity score = narrative shift (e.g., CEO pivoting from "growth" language to "efficiency" language).
-- **Visual vs. Verbal:** Compare slide deck promises (bullish visuals) vs. transcript Q&A (hesitant responses).
-- **Action Check:** `IF Sentiment = Bullish AND Insiders = NET_SELLING → RED_FLAG`.
-- **Institutional Crowding:** Flag if top-10 holders own >60% of float (liquidity risk).
+```
+Query + Ticker
+    │
+    ▼
+Step-Back Prompting   →  "What macro/sector/competitor events could affect this company?"
+    │
+    ▼
+HyDE                  →  Generate hypothetical ideal news article → embed → guide search
+    │
+    ▼
+Perplexity sonar-pro  →  Live web search with freshness reranking (<24h preferred)
+    │
+    ▼
+Hallucination Guard   →  Every factual claim requires URL + date
+                          Single-source claims labelled "UNCONFIRMED"
+    │
+    ▼
+format_json_output    →  breaking_news[], sentiment_signal, unknown_risk_flags[],
+                          competitor_signals[], supervisor_escalation
+```
 
-**Output:** `{narrative_drift_score, insider_conviction_level, divergence_alerts[]}`.
+**CLI / Smoke test:**
+```bash
+# Verify API key loaded
+python - <<'EOF'
+from agents.web_search.tools import PERPLEXITY_API_KEY, DEFAULT_MODEL
+print("Key loaded:", bool(PERPLEXITY_API_KEY))
+print("Model:", DEFAULT_MODEL)
+EOF
+
+# Live smoke test
+python - <<'EOF'
+from agents.web_search.agent import run_web_search_agent
+import json
+result = run_web_search_agent({
+    "query": "NVDA latest regulatory risk Q1 2026",
+    "ticker": "NVDA",
+    "recency_filter": "week",
+    "model": "sonar-pro"
+})
+print(json.dumps(result, indent=2))
+EOF
+```
+
+**Required `.env` key:**
+```bash
+PERPLEXITY_API_KEY=pplx-xxxxxxxxxxxxxxxx
+```
 
 ---
 
-#### 7. 🌐 Web Search Agent (The "News Desk")
-**Goal:** Find "unknown unknowns" and surface breaking developments in real time.
+## 4. Orchestration Layer
 
-**Model:** Qwen 2.5 (local Ollama) — fast, low-cost, sufficient for news triage.
+The orchestration layer (`/orchestration/`) coordinates the four agents via a LangGraph `StateGraph`.
 
-**Architecture:** HyDE + Step-Back Prompting + Freshness Reranking.
+### Graph Topology
 
-**Workflow:**
-1. **Step-Back Prompting:** "What recent macro or sector events could affect this company?"
-2. **HyDE (Hypothetical Document Embeddings):** Generate a fake, ideal news article → embed → search Qdrant for real matching chunks.
-3. **Reranking:** Filter results for Freshness (< 24h preferred) and Source Credibility (filings > wire news > social).
-4. **Fallback Role:** Automatically triggered when Business Analyst's CRAG score < 0.5.
+```
+[planner] ──► [parallel_agents] ──► [react_check] ──┐
+                    ▲                                │ loop if gaps + iterations left
+                    └────────────────────────────────┘
+                                    │ all done
+                                    ▼
+                              [summarizer] ──► END
+```
 
-**Data Sources:** EODHD News Feed, FMP Press Releases, SEC EDGAR live filings, live web search.
+### Key Files
 
-**Output:** `{breaking_news[], sentiment_signal, unknown_risk_flags[]}`.
+| File | Purpose |
+|---|---|
+| `graph.py` | `build_graph()` (parallel, default) + `build_sequential_graph()` (debug) + `run()` + `stream()` |
+| `nodes.py` | All 8 node functions: planner, parallel_agents, 4 agent wrappers, react_check, summarizer |
+| `state.py` | `OrchestrationState` TypedDict — the shared state schema |
+| `llm.py` | `plan_query()` (llama3.2) + `summarise_results()` (deepseek-r1:8b) + prompts |
+| `citations.py` | `build_citation_block()` + `inject_inline_numbers()` — `[N]` reference section |
+| `data_availability.py` | `check_all()` — concurrent ping of Neo4j, Qdrant, PostgreSQL, Ollama |
+
+### Programmatic Usage
+
+```python
+from orchestration.graph import run, stream
+
+# Blocking call — returns full final state dict
+result = run("What is Apple's competitive moat and current valuation?")
+print(result["final_summary"])
+print(result["ticker"])          # "AAPL"
+print(result["plan"])            # {"agents": ["business_analyst", "quant_fundamental", ...]}
+
+# Streaming — yields (node_name, partial_state) tuples as each node completes
+for node_name, node_output in stream("Compare MSFT vs AAPL"):
+    print(f"[{node_name}] completed")
+
+# Force sequential mode (debug)
+import os
+os.environ["ORCHESTRATION_SEQUENTIAL"] = "1"
+result = run("Simple AAPL P/E query")
+```
+
+### ReAct Loop Behaviour
+
+| Complexity | Max Passes | Triggered By |
+|---|---|---|
+| 1 (simple look-up) | 1 | Single metric questions |
+| 2 (moderate analysis) | 2 | Multi-factor analysis |
+| 3 (full report) | 3 | Comparative / full fundamental analysis |
+
+On each loop, only agents with **no output** or an **error** are re-run. Successful agents are never re-executed.
+
+### Planner Models
+
+| Node | Model | Justification |
+|---|---|---|
+| `node_planner` | `llama3.2:latest` | Fast (~3s); reliable JSON routing |
+| `node_summarizer` | `deepseek-r1:8b` | Deep analytical prose for 11-section research note |
 
 ---
 
-## 🗄️ 5. Local Database Architecture
+## 5. Database Architecture
 
-All data storage runs **100% locally via Docker**. No cloud databases are used.
+All data runs **100% locally via Docker** — no cloud databases.
 
-| Database | Container | Port | Role | What's Stored |
-| :--- | :--- | :--- | :--- | :--- |
-| **PostgreSQL 15** | `fyp-postgres` | 5432 | Structured time-series & fundamentals | OHLCV prices, ratios, macro indicators, insider trades, analyst estimates, earnings data |
-| **Qdrant** | `fyp-qdrant` | 6333 | Vector embeddings for semantic search | 10-K/10-Q proposition chunks, news articles, earnings transcripts, central bank minutes |
-| **Neo4j 5.15** | `fyp-neo4j` | 7474/7687 | Graph relationships | Company nodes, competitor edges, sector membership, supply chain links |
+| Database | Container | Port | Role |
+|---|---|---|---|
+| PostgreSQL 15 | `fyp-postgres` | 5432 | Structured time-series + fundamentals |
+| Qdrant | `fyp-qdrant` | 6333/6334 | Vector embeddings (semantic RAG) |
+| Neo4j 5.15 | `fyp-neo4j` | 7474/7687 | Graph relationships + company properties |
 
-### PostgreSQL Schema Overview
+### PostgreSQL Schema
 
 ```sql
--- Time-series data (prices, intraday, macro indicators)
-raw_timeseries       (agent_name, ticker_symbol, data_name, ts_date, payload JSONB, source)
+-- Time-series (prices, intraday, technicals, macro)
+raw_timeseries   (id, agent_name, ticker_symbol, data_name, ts_date, payload JSONB, source, ingested_at)
 
--- Fundamental/snapshot data (ratios, profile, estimates)
-raw_fundamentals     (agent_name, ticker_symbol, data_name, as_of_date, payload JSONB, source)
+-- Snapshot/fundamental data (ratios, estimates, filings)
+raw_fundamentals (id, agent_name, ticker_symbol, data_name, as_of_date, payload JSONB, source, ingested_at)
 
--- Global shared datasets (once per day)
-market_eod_us        (ts_date, payload JSONB, source)
-global_economic_calendar (ts_date, payload JSONB, source)
-global_ipo_calendar  (ts_date, payload JSONB, source)
+-- Global datasets (ingested once per day)
+market_eod_us            (id, ts_date, payload JSONB, source, ingested_at)
+global_economic_calendar (id, ts_date, payload JSONB, source, ingested_at)
+global_ipo_calendar      (id, ts_date, payload JSONB, source, ingested_at)
 
--- Agent query logs (for self-improvement)
-query_logs           (query_id UUID, query_text, agents_invoked[], latency_ms, timestamp)
-citation_tracking    (query_id, chunk_id, cited BOOL, user_rating FLOAT)
+-- Agent query logs (Phase 3 — self-improvement)
+query_logs       (query_id UUID, query_text, agents_invoked[], latency_ms, timestamp)
+citation_tracking(query_id, chunk_id, cited BOOL, user_rating FLOAT)
+sentiment_trends (ticker_symbol, bullish_pct, bearish_pct, neutral_pct, trend, updated_at)
 ```
 
-### Qdrant Collection Schema
+**Inspect PostgreSQL:**
+```bash
+docker exec -it fyp-postgres psql -U airflow -d airflow
+\dt                                               -- list all tables
+SELECT ticker_symbol, COUNT(*) FROM raw_timeseries GROUP BY ticker_symbol;
+SELECT MAX(ingested_at) FROM raw_fundamentals;
+\q
+```
+
+### Qdrant Schema
 
 ```
 Collection: financial_documents
-Vector size: 768 (nomic-embed-text via local Ollama)
-Distance: Cosine
+Vector:     768-dim, cosine distance (nomic-embed-text via Ollama)
+Status:     ~2,390 vectors (AAPL: 407, TSLA: 419, NVDA: 423, MSFT: 422, GOOGL: 329)
 
-Payload metadata:
-  - ticker_symbol    : str   (e.g. "AAPL")
-  - agent_name       : str   (e.g. "business_analyst")
-  - data_name        : str   (e.g. "10k_proposition")
-  - filing_date      : str   (ISO date)
-  - section          : str   (e.g. "Item 1A Risk Factors")
-  - source           : str   (e.g. "eodhd", "sec_edgar", "fmp")
-  - proposition_id   : str   (UUID)
-  - boost_factor     : float (self-improving weight, default 1.0)
+Payload fields:
+  ticker_symbol  : str   (e.g. "AAPL")
+  agent_name     : str   (e.g. "business_analyst")
+  data_name      : str   (e.g. "financial_news")
+  title          : str   (article title — used to form chunk_id slug)
+  source         : str   (e.g. "eodhd")
+  filing_date    : str   (ISO date)
+  boost_factor   : float (default 1.0 — updated by self-improving RAG)
 ```
 
-### Neo4j Graph Schema
+**Inspect Qdrant:**
+```bash
+# Collection status
+curl -s http://localhost:6333/collections/financial_documents | python3 -m json.tool
+
+# Semantic search test
+python - <<'EOF'
+import requests
+q = requests.post("http://localhost:11434/api/embeddings",
+    json={"model": "nomic-embed-text", "prompt": "Apple iPhone revenue growth"}).json()["embedding"]
+hits = requests.post("http://localhost:6333/collections/financial_documents/points/search",
+    json={"vector": q, "limit": 5, "with_payload": True}).json()["result"]
+for h in hits:
+    print(f"{h['score']:.3f} | {h['payload'].get('ticker_symbol')} | {h['payload'].get('title','')[:60]}")
+EOF
+```
+
+### Neo4j Schema
 
 ```cypher
-// Nodes
-(:Company {ticker, name, sector, industry, country, marketCap})
-(:Sector  {name})
-(:Technology {name})
+// Nodes (currently populated)
+(:Company {ticker, Name, Sector, Industry, Exchange,
+           Highlights_MarketCapitalization, Highlights_PERatio,
+           Highlights_ProfitMargin, Valuation_TrailingPE,
+           Valuation_ForwardPE, Valuation_EnterpriseValue, ...})  // 85+ properties
 
-// Relationships
+// Relationships (Phase 3 — not yet populated)
 (:Company)-[:COMPETES_WITH]->(:Company)
 (:Company)-[:BELONGS_TO]->(:Sector)
 (:Company)-[:DEPENDS_ON]->(:Technology)
-(:Company)-[:HAS_RISK]->(:RiskFactor {description, severity})
-(:Company)-[:MENTIONED_IN]->(:Filing {date, type})
+(:Company)-[:HAS_RISK]->(:RiskFactor)
+```
+
+**Inspect Neo4j:**
+```bash
+# Browser: http://localhost:7474
+# Bolt:    bolt://localhost:7687  (neo4j / changeme_neo4j_password)
+
+# CLI
+docker exec -it fyp-neo4j cypher-shell -u neo4j -p changeme_neo4j_password
+MATCH (c:Company) RETURN c.ticker, c.Name, c.Highlights_MarketCapitalization LIMIT 10;
 ```
 
 ---
 
-## ⚙️ 6. Data Pipelines (Airflow DAGs)
+## 6. Ingestion Pipeline
 
-The system relies on **2 primary ingestion DAGs** (plus enrichment) to keep the local knowledge base fresh.
+See [`ingestion/README.md`](ingestion/README.md) for detailed operations guide.
 
-### DAG 1: EODHD Complete Ingestion (`eodhd_complete_ingestion`)
-- **Schedule:** Daily at 01:00 UTC
-- **Task Graph:** `scrape → [load_postgres ∥ load_neo4j ∥ load_qdrant] → summary`
+Two Airflow DAGs ingest data daily:
 
-| Agent Persona | Data Fetched | Destination |
-| :--- | :--- | :--- |
-| `business_analyst` | Financial news, sentiment trends, company profile | Qdrant (news) + PostgreSQL (sentiment) + Neo4j (profile) |
-| `quantitative_fundamental` | Realtime quotes, OHLCV, intraday (1m/5m/15m/1h), SMA/EMA technicals, options | PostgreSQL |
-| `financial_modeling` | Weekly/monthly prices, dividends, splits, earnings, IPO calendar, economic events, bulk EOD | PostgreSQL |
+| DAG | Schedule | Purpose |
+|---|---|---|
+| `eodhd_complete_ingestion` | Daily 01:00 UTC | News, prices, fundamentals, technicals → PG + Qdrant + Neo4j |
+| `fmp_complete_ingestion` | Daily 02:00 UTC | Analyst estimates, earnings, DCF inputs, insider trades → PG |
 
-### DAG 2: FMP Complete Ingestion (`fmp_complete_ingestion`)
-- **Schedule:** Daily at 02:00 UTC
-- **Purpose:** Dual-path data verification — FMP data cross-validates EODHD figures.
-- Fetches: Analyst estimates, price targets, earnings transcripts, insider trades (Form 4), institutional holdings (13F), DCF inputs.
+**Trigger DAGs manually:**
+```bash
+# Get scheduler container ID
+SCHED=$(docker compose ps -q airflow-scheduler)
 
-### DAG 3: Sentiment Enrichment (`sentiment_processing`)
-- **Schedule:** Triggered after DAG 1 completes
-- **Action:** Runs local `FinTwitBERT` (Hugging Face) over raw news/social text to produce scalar sentiment scores (−1.0 to +1.0) stored in PostgreSQL.
+# List all DAGs
+docker exec -it $SCHED airflow dags list
 
-### DAG 4: Weekly Self-Improvement (`weekly_model_retraining`)
-- **Schedule:** Weekly (Sunday 03:00 UTC)
-- **Action:**
-  - Reads `citation_tracking` table → identifies high-rated chunks.
-  - Updates `boost_factor` payload in Qdrant for cited chunks.
-  - Triggers re-embedding of stale chunks with updated strategy.
+# Trigger EODHD ingestion
+docker exec -it $SCHED airflow dags unpause eodhd_complete_ingestion
+docker exec -it $SCHED airflow dags trigger eodhd_complete_ingestion
 
-### 🔮 Future DAGs
-- **SEC EDGAR Parser:** Direct 10-K/10-Q HTML → proposition chunking pipeline.
-- **Insider Trading Tracker:** Real-time Form 4 parser from EDGAR RSS feed.
-- **Options Flow Monitor:** Unusual options activity detection from EODHD options data.
+# Check run status
+docker exec -it $SCHED airflow dags list-runs -d eodhd_complete_ingestion
 
----
-
-## 🤝 7. Multi-Agent Conflict Resolution
-
-The Supervisor detects signal conflicts between agents and the Synthesizer resolves them explicitly.
-
-### Conflict Resolution Examples
-
-**Conflict A — Analyst Optimism vs. Competitor Reality**
-> Consensus Agent: "Analysts project 20% growth, citing strong AI demand."
-> Business Analyst (Competitor Data): "Top competitor 10-K warns of 'AI chip oversupply' and 'slowing enterprise capex'."
-> **Synthesis:** `⚠️ TRAP DETECTED. Street estimates ignore sector-wide warning signals from the market leader. High probability of earnings miss. AVOID.`
-
-**Conflict B — Insider Buying vs. Negative News**
-> Web Search Agent: "Breaking: CEO investigation rumour causes stock to drop 10%."
-> Insider Agent: "CFO purchased $2M shares yesterday — largest acquisition in 5 years."
-> **Synthesis:** `💡 CONTRARIAN OPPORTUNITY. Market overreacting to unverified rumours. Insiders betting heavily on innocence/recovery. Speculative BUY with tight stop.`
-
-**Conflict C — Cheap Valuation vs. Macro Headwind**
-> Quant Agent: "P/E = 8x (historic low). FCF Yield = 12%."
-> Macro Agent: "Company earns 60% of revenue in Europe. EUR/USD declining on ECB rate cuts."
-> Financial Modelling Agent: "DCF Bear Case = $72 (current price $85) after 15% FX haircut on earnings."
-> **Synthesis:** `⚠️ VALUE TRAP. Cheap for a reason. FX headwinds wipe out the apparent discount. Wait for currency stabilization before entry.`
-
----
-
-## 📊 8. Final Output Structure
-
-Every full analysis report includes:
-
-### Agent Consensus Matrix
-
-| Agent | Signal | Confidence | Key Finding |
-| :--- | :--- | :--- | :--- |
-| 🧠 Business Analyst | Neutral | 85% | Solid moat, but high regulatory risk in Item 1A |
-| 📊 Quant Fundamental | Bullish | 92% | Undervalued; Piotroski F-Score = 8/9 |
-| 💰 Financial Modelling | Bullish | 88% | DCF Base Case +35% upside; EV/EBITDA below peers |
-| 🤨 Consensus & Strategy | Bearish | 78% | Street estimates 15% above peer guidance trend |
-| 🌍 Macro Economic | Neutral | 70% | Late-cycle; FX exposure neutral |
-| 🐋 Insider & Sentiment | Bullish | 88% | CFO buying; narrative tone stable QoQ |
-| 🌐 Web Search | Neutral | 65% | No material breaking news |
-
-### Executive Summary Block
+# View task logs
+docker exec -it $SCHED airflow tasks logs eodhd_complete_ingestion \
+  eodhd_load_qdrant_business_analyst_AAPL 2026-02-24
 ```
-Conviction Level: MODERATE BUY
 
-Conflict Resolution: "Quant and Modelling see clear value; Consensus flags
-an earnings miss risk from peer guidance. Insider conviction (CFO buying)
-is the tie-breaker → Moderate Buy bias with reduced position sizing."
-
-Actionable Recommendation:
-  Entry Price:  $120
-  Stop Loss:    $110  (-8%)
-  Target:       $155  (+29%)
-  Time Horizon: 12–18 months
+**Health check:**
+```bash
+source .venv/bin/activate
+python ingestion/inspect_data.py
+# Expected output:
+# ✅ Connected to localhost:5432/airflow
+# ✅ raw_timeseries     516,197 rows
+# ✅ :Company           5 nodes
+# ✅ Status: green | Points: 2390
 ```
 
 ---
 
-## 🔄 9. Self-Improving RAG
+## 7. Running Agents
 
-The system learns continuously on three timescales:
+All agents require the Docker stack to be running (`docker compose up -d`) and Ollama serving locally.
 
-**Per-Query (Real-Time):**
-- Tracks which retrieved chunks were cited in the final answer.
-- Boosts `boost_factor` in Qdrant payload for cited chunks (multiplicative weight applied at retrieval).
+### Business Analyst Agent
 
-**Daily:**
-- Identifies query types with low resolution rates → triggers targeted data acquisition.
-- Flags retrieval gaps where no relevant document was found.
+```bash
+# Suggested test queries (all validated with live data)
+.venv/bin/python -m agents.business_analyst.agent --ticker AAPL --log-level WARNING
+.venv/bin/python -m agents.business_analyst.agent \
+  --ticker TSLA --task "What are Tesla's key business risks?" --log-level WARNING
+.venv/bin/python -m agents.business_analyst.agent \
+  --ticker NVDA --task "How defensible is NVIDIA's AI chip moat?" --log-level WARNING
+.venv/bin/python -m agents.business_analyst.agent \
+  --ticker MSFT --task "Assess Microsoft's cloud and AI services strategy." --log-level WARNING
+.venv/bin/python -m agents.business_analyst.agent \
+  --ticker GOOGL --task "What is Alphabet's advertising dependency risk?" --log-level INFO
+```
 
-**Weekly:**
-- Fine-tunes embedding strategy using successful query–chunk pairs.
-- A/B tests chunking configurations (chunk size, overlap) on held-out query set.
+### Quant Fundamental Agent
+
+```bash
+.venv/bin/python -m agents.quant_fundamental.agent --ticker AAPL --log-level WARNING
+.venv/bin/python -m agents.quant_fundamental.agent --ticker MSFT --log-level WARNING
+.venv/bin/python -m agents.quant_fundamental.agent --ticker GOOGL --log-level WARNING
+.venv/bin/python -m agents.quant_fundamental.agent --ticker TSLA --log-level WARNING
+.venv/bin/python -m agents.quant_fundamental.agent --ticker NVDA --log-level WARNING
+.venv/bin/python -m agents.quant_fundamental.agent \
+  --prompt "Run quant fundamental analysis for NVDA" --log-level WARNING
+```
+
+### Financial Modelling Agent
+
+```bash
+python -m agents.financial_modelling.agent --ticker AAPL --log-level WARNING
+python -m agents.financial_modelling.agent --ticker TSLA --log-level WARNING
+python -m agents.financial_modelling.agent --ticker NVDA --log-level WARNING
+python -m agents.financial_modelling.agent --ticker MSFT --log-level WARNING
+python -m agents.financial_modelling.agent --ticker GOOGL --log-level WARNING
+```
+
+### Web Search Agent
+
+```bash
+# Requires PERPLEXITY_API_KEY in .env
+python - <<'EOF'
+from agents.web_search.agent import run_web_search_agent
+import json
+for ticker in ["AAPL", "NVDA", "TSLA"]:
+    result = run_web_search_agent({"query": f"{ticker} latest news Q1 2026",
+                                   "ticker": ticker, "recency_filter": "week"})
+    print(f"{ticker}: sentiment={result['sentiment_signal']}, "
+          f"risks={len(result['unknown_risk_flags'])}, error={result['error']}")
+EOF
+```
+
+---
+
+## 8. Running the Orchestration
+
+The orchestration layer requires all 4 agents' backends to be running.
 
 ```python
-class SelfImprovingRAG:
-    def retrieve(self, query: str) -> list[Chunk]:
-        chunks = self.qdrant.search(query)
-        for chunk in chunks:
-            chunk.score *= self.get_boost_factor(chunk.id)  # Apply learned weights
-        return sorted(chunks, key=lambda c: c.score, reverse=True)
+from orchestration.graph import run, stream
 
-    def post_query_feedback(self, query_id: str, cited_chunk_ids: list[str], rating: float):
-        for chunk_id in cited_chunk_ids:
-            self.increment_boost(chunk_id, weight=rating)
-        self.log_to_postgres(query_id, cited_chunk_ids, rating)
+# Single ticker — full analysis
+result = run("What is Apple's competitive moat and current valuation?")
+print(result["final_summary"])
 
-    def weekly_retrain(self):
-        pairs = self.get_high_rated_pairs(min_rating=4.0)
-        self.embedding_model.fine_tune(pairs)
-        self.reindex_qdrant()
+# Multi-ticker comparison
+result = run("Compare MSFT vs AAPL cloud strategy and valuation")
+print(result["tickers"])          # ["MSFT", "AAPL"]
+
+# Simple metric look-up (complexity 1 — single pass, no retry)
+result = run("What is NVDA's current P/E ratio?")
+
+# Streaming (for UI integration)
+for node_name, node_output in stream("Full fundamental analysis of TSLA"):
+    if node_name == "planner":
+        print("Plan:", node_output.get("plan"))
+    elif node_name == "parallel_agents":
+        print("Agents completed this pass")
+    elif node_name == "summarizer":
+        print("Summary ready")
+
+# Debug mode — one agent at a time
+import os; os.environ["ORCHESTRATION_SEQUENTIAL"] = "1"
+result = run("AAPL P/E check")
+```
+
+**State dict keys returned:**
+```python
+result["final_summary"]                    # str — DeepSeek research note
+result["ticker"]                           # str — primary ticker
+result["tickers"]                          # list[str] — all tickers
+result["plan"]                             # dict — planner's routing decision
+result["business_analyst_output"]          # dict — BA agent result
+result["quant_fundamental_output"]         # dict — QF agent result
+result["financial_modelling_output"]       # dict — FM agent result
+result["web_search_output"]               # dict — WS agent result
+result["agent_errors"]                     # dict — any agent errors
+result["react_steps"]                      # list — ReAct trace
 ```
 
 ---
 
-## 🛡️ 10. Citation-Verification Protocol
+## 9. Testing
 
-### Three-Stage Verification
+```bash
+# Run all tests
+.venv/bin/python -m pytest agents/ -v
 
-**Stage 1 — Grounded Generation:**
-Every factual claim in the Synthesizer's output must reference a chunk ID:
-> `"Apple's revenue grew 25% [chunk:149] driven by iPhone sales in China [chunk:203]."`
-The system prompt explicitly forbids unsourced claims.
+# Per-agent test suites
+.venv/bin/python -m pytest agents/business_analyst/tests/     -v   # 39 tests
+.venv/bin/python -m pytest agents/quant_fundamental/tests/    -v   # 44 tests
+.venv/bin/python -m pytest agents/financial_modelling/tests/  -v
+.venv/bin/python -m pytest agents/web_search/tests/           -v   # 6 tests
 
-**Stage 2 — Critic Agent Audit (GPT-4o-mini):**
-- Extracts factual assertions sentence by sentence.
-- Checks each assertion against its cited chunk via NLI (Natural Language Inference).
-- Entailment score > 0.85 required → `✅ VERIFIED`.
-- Score 0.5–0.85 → `⚠️ PARTIAL` (flagged for human review).
-- Score < 0.5 → `❌ REJECTED` (removed from report).
+# Exclude integration tests (no live Docker required)
+.venv/bin/python -m pytest agents/ -m "not integration" -v
 
-**Stage 3 — Interactive UI Verification:**
-- Every `[chunk:id]` is a clickable hyperlink opening a source modal.
-- Relevant sentences highlighted in yellow.
-- Full provenance chain shown: `EODHD API → ETL → Qdrant → Chunk → Report`.
+# Fast smoke test for a single agent
+.venv/bin/python -m pytest agents/quant_fundamental/tests/ -v -k "test_run"
+```
 
-### Audit Trail (Logged Per Query)
-```json
-{
-  "query_id": "uuid-12345",
-  "timestamp": "2026-02-24T13:00:00Z",
-  "agents_invoked": ["business_analyst", "quant_fundamental", "financial_modelling"],
-  "chunks_retrieved": 31,
-  "chunks_cited": 18,
-  "critic_pass_rate": 0.94,
-  "conflicts_detected": 1,
-  "conflict_resolution": "insider_conviction_tie_breaker",
-  "user_feedback": null
-}
+All tests use mocked external services (Qdrant, Neo4j, PostgreSQL, Ollama). No live infrastructure required for the test suite.
+
+---
+
+## 10. Streamlit UI
+
+The Streamlit POC is at `POC/streamlit/streamlit.py`.
+
+```bash
+# Install dependencies
+pip install streamlit plotly
+
+# Launch
+streamlit run POC/streamlit/streamlit.py
+# Opens at http://localhost:8501
+```
+
+**Features:**
+- Query input with example queries and ticker selector
+- Real-time streaming progress display (planner → agents → summariser)
+- Per-agent collapsible result cards
+- DCF scenario table and implied price range
+- Technical indicators summary
+- Final research note rendering
+- Agent error and data availability status
+
+See [`POC/streamlit/`](POC/streamlit/) for the full implementation.
+
+---
+
+## 11. Environment Variables
+
+Create `.env` at the repo root (copy from `.env.example`):
+
+```bash
+# ── API Keys ───────────────────────────────────────────────────────────────
+FMP_API_KEY=your_fmp_key
+EODHD_API_KEY=your_eodhd_key
+FRED_API_KEY=your_fred_key
+PERPLEXITY_API_KEY=pplx-xxxxxxxxxxxxxxxx   # Web Search Agent (required)
+OPENAI_API_KEY=sk-...                       # reserved for Phase 3 Critic Agent
+REDDIT_CLIENT_ID=...
+REDDIT_CLIENT_SECRET=...
+REDDIT_USER_AGENT=...
+
+# ── Databases ─────────────────────────────────────────────────────────────
+POSTGRES_HOST=localhost
+POSTGRES_PORT=5432
+POSTGRES_DB=airflow
+POSTGRES_USER=airflow
+POSTGRES_PASSWORD=airflow
+
+QDRANT_HOST=localhost
+QDRANT_PORT=6333
+QDRANT_COLLECTION_NAME=financial_documents
+
+NEO4J_URI=bolt://localhost:7687
+NEO4J_USER=neo4j
+NEO4J_PASSWORD=changeme_neo4j_password
+
+# ── LLM (Ollama local) ────────────────────────────────────────────────────
+OLLAMA_BASE_URL=http://localhost:11434
+
+# Orchestration
+ORCHESTRATION_PLANNER_MODEL=llama3.2:latest
+ORCHESTRATION_SUMMARIZER_MODEL=deepseek-r1:8b
+ORCHESTRATION_SEQUENTIAL=0                  # set to 1 for sequential debug mode
+# ORCHESTRATION_LLM_TIMEOUT=60             # planner timeout (s); unset = no cap
+# ORCHESTRATION_SUMMARIZER_TIMEOUT=1200    # summarizer timeout (s); unset = no cap
+
+# Agent LLMs
+BUSINESS_ANALYST_MODEL=deepseek-r1:8b
+LLM_MODEL_QUANTITATIVE=llama3.2:latest
+LLM_MODEL_FINANCIAL_MODELING=deepseek-r1:8b
+
+# Embeddings
+EMBEDDING_MODEL=nomic-embed-text
+EMBEDDING_DIMENSION=768
+RERANKER_MODEL=cross-encoder/ms-marco-MiniLM-L-6-v2
+
+# ── Agent Tuning (optional) ───────────────────────────────────────────────
+BUSINESS_ANALYST_TEMPERATURE=0.2
+BUSINESS_ANALYST_MAX_TOKENS=3000
+CRAG_CORRECT_THRESHOLD=0.55
+CRAG_AMBIGUOUS_THRESHOLD=0.35
+RAG_TOP_K=8
+RAG_SCORE_THRESHOLD=0.6
+
+QUANT_LLM_TEMPERATURE=0.1
+QUANT_LLM_MAX_TOKENS=512
+QUANT_REQUEST_TIMEOUT=120
+ANOMALY_ZSCORE_THRESHOLD=2.0
+BENEISH_THRESHOLD=-2.22
+PIOTROSKI_STRONG_THRESHOLD=7
+
+PRICE_HISTORY_DAYS=365
+DCF_FORECAST_YEARS=5
+DCF_TERMINAL_GROWTH_RATE=0.025
+DCF_WACC=0.09
+
+WEB_SEARCH_MODEL=sonar-pro
+WEB_SEARCH_RECENCY_FILTER=week
+
+# ── Ingestion ─────────────────────────────────────────────────────────────
+TRACKED_TICKERS=AAPL,GOOGL,MSFT,NVDA,TSLA
+
+# ── Airflow ───────────────────────────────────────────────────────────────
+AIRFLOW__CORE__EXECUTOR=LocalExecutor
+AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:airflow@postgres/airflow
+AIRFLOW__WEBSERVER__SECRET_KEY=your-secret-key
+AIRFLOW_UID=50000
+AIRFLOW_WWW_USER_USERNAME=airflow
+AIRFLOW_WWW_USER_PASSWORD=airflow
 ```
 
 ---
 
-## 💻 11. Technical Specifications
+## 12. Project Roadmap
 
-### LLM Strategy
+**Duration:** February 1 – April 30, 2026 (13 weeks)
 
-| Role | Model | Inference | Justification |
-| :--- | :--- | :--- | :--- |
-| **Supervisor** | GPT-4o | Cloud (runtime) | Complex multi-step planning, conflict detection |
-| **Synthesizer** | GPT-4o | Cloud (runtime) | Coherent long-form narrative generation |
-| **Critic** | GPT-4o-mini | Cloud (runtime) | Cost-effective NLI verification |
-| **Business Analyst RAG** | deepseek-v3.2-exp | Local Ollama | CRAG qualitative analysis and evaluator scoring |
-| **Ingestion ETL (News/Filings)** | Llama 3.2 (3B) | Local Ollama | High-volume offline extraction, zero cost |
-| **Web Search Agent** | Qwen 2.5 | Local Ollama | Fast real-time news triage, low latency |
-| **Embeddings** | nomic-embed-text | Local Ollama | 768-dim, zero API cost, fast |
+### Phase 1 — Foundation & Data Infrastructure (Weeks 1–4)  COMPLETE
 
-### Data Sources & Budget (~$300 USD / 4 months)
-
-| Data Type | Provider | Cost | Notes |
-| :--- | :--- | :--- | :--- |
-| Core Equity (Price/Fund/News) | EODHD All-In-One | ~$200 | Backbone: prices, fundamentals, news |
-| Fundamentals + Estimates | FMP Ultimate | ~$0–50 | Analyst estimates, transcripts, Form 4 |
-| Macro Indicators | EODHD / FRED | $0 | GDP, CPI, Yields, PMI |
-| Insider/Institutional | FMP / SEC EDGAR | $0 | Form 4, 13F filings |
-| Sentiment Model | Hugging Face | $0 | Local FinTwitBERT |
-| Embeddings | Ollama (local) | $0 | nomic-embed-text |
-| Vector DB | Qdrant (Docker) | $0 | Self-hosted |
-| Graph DB | Neo4j Community (Docker) | $0 | Self-hosted |
-| LLM API Buffer | OpenAI | ~$50–100 | Supervisor + Synthesizer + Critic |
-
----
-
-## 📅 12. Implementation Roadmap
-
-**Project Duration:** February 1 – April 30, 2026 (13 Weeks)
-
----
-
-### 🔵 Phase 1: Foundation & Data Infrastructure (Weeks 1–4) ✅
-
-#### Week 1 (Feb 1–7) — Environment Setup ✅
-- [x] Project repo structure (`/ingestion`, `/agents`, `/skills`, `/rag`, `/ui`)
 - [x] Docker Compose: Qdrant, PostgreSQL, Neo4j, Airflow
-- [x] EODHD + FMP API integration scripts
+- [x] EODHD + FMP API integration and Airflow DAGs
 - [x] PostgreSQL schema: `raw_timeseries`, `raw_fundamentals`
-- [x] Qdrant collection initialized with `nomic-embed-text` (768-dim)
+- [x] Qdrant collection `financial_documents` (768-dim, ~2,390 vectors)
+- [x] ETL loaders: `load_postgres.py`, `load_neo4j.py`, `load_qdrant.py`
+- [x] Idempotent MD5 hash deduplication
 
-**Deliverable:** Docker stack running; price data ingested for 10 test stocks.
+### Phase 2 — Agent Layer (Weeks 3–8)  IN PROGRESS
 
----
+- [x] Business Analyst Agent (CRAG + hybrid retrieval) — 39 tests passing
+- [x] Quantitative Fundamental Agent (8-node deterministic) — 44 tests passing
+- [x] Financial Modelling Agent (DCF + Comps + Technicals) — all 5 tickers live
+- [x] Web Search Agent (Perplexity sonar-pro) — 6 tests passing
+- [x] LangGraph orchestration graph (parallel + sequential)
+- [ ] `agents/consensus_strategy/` — Contrastive RAG, Gap Analysis engine
+- [ ] `agents/macro_economic/` — Text-to-SQL, economic cycle classifier
+- [ ] `agents/insider_sentiment/` — Temporal Contrastive RAG, Form 4 reader
 
-#### Week 2 (Feb 8–14) — Core Ingestion DAGs ✅
-- [x] `dag_eodhd_ingestion_unified.py` — 3 agent personas, parallel fan-out
-- [x] `dag_fmp_ingestion_unified.py` — dual-path data source
-- [x] ETL loaders: `load_postgres.py`, `load_qdrant.py`, `load_neo4j.py`
-- [x] Idempotent MD5 hash-based deduplication
-- [x] Ollama warm-up probe in `load_qdrant.py`
+### Phase 3 — Trust, UI & Polish (Weeks 9–13)
 
-**Deliverable:** Automated daily ingestion for S&P 100 stocks operational.
-
----
-
-#### Week 3 (Feb 15–21) — Agent Skill: Quant Fundamental ✅
-- [x] `skills/quant_fundamental/` — Chain-of-Table SQL/Python engine
-- [x] Dual-path verification (Pandas vs DuckDB)
-- [x] Factor calculations: ROE, ROIC, Piotroski F-Score, Beneish M-Score
-- [x] Unit test suite for all calculations
-
-**Deliverable:** Skill returns audited fundamental report for any ticker.
-
----
-
-#### Week 4 (Feb 22–28) — Agent Skill: Financial Modelling
-- [ ] `skills/financial_modelling/` — DCF engine
-  - WACC calculation (Cost of Equity via CAPM + Cost of Debt)
-  - 5-year FCF projection engine
-  - Terminal Value (Gordon Growth Model)
-  - Sensitivity matrix (WACC × Terminal Growth Rate)
-- [ ] Comparable Company Analysis (Comps) from PostgreSQL peer data
-- [ ] Scenario engine: Bear / Base / Bull with probability weighting
-- [ ] LBO model (optional stretch goal)
-
-**Deliverable:** CLI tool returning `{intrinsic_value, upside_pct, scenario_table}` for any ticker.
+- [x] Streamlit POC UI (`POC/streamlit/streamlit.py`)
+- [ ] Critic Agent (GPT-4o-mini NLI verification, ≥90% pass rate)
+- [ ] Self-Improving RAG (`SelfImprovingRAG` class, Qdrant boost-factor updates)
+- [ ] Weekly retraining DAG (`citation_tracking` → `boost_factor` update)
+- [ ] Full Streamlit UI (`ui/app.py`): streaming CoT, DCF heatmap, clickable citations
+- [ ] 50-query evaluation dataset (20 Q&A / 15 Comparison / 15 Full Analysis)
+- [ ] 5 demo reports (AAPL, TSLA, NVDA, MSFT, GOOGL)
 
 ---
 
-### 🟢 Phase 2: Agent Layer — RAG Specialists (Weeks 5–8)
-
-#### Week 5 (Mar 1–7) — Business Analyst Agent
-- [ ] `agents/business_analyst/` — CRAG + Proposition Chunking
-  - SEC EDGAR 10-K/10-Q scraper → proposition decomposer (LLM)
-  - Hybrid search: dense (Qdrant) + sparse (BM25) + graph (Neo4j Cypher)
-  - CRAG evaluator with score threshold logic
-  - Web Search fallback trigger (score < 0.5)
-- [ ] Neo4j relationship schema: `COMPETES_WITH`, `DEPENDS_ON`, `HAS_RISK`
-
-**Deliverable:** Agent extracts and cites specific risk factors from a 10-K filing.
-
----
-
-#### Week 6 (Mar 8–14) — Consensus & Macro Agents
-- [ ] `agents/consensus_strategy/` — Contrastive RAG
-  - SEC EDGAR peer filing scraper (Item 1A + Item 7 for top-5 competitors)
-  - Gap Analysis engine: company guidance vs. analyst consensus vs. peer warnings
-  - Consensus Gap Score calculator
-- [ ] `agents/macro_economic/` — Text-to-SQL + RAG
-  - Economic cycle classifier (Yield Curve + PMI)
-  - FX impact calculator (revenue exposure × rate differential)
-  - Fed/ECB minutes RAG (Qdrant)
-
-**Deliverable:** Both agents produce structured JSON output for AAPL and NVDA.
-
----
-
-#### Week 7 (Mar 15–21) — Insider/Sentiment + Web Search Agents
-- [ ] `agents/insider_sentiment/` — Temporal Contrastive RAG
-  - Earnings transcript chunking by speaker turn
-  - Semantic drift calculator (cosine similarity QoQ)
-  - Form 4 + 13F data reader from PostgreSQL
-  - Divergence alert logic
-- [ ] `agents/web_search/` — HyDE + Step-Back + Reranking
-  - Qwen 2.5 (local Ollama) integration
-  - EODHD live news feed connector
-  - Freshness + credibility reranker
-
-**Deliverable:** Insider agent detects CFO sell-off in backdated test case. Web agent surfaces same-day news.
-
----
-
-#### Week 8 (Mar 22–28) — LangGraph Supervisor + Synthesizer
-- [ ] `agents/supervisor/` — Global Plan-and-Execute (GPT-4o)
-  - Intent classifier (Q&A / Comparison / Full Analysis)
-  - Parallel agent execution via LangGraph `send()` nodes
-  - Conflict detection logic
-- [ ] `agents/synthesizer/` — Conflict resolution + report assembly
-  - Three output templates (Q&A / Comparison / Full Analysis)
-  - Agent Consensus Matrix builder
-  - `[chunk:id]` citation enforcement
-
-**Deliverable:** Full 9-agent pipeline produces a report for NVDA end-to-end.
-
----
-
-### 🟪 Phase 3: Trust, UI & Polish (Weeks 9–13)
-
-#### Week 9 (Mar 29 – Apr 4) — Citation Verification + Critic Agent
-- [ ] Critic Agent (GPT-4o-mini): NLI-based sentence-level verification
-- [ ] Audit trail logging to PostgreSQL (`citation_tracking` table)
-- [ ] Target: ≥ 90% critic pass rate on 25 test queries
-
-#### Week 10 (Apr 5–11) — Self-Improving RAG
-- [ ] `SelfImprovingRAG` class with Qdrant boost-factor updates
-- [ ] Feedback collection API (cited chunks, user ratings)
-- [ ] Weekly retraining DAG (`weekly_model_retraining`)
-
-#### Week 11 (Apr 12–18) — Streamlit UI
-- [ ] Real-time streaming CoT display (Plan → Execute → Synthesize)
-- [ ] Agent Consensus Matrix widget
-- [ ] Clickable `[chunk:id]` citations → source modal
-- [ ] DCF sensitivity heatmap (Plotly)
-- [ ] Price chart + sentiment timeline overlay
-
-#### Week 12 (Apr 19–25) — Performance Optimization
-- [ ] Latency profiling: target < 20s for full analysis
-- [ ] A/B test chunking strategies (proposition vs. fixed-size)
-- [ ] Optimize Qdrant payload indexing for filtered search
-
-#### Week 13 (Apr 26–30) — Final Testing & Submission
-- [ ] 50 diverse test queries (20 Q&A / 15 Comparison / 15 Full Analysis)
-- [ ] 5 demo reports: AAPL, TSLA, NVDA, MSFT, GOOGL
-- [ ] Architecture whitepaper
-- [ ] Evaluation dataset with ground truth annotations
-
----
-
-## 📊 13. Evaluation Framework
+## 13. Evaluation Framework
 
 | Metric | Definition | Target |
-| :--- | :--- | :--- |
-| **Citation Verification Rate (CVR)** | % factual claims passing Critic Agent NLI check | ≥ 95% |
-| **Numerical Accuracy Score (NAS)** | Dual-path Python vs SQL agreement rate | 100% |
-| **Retrieval Precision@5** | Relevance of top-5 chunks (human annotated) | ≥ 0.85 |
-| **Citation Utilization Rate (CUR)** | % retrieved chunks cited in final answer | ≥ 60% |
-| **Query Resolution Rate (QRR)** | % queries answered without "insufficient data" | ≥ 92% |
-| **Conflict Detection Accuracy** | % real conflicts correctly identified by Supervisor | ≥ 85% |
-| **Full Analysis Latency** | End-to-end response time for 7-agent analysis | < 30s |
-| **Self-Improvement Rate** | Citation precision gain after 1 week of usage | +5% / week |
+|:---|:---|:---|
+| Citation Verification Rate (CVR) | % factual claims passing NLI check | ≥ 95% |
+| Numerical Accuracy Score (NAS) | Python vs SQL dual-path agreement | 100% |
+| Retrieval Precision@5 | Relevance of top-5 chunks (human annotated) | ≥ 0.85 |
+| Citation Utilisation Rate (CUR) | % retrieved chunks cited in final answer | ≥ 60% |
+| Query Resolution Rate (QRR) | % queries answered without "insufficient data" | ≥ 92% |
+| Full Analysis Latency | End-to-end wall-clock for 4-agent parallel run | < 30s |
+| Self-Improvement Rate | Citation precision gain after 1 week of usage | +5%/week |
 
 ---
 
-## 📦 14. Deliverables
+## Directory Structure
 
-1. **Streamlit UI:** Real-time streaming app with CoT visualization, Agent Consensus Matrix, clickable citations, and DCF charts.
-2. **Source Code:** Modular Python repo — `/ingestion`, `/agents`, `/skills`, `/rag`, `/ui`.
-3. **Local Docker Stack:** One-command `docker-compose up` launches all 4 services (PostgreSQL, Qdrant, Neo4j, Airflow).
-4. **Documentation:** Architecture whitepaper, agent design specs, evaluation report.
-5. **Demo Reports:** 5 full-analysis reports (AAPL, TSLA, NVDA, MSFT, GOOGL) with audit trails.
-6. **Evaluation Dataset:** 50-query test set with ground truth annotations.
+```
+FYP/
+├── README.md                     ← This file
+├── .env                          ← API keys and configuration (not committed)
+├── .env.example                  ← Template
+├── docker-compose.yml            ← 6-service stack (PG, Qdrant, Neo4j, Airflow x3)
+├── pyproject.toml                ← pytest configuration
+├── conftest.py                   ← sys.path setup for pytest
+│
+├── orchestration/                ← LangGraph multi-agent pipeline
+│   ├── README.md
+│   ├── graph.py                  ← build_graph(), run(), stream()
+│   ├── nodes.py                  ← all 8 LangGraph node functions
+│   ├── state.py                  ← OrchestrationState TypedDict
+│   ├── llm.py                    ← plan_query(), summarise_results()
+│   ├── citations.py              ← build_citation_block(), inject_inline_numbers()
+│   └── data_availability.py      ← check_all() — backend health check
+│
+├── agents/
+│   ├── README.md                 ← Agent layer overview
+│   ├── business_analyst/         ← CRAG pipeline (deepseek-r1:8b, Qdrant + Neo4j + BM25)
+│   ├── quant_fundamental/        ← Deterministic factor engine (llama3.2, PostgreSQL only)
+│   ├── financial_modelling/      ← DCF + Comps + Technicals (deepseek-r1:8b, PostgreSQL)
+│   └── web_search/               ← Perplexity sonar-pro (live web)
+│
+├── ingestion/
+│   ├── README.md                 ← Ingestion operations guide (English)
+│   ├── inspect_data.py           ← Health check script
+│   ├── dags/                     ← Airflow DAG definitions
+│   └── etl/                      ← ETL loaders + agent_data/ cache
+│
+├── POC/
+│   └── streamlit/
+│       ├── streamlit.py          ← Streamlit UI app
+│       └── requirements.txt
+│
+├── ui/                           ← Full production UI (Phase 3 — not yet built)
+├── rag/                          ← RAG utilities
+├── skills/                       ← Standalone agent skills (prototypes)
+├── data/                         ← Local data cache
+└── docs/
+    └── setup_guide.md
+```
+
+---
+
+*Last updated: 2026-03-03 | Author: hck717*

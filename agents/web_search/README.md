@@ -18,11 +18,11 @@ It is the **only agent with real-time web access**. Every call is stateless and 
 | ✅ In Scope | ❌ Out of Scope (handled by other agents) |
 |---|---|
 | Breaking earnings announcements | Historical price/OHLCV data → Financial Modelling Agent |
-| Regulatory investigations / fines / sanctions | Fundamental ratios / DCF → Quant Agent |
-| CEO / CFO / Board leadership changes | GDP, CPI, yield curve → Macro Agent |
+| Regulatory investigations / fines / sanctions | Fundamental ratios / DCF → Quant Fundamental Agent |
+| CEO / CFO / Board leadership changes | GDP, CPI, yield curve → (Phase 3 — not yet implemented) |
 | M&A announcements, product launches, recalls | 10-K / 10-Q deep-read → Business Analyst Agent |
-| Litigation, patent disputes, ESG events | Analyst consensus / estimates → Consensus Agent |
-| Events not yet in EODHD / FMP DB | Insider trades / 13F → Insider & Sentiment Agent |
+| Litigation, patent disputes, ESG events | Analyst consensus / estimates → Financial Modelling Agent |
+| Events not yet in EODHD / FMP DB | Insider trades / 13F → (Phase 3 — not yet implemented) |
 | Competitor earnings surprises (indirect signals) | |
 
 ---

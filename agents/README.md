@@ -1,66 +1,132 @@
-# 🤖 FYP Agent 層 — 概覽
+# Agents Layer — Overview
 
-> **語言說明：** 本目錄以廣東話書寫，所有技術術語保留英文原名。
-
----
-
-## 系統架構概覽
-
-呢個 `agents` 模組包含四個專門化嘅 AI agent，每個負責唔同類型嘅金融分析工作。佔們由一個 **Supervisor** 統一調度，形成一個 multi-agent 系統。
-
-```
-用戶輸入 (query)
-       │
-       ▼
-  [Supervisor Agent]  ←  路由、分配、合併結果
-       │
-  ┌───┬───┬───┬───┐
-  ▼    ▼    ▼    ▼
-[WS] [MM] [BA] [FM]   ←  四個專門 agent 並行執行
-  │    │    │    │
-  ▼    ▼    ▼    ▼
-各自呈回結果同來源引用
-       │
-       ▼
-  [Critic Agent]  ←  核實、去重、測試一致性
-       │
-       ▼
-  [Summarizer]    ←  生成最終 Markdown 報告
-```
+The `agents/` directory contains four specialised AI agents. Each agent is an
+independent LangGraph pipeline responsible for a distinct class of financial
+analysis. The orchestration layer (`orchestration/`) selects which agents to
+run, dispatches them in parallel, and synthesises their outputs into a final
+research note.
 
 ---
 
-## 四個 Agent 簡介
+## Architecture
 
-| Agent | 目錄 | 主要負責 | 主要工具 |
+```
+User Query
+    │
+    ▼
+[Orchestration Planner]  ─  resolves ticker(s), selects agents, sets complexity
+    │
+    ▼ (parallel — ThreadPoolExecutor)
+┌───────┬────────────────┬───────────────────┬──────────────────────┐
+│  Web  │    Business    │      Quant        │     Financial        │
+│Search │    Analyst     │   Fundamental     │     Modelling        │
+│ Agent │     Agent      │      Agent        │       Agent          │
+└───────┴────────────────┴───────────────────┴──────────────────────┘
+    │           │                 │                    │
+    └───────────┴─────────────────┴────────────────────┘
+                          │
+                          ▼
+              [ReAct Check]  ─  retry gap agents if needed
+                          │
+                          ▼
+              [Summarizer]   ─  deepseek-r1:8b narrative
+                          │
+                          ▼
+                  Final Research Note (Markdown)
+```
+
+---
+
+## Agents at a Glance
+
+| Agent | Directory | Primary Responsibility | Key Data Sources |
 |---|---|---|---|
-| 🔍 **Web Search Agent** | `web_search/` | 實時網絡搜尋、最新新聞 | Tavily / DuckDuckGo Search |
-| 🌏 **Macro Metrics Agent** | `macro_metrics/` | 宏觀經濟指標分析 | EODHD economic-events API, PostgreSQL |
-| 📈 **Business Analyst Agent** | `business_analyst/` | 公司基本面、新聞情緒分析 | Qdrant RAG, Neo4j, Ollama |
-| 🧩 **Financial Modelling Agent** | `financial_modelling/` | 定量模型、估值、技術分析 | PostgreSQL, DCF, 技術指標 |
+| **Web Search** | `web_search/` | Live breaking news, sentiment signals, unknown risk flags | Perplexity sonar-pro API |
+| **Business Analyst** | `business_analyst/` | Qualitative moat analysis, news sentiment, CRAG RAG | Qdrant, Neo4j, PostgreSQL, Ollama |
+| **Quant Fundamental** | `quant_fundamental/` | Value/quality/momentum factors, Piotroski, Beneish, anomalies | PostgreSQL |
+| **Financial Modelling** | `financial_modelling/` | DCF valuation, peer comps, technicals, analyst consensus | PostgreSQL, Neo4j |
 
 ---
 
-## 共用技術堆疊
+## Shared Technology Stack
 
-| 工具 | 用途 |
+| Component | Role |
 |---|---|
-| **LangGraph** | Agent 狀態機 / 工作流管理 |
-| **LangChain** | LLM 呼叫、tool calling、prompt management |
-| **Ollama** | 本地 LLM 推理（qwen2.5:7b、deepseek-r1:8b、llama3.2）|
-| **Qdrant** | 新聞 embedding 語義搜尋（RAG）|
-| **Neo4j** | 公司知識圖譜查詢 |
-| **PostgreSQL** | 历史時序數據、基本面指標 |
+| **LangGraph** | Agent state machine / node-based workflow |
+| **LangChain** | LLM invocation, prompt management |
+| **Ollama** | Local LLM inference (`llama3.2:latest`, `deepseek-r1:8b`) |
+| **Qdrant** | News chunk vector search — 768-dim cosine, `financial_documents` collection |
+| **Neo4j** | Company knowledge graph — peer relationships, sector metadata |
+| **PostgreSQL** | Historical time-series, fundamentals, sentiment trends |
+| **sentence-transformers** | Embedding model: `nomic-embed-text` (768-dim) |
 
 ---
 
-## 專項 README
+## Quick-Start Commands
 
-- 🔍 [Web Search Agent](web_search/README.md)
-- 🌏 [Macro Metrics Agent](macro_metrics/README.md)
-- 📈 [Business Analyst Agent](business_analyst/README.md)
-- 🧩 [Financial Modelling Agent](financial_modelling/README.md)
+Run any agent directly from the repo root (activate `.venv` first):
+
+```bash
+# Business Analyst
+python -m agents.business_analyst.agent --ticker AAPL
+python -m agents.business_analyst.agent --ticker MSFT --task "What is Microsoft's competitive moat?"
+
+# Quant Fundamental
+python -m agents.quant_fundamental.agent --ticker NVDA
+python -m agents.quant_fundamental.agent --prompt "Compare MSFT vs AAPL fundamentals"
+
+# Financial Modelling
+python -m agents.financial_modelling.agent --ticker TSLA
+python -m agents.financial_modelling.agent --ticker GOOGL --log-level DEBUG
+
+# Web Search
+python -m agents.web_search.agent --ticker AAPL
+python -m agents.web_search.agent --ticker NVDA --recency week
+```
+
+> **Supported tickers:** `AAPL` `MSFT` `GOOGL` `TSLA` `NVDA`
 
 ---
 
-*最後更新：2026-02-24 | 作者：hck717*
+## Agent Detail READMEs
+
+- [Web Search Agent](web_search/README.md)
+- [Business Analyst Agent](business_analyst/README.md)
+- [Quant Fundamental Agent](quant_fundamental/README.md)
+- [Financial Modelling Agent](financial_modelling/README.md)
+
+---
+
+## Testing
+
+Each agent has its own test suite under `tests/`:
+
+```bash
+# Run all agent tests
+python -m pytest tests/ -v
+
+# Run per-agent
+python -m pytest tests/test_business_analyst.py -v
+python -m pytest tests/test_quant_fundamental.py -v
+python -m pytest tests/test_financial_modelling.py -v
+python -m pytest tests/test_web_search.py -v
+```
+
+Test counts (as of last update): Business Analyst 39, Quant Fundamental 44,
+Financial Modelling 44, Web Search 6.
+
+---
+
+## Architecture Constraints
+
+- All numeric outputs (P/E, DCF, RSI, Beta, …) are **Python-computed** — never
+  generated by an LLM.
+- All qualitative claims in LLM narratives must cite a `chunk_id` token
+  (format: `qdrant::TICKER::slug`). The orchestration citation system resolves
+  these into numbered `[N]` footnotes.
+- LLMs are used **only** for narrative text (`quantitative_summary`,
+  `competitive_moat`, `investment_thesis`) — never for arithmetic.
+
+---
+
+*Last updated: 2026-03-03*
