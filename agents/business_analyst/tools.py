@@ -1,453 +1,874 @@
-# agents/business_analyst/tools.py
-"""
-Data connectors for the Business Analyst Agent.
+"""Connectors and helper utilities for the Business Analyst agent."""
 
-Provides:
-  - Neo4j: company graph facts + vector search (hybrid retrieval)
-  - Qdrant: recent news semantic search
-  - PostgreSQL: sentiment_trends data
-  - Utility: JSON extraction, BM25 scoring
+from __future__ import annotations
 
-Host resolution:
-  Each connector tries .env hostname (Docker-internal) first, then localhost.
-  No .env changes needed when running from Mac terminal.
-
-Import design — ALL heavy packages lazy-imported inside getters:
-  neo4j / pandas       → get_neo4j_driver()
-  qdrant_client        → get_qdrant()
-  sentence_transformers→ get_embedder() / get_reranker()
-
-Embedding model resolution:
-  .env may set EMBEDDING_MODEL=nomic-embed-text (Ollama name).
-  sentence-transformers uses HuggingFace IDs, not Ollama names.
-  We map known Ollama names → HuggingFace equivalents, then fall back
-  to all-MiniLM-L6-v2 if the resolved model still fails to load.
-"""
-import os
-import re
 import json
 import logging
-import warnings
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+import math
+import os
+from contextlib import closing
+from dataclasses import dataclass
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import psycopg2
-import psycopg2.extras
-from dotenv import load_dotenv
+from neo4j import GraphDatabase, basic_auth
+from psycopg2.extras import RealDictCursor
+from qdrant_client import QdrantClient
+from qdrant_client.http import models as qmodels
+import requests
 
-try:
-    from rank_bm25 import BM25Okapi
-    BM25_AVAILABLE = True
-except ImportError:
-    BM25_AVAILABLE = False
+from .config import BusinessAnalystConfig
+from .schema import Chunk, CRAGStatus, RetrievalResult, SentimentSnapshot
 
-load_dotenv(dotenv_path=Path(__file__).resolve().parents[2] / ".env")
+# Cross-encoder reranker — loaded lazily so import never hard-fails.
+_CrossEncoder = None  # type: ignore[assignment]
+# sentence-transformers SentenceTransformer — loaded lazily for the same reason.
+_SentenceTransformer = None  # type: ignore[assignment]
+
+def _get_cross_encoder_class():
+    global _CrossEncoder
+    if _CrossEncoder is None:
+        try:
+            from sentence_transformers import CrossEncoder as _CE  # type: ignore[import]
+            _CrossEncoder = _CE
+        except ImportError:
+            pass
+    return _CrossEncoder
+
+def _get_sentence_transformer_class():
+    global _SentenceTransformer
+    if _SentenceTransformer is None:
+        try:
+            from sentence_transformers import SentenceTransformer as _ST  # type: ignore[import]
+            _SentenceTransformer = _ST
+        except ImportError:
+            pass
+    return _SentenceTransformer
+
 logger = logging.getLogger(__name__)
 
-# Suppress neo4j schema-warning noise (missing props/rels printed for every query)
-logging.getLogger("neo4j.notifications").setLevel(logging.ERROR)
 
-# ── Config ──────────────────────────────────────────────────────────────────
-NEO4J_URI      = os.getenv("NEO4J_URI",      "bolt://localhost:7687")
-NEO4J_USER     = os.getenv("NEO4J_USER",     "neo4j")
-NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "changeme_neo4j_password")
+# ----------------------------------------------------------------------------
+# Embeddings
+# ----------------------------------------------------------------------------
+class EmbeddingClient:
+    """Thin wrapper around Ollama's embedding endpoint."""
 
-QDRANT_HOST    = os.getenv("QDRANT_HOST",           "localhost")
-QDRANT_PORT    = int(os.getenv("QDRANT_PORT",        "6333"))
-COLLECTION     = os.getenv("QDRANT_COLLECTION_NAME", "financial_documents")
-RAG_TOP_K      = int(os.getenv("RAG_TOP_K",          "8"))
+    def __init__(self, base_url: str, model: str, timeout: Optional[int]) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.model = model
+        self.timeout = timeout
 
-PG_HOST        = os.getenv("POSTGRES_HOST",     "localhost")
-PG_PORT        = int(os.getenv("POSTGRES_PORT", "5432"))
-PG_DB          = os.getenv("POSTGRES_DB",       "airflow")
-PG_USER        = os.getenv("POSTGRES_USER",     "airflow")
-PG_PASS        = os.getenv("POSTGRES_PASSWORD", "airflow")
-
-_EMBED_MODEL_RAW = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
-RERANK_MODEL     = os.getenv("RERANKER_MODEL",  "cross-encoder/ms-marco-MiniLM-L-6-v2")
-
-# ── Embedding model name resolution ──────────────────────────────────────────────
-# .env may use Ollama model names. Map them to HuggingFace sentence-transformers IDs.
-_OLLAMA_TO_HF: Dict[str, str] = {
-    "nomic-embed-text":          "nomic-ai/nomic-embed-text-v1",
-    "nomic-embed-text:latest":   "nomic-ai/nomic-embed-text-v1",
-    "mxbai-embed-large":         "mixedbread-ai/mxbai-embed-large-v1",
-    "mxbai-embed-large:latest":  "mixedbread-ai/mxbai-embed-large-v1",
-    "all-minilm":                "all-MiniLM-L6-v2",
-    "all-minilm:latest":         "all-MiniLM-L6-v2",
-    "bge-large":                 "BAAI/bge-large-en-v1.5",
-    "bge-m3":                    "BAAI/bge-m3",
-}
-_EMBED_FALLBACK = "all-MiniLM-L6-v2"  # always works, 384-dim, no HF login needed
-
-EMBED_MODEL = _OLLAMA_TO_HF.get(_EMBED_MODEL_RAW, _EMBED_MODEL_RAW)
-
-# ── Lazy-loaded singletons ─────────────────────────────────────────────────────
-_embedder:      Any = None
-_reranker:      Any = None
-_neo4j_driver:  Any = None
-_qdrant_client: Any = None
-_embed_model_used: str = EMBED_MODEL  # track which model actually loaded
-
-
-def _neo4j_localhost_uri() -> str:
-    m = re.match(r"(bolt://)([^:]+)(:\d+)", NEO4J_URI)
-    return f"{m.group(1)}localhost{m.group(3)}" if m else "bolt://localhost:7687"
-
-
-# ── Getters ────────────────────────────────────────────────────────────────────
-
-def get_embedder():
-    """
-    Lazy-load SentenceTransformer.
-    Tries EMBED_MODEL (HF-resolved from .env) first.
-    Falls back to all-MiniLM-L6-v2 if that model fails (e.g. needs HF login,
-    wrong dimension, download error).
-    """
-    global _embedder, _embed_model_used
-    if _embedder is not None:
-        return _embedder
-
-    from sentence_transformers import SentenceTransformer  # noqa: lazy
-
-    models_to_try = [EMBED_MODEL]
-    if EMBED_MODEL != _EMBED_FALLBACK:
-        models_to_try.append(_EMBED_FALLBACK)
-
-    for model_name in models_to_try:
+    def embed(self, text: str) -> List[float]:
+        # Try new /api/embed endpoint first (Ollama >= 0.1.26, e.g. nomic-embed-text).
+        # Only fall back to the legacy /api/embeddings endpoint if the primary call
+        # fails with a non-404 error (e.g. empty vector returned).  A 404 on
+        # /api/embed means the Ollama instance is too old or the model is not loaded;
+        # in that case /api/embeddings will also 404 (it was removed in Ollama ≥ 0.2),
+        # so we surface the original error immediately instead of masking it.
+        primary_exc: Optional[Exception] = None
         try:
-            logger.info(f"[tools] Loading embedder: {model_name}")
-            _embedder = SentenceTransformer(model_name, trust_remote_code=True)
-            _embed_model_used = model_name
-            logger.info(f"[tools] Embedder ready: {model_name}")
-            return _embedder
-        except Exception as e:
-            logger.warning(f"[tools] Embedder load failed ({model_name}): {e}")
+            resp = requests.post(
+                f"{self.base_url}/api/embed",
+                json={"model": self.model, "input": text},
+                timeout=self.timeout,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            embeddings = data.get("embeddings")
+            if embeddings and len(embeddings) > 0 and embeddings[0]:
+                return embeddings[0]
+            # Endpoint responded but returned an empty vector — note and fall through
+            primary_exc = RuntimeError(
+                f"/api/embed returned empty embeddings for model '{self.model}'. "
+                "Ensure the model is pulled: `ollama pull {self.model}`"
+            )
+        except requests.exceptions.HTTPError as exc:
+            if exc.response is not None and exc.response.status_code == 404:
+                # 404 on /api/embed → do NOT try /api/embeddings (also absent in modern Ollama)
+                raise RuntimeError(
+                    f"Ollama embedding endpoint /api/embed returned 404 for model '{self.model}'. "
+                    "Ensure Ollama ≥ 0.1.26 is running and the model is pulled: "
+                    f"`ollama pull {self.model}`"
+                ) from exc
+            primary_exc = exc
+        except Exception as exc:
+            primary_exc = exc
 
-    raise RuntimeError(f"[tools] Could not load any embedding model. Tried: {models_to_try}")
+        if primary_exc is not None:
+            logger.debug(
+                "EmbeddingClient /api/embed failed (%s), trying legacy /api/embeddings", primary_exc
+            )
 
-
-def get_reranker():
-    """Lazy-load CrossEncoder."""
-    global _reranker
-    if _reranker is None:
-        from sentence_transformers import CrossEncoder  # noqa: lazy
-        logger.info(f"[tools] Loading reranker: {RERANK_MODEL}")
-        _reranker = CrossEncoder(RERANK_MODEL)
-    return _reranker
-
-
-def get_neo4j_driver():
-    """
-    Lazy-import neo4j. Tries Docker URI first, then localhost fallback.
-    """
-    global _neo4j_driver
-    if _neo4j_driver is not None:
-        return _neo4j_driver
-
-    try:
-        from neo4j import GraphDatabase  # noqa: lazy (pulls pandas)
-    except Exception as e:
-        logger.warning(f"[tools] neo4j import failed: {e}")
-        return None
-
-    uris = [NEO4J_URI]
-    lb   = _neo4j_localhost_uri()
-    if lb != NEO4J_URI:
-        uris.append(lb)
-
-    for uri in uris:
+        # Fallback to legacy /api/embeddings endpoint (Ollama < 0.1.26)
         try:
-            drv = GraphDatabase.driver(uri, auth=(NEO4J_USER, NEO4J_PASSWORD))
-            with drv.session() as s:
-                s.run("RETURN 1")
-            logger.info(f"[tools] Neo4j connected via {uri}")
-            _neo4j_driver = drv
-            return _neo4j_driver
-        except Exception as e:
-            logger.warning(f"[tools] Neo4j failed ({uri}): {e}")
+            resp = requests.post(
+                f"{self.base_url}/api/embeddings",
+                json={"model": self.model, "prompt": text},
+                timeout=self.timeout,
+            )
+            resp.raise_for_status()
+            embedding = resp.json().get("embedding")
+            if not embedding:
+                raise RuntimeError("Embedding endpoint returned empty vector")
+            return embedding
+        except requests.exceptions.HTTPError as exc:
+            if exc.response is not None and exc.response.status_code == 404:
+                # Both endpoints returned 404 — surface the original /api/embed error
+                if primary_exc is not None:
+                    raise RuntimeError(
+                        f"Both /api/embed and /api/embeddings returned 404 for model '{self.model}'. "
+                        "Ensure Ollama ≥ 0.1.26 is running and the model is pulled: "
+                        f"`ollama pull {self.model}`"
+                    ) from primary_exc
+            raise
 
-    logger.warning("[tools] Neo4j unavailable on all URIs")
-    return None
 
+# ----------------------------------------------------------------------------
+# Local sentence-transformers embedding client (for models NOT served via Ollama,
+# e.g. all-MiniLM-L6-v2 used for Neo4j chunk ingestion vectors).
+# ----------------------------------------------------------------------------
+class LocalEmbeddingClient:
+    """Embedding client that runs sentence-transformers locally (no Ollama required).
 
-def get_qdrant():
+    Used for the Neo4j vector index, which was built with all-MiniLM-L6-v2
+    (384-dim) via sentence_transformers, not via Ollama.  Falls back to the
+    Ollama-backed EmbeddingClient if sentence_transformers is not installed.
     """
-    Lazy-import qdrant_client. Tries Docker host first, then localhost fallback.
-    """
-    global _qdrant_client
-    if _qdrant_client is not None:
-        return _qdrant_client
 
-    try:
-        from qdrant_client import QdrantClient  # noqa: lazy
-    except Exception as e:
-        logger.warning(f"[tools] qdrant_client import failed: {e}")
-        return None
+    _model_cache: dict = {}  # class-level cache so the model is loaded once per process
 
-    hosts = [QDRANT_HOST]
-    if QDRANT_HOST != "localhost":
-        hosts.append("localhost")
+    def __init__(self, model: str, fallback: Optional["EmbeddingClient"] = None) -> None:
+        self.model_name = model
+        self.fallback = fallback
+        self._st_model = None
+        self._load_attempted = False
 
-    for host in hosts:
+    def _load(self):
+        if self._load_attempted:
+            return
+        self._load_attempted = True
+        ST = _get_sentence_transformer_class()
+        if ST is None:
+            logger.warning(
+                "sentence_transformers not installed — LocalEmbeddingClient will use fallback."
+            )
+            return
+        if self.model_name in self.__class__._model_cache:
+            self._st_model = self.__class__._model_cache[self.model_name]
+            return
+        import os as _os
+        _old_tqdm = _os.environ.get("TQDM_DISABLE")
+        _old_hf_offline = _os.environ.get("HF_HUB_OFFLINE")
+        _os.environ["TQDM_DISABLE"] = "1"
+        _os.environ["HF_HUB_OFFLINE"] = "1"
         try:
-            client = QdrantClient(host=host, port=QDRANT_PORT)
-            client.get_collections()
-            logger.info(f"[tools] Qdrant connected via {host}:{QDRANT_PORT}")
-            _qdrant_client = client
-            return _qdrant_client
-        except Exception as e:
-            logger.warning(f"[tools] Qdrant failed ({host}:{QDRANT_PORT}): {e}")
+            self._st_model = ST(self.model_name)
+            self.__class__._model_cache[self.model_name] = self._st_model
+            logger.info("LocalEmbeddingClient loaded model: %s", self.model_name)
+        except Exception as exc:
+            logger.warning(
+                "LocalEmbeddingClient failed to load '%s' (%s) — will use fallback.",
+                self.model_name, exc,
+            )
+        finally:
+            if _old_tqdm is None:
+                _os.environ.pop("TQDM_DISABLE", None)
+            else:
+                _os.environ["TQDM_DISABLE"] = _old_tqdm
+            if _old_hf_offline is None:
+                _os.environ.pop("HF_HUB_OFFLINE", None)
+            else:
+                _os.environ["HF_HUB_OFFLINE"] = _old_hf_offline
 
-    logger.warning("[tools] Qdrant unavailable on all hosts")
-    return None
+    def embed(self, text: str) -> List[float]:
+        self._load()
+        if self._st_model is not None:
+            try:
+                vec = self._st_model.encode(text, normalize_embeddings=True)
+                return vec.tolist()
+            except Exception as exc:
+                logger.warning("LocalEmbeddingClient encode failed (%s) — trying fallback.", exc)
+        if self.fallback is not None:
+            return self.fallback.embed(text)
+        raise RuntimeError(
+            f"LocalEmbeddingClient: sentence_transformers model '{self.model_name}' unavailable "
+            "and no fallback configured."
+        )
 
 
-# ── PostgreSQL: Sentiment ──────────────────────────────────────────────────────
+# ----------------------------------------------------------------------------
+# Neo4j
+# ----------------------------------------------------------------------------
+class Neo4jConnector:
+    def __init__(self, config: BusinessAnalystConfig) -> None:
+        self.config = config
+        uri = config.neo4j_uri
+        auth = basic_auth(config.neo4j_user, config.neo4j_password)
+        self.driver = GraphDatabase.driver(uri, auth=auth, encrypted=config.neo4j_verify)
 
-def fetch_sentiment(ticker: str) -> Dict:
-    """Fetch latest sentiment_trends row. Tries PG_HOST then localhost."""
-    hosts = [PG_HOST]
-    if PG_HOST != "localhost":
-        hosts.append("localhost")
+    def fetch_company_overview(self, ticker: Optional[str]) -> Optional[Dict[str, Any]]:
+        if not ticker:
+            return None
+        cypher = """
+        MATCH (c:Company {ticker:$ticker})
+        RETURN c LIMIT 1
+        """
+        with self.driver.session(database=None) as session:
+            record = session.run(cypher, ticker=ticker).single()
+            if not record:
+                return None
+            node = record["c"]
+            return dict(node)
 
-    conn = None
-    for host in hosts:
+    def fetch_graph_facts(self, ticker: Optional[str], limit: int = 25) -> List[Dict[str, Any]]:
+        if not ticker:
+            return []
+        cypher = """
+        MATCH (c:Company {ticker:$ticker})-[r:FACES_RISK|HAS_STRATEGY|COMPETES_WITH|HAS_FACT]->(n)
+        RETURN type(r) AS rel_type, properties(n) AS node_props, properties(r) AS rel_props
+        LIMIT $limit
+        """
+        with self.driver.session(database=None) as session:
+            rows = session.run(cypher, ticker=ticker, limit=limit)
+            facts: List[Dict[str, Any]] = []
+            for row in rows:
+                facts.append(
+                    {
+                        "relationship": row["rel_type"],
+                        "node": row["node_props"],
+                        "relationship_properties": row["rel_props"],
+                    }
+                )
+            return facts
+
+    def vector_search(
+        self,
+        vector: Sequence[float],
+        ticker: Optional[str],
+        top_k: int,
+        index_name: Optional[str] = None,
+    ) -> List[Chunk]:
+        index_name = index_name or self.config.neo4j_chunk_index
+        cypher = """
+        CALL db.index.vector.queryNodes($index_name, $top_k, $vector)
+        YIELD node, score
+        WITH node, score
+        WHERE $ticker IS NULL OR node.ticker = $ticker
+        RETURN node.chunk_id AS chunk_id,
+               node.text AS text,
+               node.section AS section,
+               node.filing_date AS filing_date,
+               node.ticker AS ticker_symbol,
+               score
+        LIMIT $top_k
+        """
+        with self.driver.session(database=None) as session:
+            rows = session.run(
+                cypher,
+                index_name=index_name,
+                top_k=top_k,
+                vector=vector,
+                ticker=ticker,
+            ).data()
+        chunks: List[Chunk] = []
+        for row in rows:
+            metadata = {
+                "section": row.get("section"),
+                "filing_date": row.get("filing_date"),
+                "ticker": row.get("ticker_symbol"),
+            }
+            chunk_id = row.get("chunk_id") or f"neo4j::{metadata['ticker']}::{metadata['section']}::{len(chunks)}"
+            score = self._normalise_score(row.get("score"))
+            chunks.append(
+                Chunk(
+                    chunk_id=chunk_id,
+                    text=row.get("text", ""),
+                    score=score,
+                    source="neo4j",
+                    metadata=metadata,
+                )
+            )
+        return chunks
+
+    @staticmethod
+    def _normalise_score(raw: Optional[float]) -> float:
+        if raw is None:
+            return 0.0
+        if 0 <= raw <= 1:
+            return raw
+        # Neo4j returns cosine distance (0 good) → convert to similarity
+        if raw >= 0:
+            return max(0.0, 1.0 - raw)
+        return 0.0
+
+    def insert_chunks(
+        self,
+        ticker: str,
+        chunks: List[Dict[str, Any]],
+        embedding_client: Optional["EmbeddingClient"] = None,
+    ) -> int:
+        rows = []
+        for chunk in chunks:
+            row = dict(chunk)
+            if embedding_client is not None and "embedding" not in row:
+                try:
+                    row["embedding"] = embedding_client.embed(row["text"])
+                except Exception as exc:
+                    logger.warning("Embedding failed for chunk %s: %s", row.get("chunk_id"), exc)
+                    row["embedding"] = None
+            rows.append(row)
+
+        cypher = """
+        UNWIND $rows AS row
+        MERGE (c:Company {ticker: row.ticker})
+        MERGE (chunk:Chunk {chunk_id: row.chunk_id})
+          SET chunk.text = row.text,
+              chunk.section = row.section,
+              chunk.filing_date = row.filing_date,
+              chunk.ticker = row.ticker,
+              chunk.embedding = row.embedding
+        MERGE (c)-[:HAS_CHUNK]->(chunk)
+        """
+        with self.driver.session(database=None) as session:
+            session.run(cypher, rows=rows)
+        return len(rows)
+
+    def close(self) -> None:
+        self.driver.close()
+
+
+# ----------------------------------------------------------------------------
+# PostgreSQL
+# ----------------------------------------------------------------------------
+class PostgresConnector:
+    def __init__(self, config: BusinessAnalystConfig) -> None:
+        self.config = config
+
+    def fetch_sentiment(self, ticker: Optional[str]) -> Optional[SentimentSnapshot]:
+        if not ticker:
+            return None
+        # NOTE: live DB uses 'date' column; 'trend' added via migration when present
+        sql = """
+        SELECT bullish_pct, bearish_pct, neutral_pct,
+               COALESCE(trend, 'unknown') AS trend
+        FROM sentiment_trends
+        WHERE ticker = %s
+        ORDER BY date DESC
+        LIMIT 1
+        """
+        conn = psycopg2.connect(
+            host=self.config.postgres_host,
+            port=self.config.postgres_port,
+            dbname=self.config.postgres_db,
+            user=self.config.postgres_user,
+            password=self.config.postgres_password,
+        )
+        with closing(conn), conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, (ticker,))
+            row = cur.fetchone()
+            if not row:
+                return None
+            return SentimentSnapshot(
+                bullish_pct=float(row.get("bullish_pct", 0.0)),
+                bearish_pct=float(row.get("bearish_pct", 0.0)),
+                neutral_pct=float(row.get("neutral_pct", 0.0)),
+                trend=row.get("trend", "unknown"),
+            )
+
+
+# ----------------------------------------------------------------------------
+# Qdrant (news fallback)
+# ----------------------------------------------------------------------------
+class QdrantConnector:
+    def __init__(self, config: BusinessAnalystConfig) -> None:
+        self.config = config
+        self.client = QdrantClient(host=config.qdrant_host, port=config.qdrant_port)
+
+    def vector_search(
+        self,
+        vector: Sequence[float],
+        ticker: Optional[str],
+        top_k: int,
+    ) -> List[Chunk]:
+        qdrant_filter: Optional[qmodels.Filter] = None
+        if ticker:
+            qdrant_filter = qmodels.Filter(
+                must=[qmodels.FieldCondition(
+                    key="ticker_symbol",
+                    match=qmodels.MatchValue(value=ticker),
+                )]
+            )
+        response = self.client.query_points(
+            collection_name=self.config.qdrant_collection,
+            query=list(vector),
+            limit=top_k * 6,  # Over-fetch heavily to get top_k *unique* articles after dedup
+            with_payload=True,
+            query_filter=qdrant_filter,
+        )
+        hits = response.points
+        chunks: List[Chunk] = []
+        seen_ids: set = set()
+        seen_title_keys: set = set()  # normalised title key for near-duplicate suppression
+        for hit in hits:
+            payload = hit.payload or {}
+            # Build a human-readable chunk_id from ticker + title slug when no stored chunk_id
+            if payload.get("chunk_id"):
+                chunk_id = payload["chunk_id"]
+            else:
+                ticker_sym = payload.get("ticker_symbol", "")
+                title_raw = payload.get("title") or ""
+                title_slug = title_raw[:40].replace(" ", "_").replace("/", "-")
+                chunk_id = f"qdrant::{ticker_sym}::{title_slug}" if title_slug else f"qdrant::{hit.id}"
+            # Primary dedup: exact chunk_id
+            if chunk_id in seen_ids:
+                continue
+            seen_ids.add(chunk_id)
+            # Secondary dedup: normalised title key (strips punctuation, lowercases) so
+            # near-identical articles like "Tesla Suing California..." vs
+            # "Tesla Is Suing California..." collapse to one entry.
+            title_raw = payload.get("title") or ""
+            import re as _re
+            title_key = _re.sub(r"[^a-z0-9]", "", title_raw.lower())[:60]
+            if title_key and title_key in seen_title_keys:
+                continue
+            if title_key:
+                seen_title_keys.add(title_key)
+            text = payload.get("content") or payload.get("text") or payload.get("summary") or ""
+            metadata = {
+                k: payload.get(k)
+                for k in ["ticker_symbol", "data_name", "source", "section", "filing_date"]
+                if payload.get(k) is not None
+            }
+            score = hit.score or 0.0
+            score = score if 0 <= score <= 1 else max(0.0, 1.0 - score)
+            chunks.append(
+                Chunk(
+                    chunk_id=chunk_id,
+                    text=text,
+                    score=score,
+                    source="qdrant",
+                    metadata=metadata,
+                )
+            )
+            if len(chunks) >= top_k:
+                break
+        return chunks
+
+
+# ----------------------------------------------------------------------------
+# Keyword scorer (BM25-lite)
+# ----------------------------------------------------------------------------
+def keyword_overlap_score(text: str, query: str) -> float:
+    text_tokens = set(_tokenise(text))
+    query_tokens = set(_tokenise(query))
+    if not text_tokens or not query_tokens:
+        return 0.0
+    overlap = len(text_tokens & query_tokens)
+    return overlap / len(query_tokens)
+
+
+def _tokenise(text: str) -> List[str]:
+    return [t.lower() for t in text.split() if t.isalpha()]
+
+
+def _sigmoid_normalise(scores: List[float]) -> List[float]:
+    """Map raw cross-encoder logits to [0, 1] via sigmoid."""
+    import math as _math
+    return [1.0 / (1.0 + _math.exp(-s)) for s in scores]
+
+
+# ----------------------------------------------------------------------------
+# Ticker identity helper
+# ----------------------------------------------------------------------------
+
+def _chunk_ticker_matches(chunk: "Chunk", ticker: str) -> bool:
+    """Return True if the chunk provably belongs to *ticker*.
+
+    Checks (in priority order):
+    1. ``chunk.metadata["ticker"]``       — set by Neo4jConnector
+    2. ``chunk.metadata["ticker_symbol"]`` — set by QdrantConnector
+    3. ``chunk.chunk_id`` prefix heuristic — e.g. ``qdrant::AAPL::…`` or
+       ``neo4j::AAPL::…``
+
+    Returns True when the ticker is *unknown* (missing from all three
+    sources) to avoid silently discarding potentially valid chunks.
+    """
+    meta = chunk.metadata or {}
+    for key in ("ticker", "ticker_symbol"):
+        val = meta.get(key)
+        if val:
+            return str(val).upper() == ticker.upper()
+    # Fallback: parse chunk_id  (format: <source>::<TICKER>::<rest>)
+    parts = chunk.chunk_id.split("::")
+    if len(parts) >= 2:
+        candidate = parts[1].upper()
+        # Only trust the heuristic when it looks like a real ticker symbol
+        if 1 <= len(candidate) <= 6 and candidate.isalpha():
+            return candidate == ticker.upper()
+    # Cannot determine ticker from available metadata — let it through
+    return True
+
+
+# ----------------------------------------------------------------------------
+# Hybrid retriever & evaluator
+# ----------------------------------------------------------------------------
+class HybridRetriever:
+    """Dense + sparse + graph retrieval with cross-encoder reranking.
+
+    Reranking weight mix:
+        final_score = BM25_WEIGHT * lexical + CE_WEIGHT * cross_encoder
+    where BM25_WEIGHT = 0.30 and CE_WEIGHT = 0.70 (mirrors README spec).
+
+    If sentence-transformers is unavailable or the model fails to load,
+    the reranker silently degrades to BM25-only scoring with a warning.
+    """
+
+    BM25_WEIGHT: float = 0.30
+    CE_WEIGHT: float = 0.70
+
+    def __init__(
+        self,
+        config: BusinessAnalystConfig,
+        embedding_client: Any,
+        neo4j: Neo4jConnector,
+        qdrant: QdrantConnector,
+        qdrant_embedding_client: Optional[Any] = None,
+    ) -> None:
+        self.config = config
+        self.embedding_client = embedding_client
+        self.neo4j = neo4j
+        self.qdrant = qdrant
+        # Use a separate embedder for Qdrant if dimensions differ (e.g. nomic-embed-text 768-dim)
+        self.qdrant_embedding_client = qdrant_embedding_client or embedding_client
+        # Deferred — loaded on first call to _cross_encoder_scores() to avoid
+        # the sentence_transformers / torch / sympy / mpmath import chain at startup
+        # (hangs on Python 3.14 during mpmath ctx_mp.py:init_builtins()).
+        self._cross_encoder = None
+        self._ce_load_attempted: bool = False
+
+    # ------------------------------------------------------------------
+    # Cross-encoder loader
+    # ------------------------------------------------------------------
+
+    def _load_cross_encoder(self):
+        """Load cross-encoder model; return None on any failure."""
+        import os as _os
+        import sys as _sys
+        CE = _get_cross_encoder_class()
+        if CE is None:
+            logger.warning("sentence-transformers not installed — reranker disabled, using BM25-only")
+            return None
+        try:
+            # Suppress verbose "LOAD REPORT" and tqdm progress bar by redirecting
+            # file descriptors 1 (stdout) and 2 (stderr) to /dev/null at the OS level.
+            # Python-level sys.stdout/stderr redirect is insufficient because
+            # sentence_transformers / tqdm write directly to the underlying fd.
+            _old_tqdm = _os.environ.get("TQDM_DISABLE")
+            _old_hf_offline = _os.environ.get("HF_HUB_OFFLINE")
+            _os.environ["TQDM_DISABLE"] = "1"
+            # Force local cache — prevents HuggingFace Hub remote fetch (which times out
+            # when the model is already cached locally).
+            _os.environ["HF_HUB_OFFLINE"] = "1"
+            _devnull_fd = _os.open(_os.devnull, _os.O_WRONLY)
+            _saved_stdout = _os.dup(1)
+            _saved_stderr = _os.dup(2)
+            _os.dup2(_devnull_fd, 1)
+            _os.dup2(_devnull_fd, 2)
+            _os.close(_devnull_fd)
+            try:
+                model = CE(self.config.reranker_model)
+            finally:
+                _os.dup2(_saved_stdout, 1)
+                _os.dup2(_saved_stderr, 2)
+                _os.close(_saved_stdout)
+                _os.close(_saved_stderr)
+                if _old_tqdm is None:
+                    _os.environ.pop("TQDM_DISABLE", None)
+                else:
+                    _os.environ["TQDM_DISABLE"] = _old_tqdm
+                if _old_hf_offline is None:
+                    _os.environ.pop("HF_HUB_OFFLINE", None)
+                else:
+                    _os.environ["HF_HUB_OFFLINE"] = _old_hf_offline
+            logger.info("Cross-encoder loaded: %s", self.config.reranker_model)
+            return model
+        except Exception as exc:
+            logger.warning("Cross-encoder load failed (%s) — falling back to BM25-only", exc)
+            return None
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def retrieve(self, query: str, ticker: Optional[str]) -> RetrievalResult:
+        neo4j_vector = self.embedding_client.embed(query)
+        chunks = self.neo4j.vector_search(neo4j_vector, ticker, self.config.top_k)
+        if len(chunks) < max(1, self.config.top_k // 2):
+            qdrant_vector = self.qdrant_embedding_client.embed(query)
+            chunks.extend(self.qdrant.vector_search(qdrant_vector, ticker, self.config.top_k))
+
+        # Post-merge ticker guard: drop any chunk that belongs to a different company.
+        # This catches (a) Neo4j chunks that slipped through the post-hoc WHERE filter
+        # when the ANN window was dominated by other tickers, and (b) Qdrant chunks
+        # where the payload field name may have differed from the expected key.
+        if ticker:
+            before = len(chunks)
+            chunks = [c for c in chunks if _chunk_ticker_matches(c, ticker)]
+            dropped = before - len(chunks)
+            if dropped:
+                logger.warning(
+                    "[HybridRetriever] Dropped %d cross-ticker chunk(s) for ticker=%s "
+                    "after post-merge filter.",
+                    dropped,
+                    ticker,
+                )
+
+        ranked, bm25_debug = self._rerank(query, chunks)
+        facts = self.neo4j.fetch_graph_facts(ticker, limit=25)
+        return RetrievalResult(chunks=ranked, graph_facts=facts, bm25_debug=bm25_debug)
+
+    # ------------------------------------------------------------------
+    # Reranking
+    # ------------------------------------------------------------------
+
+    def _rerank(self, query: str, chunks: List[Chunk]) -> Tuple[List[Chunk], Dict[str, float]]:
+        """Blend BM25 lexical score (30%) with cross-encoder score (70%).
+
+        Falls back to dense + BM25 blend when cross-encoder is unavailable or
+        uniformly mis-calibrated (max CE score < 0.4, which happens when the
+        MS-MARCO cross-encoder receives long financial-news articles paired with
+        abstract qualitative queries).
+        Returns a (sorted_chunks, bm25_debug) tuple where bm25_debug maps
+        chunk_id → raw BM25 token-overlap score (before blending).
+        """
+        if not chunks:
+            return chunks, {}
+
+        # Snapshot the incoming dense scores before any modification
+        dense_scores = [float(min(1.0, c.score)) for c in chunks]
+        for i, chunk in enumerate(chunks):
+            chunk.score = dense_scores[i]
+
+        bm25_scores = [keyword_overlap_score(c.text, query) for c in chunks]
+
+        # Attempt cross-encoder scoring
+        ce_scores = self._cross_encoder_scores(query, chunks)
+
+        # Only use CE when scores are meaningful (max >= 0.4).
+        # When CE scores are uniformly low the model is mis-calibrated for this
+        # corpus, so we fall back to dense + BM25 to preserve the signal that
+        # the dense retriever already found.
+        use_ce = ce_scores is not None and max(ce_scores) >= 0.4
+
+        for i, chunk in enumerate(chunks):
+            bm25 = bm25_scores[i]
+            if use_ce:
+                ce = ce_scores[i]  # type: ignore[index]
+                chunk.score = float(min(1.0, self.CE_WEIGHT * ce + self.BM25_WEIGHT * bm25))
+            else:
+                # Dense + BM25 fallback: 70% dense score + 30% BM25
+                chunk.score = float(min(1.0, 0.7 * dense_scores[i] + 0.3 * bm25))
+
+        if ce_scores is not None and not use_ce:
+            logger.debug(
+                "_rerank: CE max score %.3f < 0.4 — using dense+BM25 fallback "
+                "(cross-encoder mis-calibrated for this corpus/query)",
+                max(ce_scores),
+            )
+
+        sorted_chunks = sorted(chunks, key=lambda c: c.score, reverse=True)
+        bm25_debug: Dict[str, float] = {
+            chunks[i].chunk_id: round(bm25_scores[i], 4) for i in range(len(chunks))
+        }
+        return sorted_chunks, bm25_debug
+
+    def _cross_encoder_scores(
+        self, query: str, chunks: List[Chunk]
+    ) -> Optional[List[float]]:
+        """Return normalised [0,1] cross-encoder scores, or None on failure.
+
+        The cross-encoder model is loaded lazily on the first call to avoid
+        importing sentence_transformers / torch at toolkit construction time,
+        which hangs on Python 3.14 due to mpmath ctx_mp.py:init_builtins().
+        """
+        if self._cross_encoder is None and not self._ce_load_attempted:
+            self._ce_load_attempted = True
+            self._cross_encoder = self._load_cross_encoder()
+        if self._cross_encoder is None:
+            return None
+        import os as _os
+        try:
+            pairs = [(query, c.text) for c in chunks]
+            # Suppress tqdm progress bar printed to stderr during predict()
+            _old_tqdm = _os.environ.get("TQDM_DISABLE")
+            _os.environ["TQDM_DISABLE"] = "1"
+            try:
+                raw_scores: List[float] = self._cross_encoder.predict(pairs, show_progress_bar=False).tolist()  # type: ignore[union-attr]
+            finally:
+                if _old_tqdm is None:
+                    _os.environ.pop("TQDM_DISABLE", None)
+                else:
+                    _os.environ["TQDM_DISABLE"] = _old_tqdm
+            return _sigmoid_normalise(raw_scores)
+        except Exception as exc:
+            logger.warning("Cross-encoder predict failed: %s — using BM25-only", exc)
+            return None
+
+
+@dataclass
+class CRAGEvaluation:
+    status: CRAGStatus
+    confidence: float
+
+
+class CRAGEvaluator:
+    def __init__(self, config: BusinessAnalystConfig) -> None:
+        self.config = config
+
+    def evaluate(
+        self,
+        chunks: Sequence[Chunk],
+        ticker: Optional[str] = None,
+    ) -> CRAGEvaluation:
+        """Score retrieval quality.
+
+        When *ticker* is provided, only chunks that provably belong to that
+        ticker are considered.  A chunk that belongs to a *different* company
+        is never counted as evidence of a CORRECT retrieval — it would
+        downstream contaminate the LLM context with off-ticker information.
+        """
+        if not chunks:
+            return CRAGEvaluation(CRAGStatus.INCORRECT, 0.0)
+
+        if ticker:
+            ticker_chunks = [c for c in chunks if _chunk_ticker_matches(c, ticker)]
+            if not ticker_chunks:
+                # Every retrieved chunk belongs to a different company — treat as
+                # INCORRECT so the pipeline falls back to web search.
+                logger.warning(
+                    "[CRAGEvaluator] All %d retrieved chunk(s) are off-ticker for ticker=%s "
+                    "— classifying as INCORRECT.",
+                    len(chunks),
+                    ticker,
+                )
+                return CRAGEvaluation(CRAGStatus.INCORRECT, 0.0)
+            top_score = ticker_chunks[0].score
+        else:
+            top_score = chunks[0].score
+
+        if top_score >= self.config.crag_correct_threshold:
+            return CRAGEvaluation(CRAGStatus.CORRECT, top_score)
+        if top_score >= self.config.crag_ambiguous_threshold:
+            return CRAGEvaluation(CRAGStatus.AMBIGUOUS, top_score)
+        return CRAGEvaluation(CRAGStatus.INCORRECT, top_score)
+
+
+# ----------------------------------------------------------------------------
+# Toolkit façade used by the agent + health checks
+# ----------------------------------------------------------------------------
+class BusinessAnalystToolkit:
+    def __init__(self, config: Optional[BusinessAnalystConfig] = None) -> None:
+        self.config = config or BusinessAnalystConfig()
+        # Neo4j chunk-ingestion embedder: all-MiniLM-L6-v2 (384-dim), run locally via
+        # sentence_transformers — this model is NOT served through Ollama.
+        # A fallback to the Ollama EmbeddingClient is wired in so the toolkit still
+        # initialises if sentence_transformers is unavailable.
+        _neo4j_ollama_fallback = EmbeddingClient(
+            self.config.ollama_base_url,
+            self.config.embedding_model,
+            self.config.request_timeout,
+        )
+        self.embedding = LocalEmbeddingClient(
+            self.config.embedding_model,
+            fallback=_neo4j_ollama_fallback,
+        )
+        # Qdrant embedder: nomic-embed-text, 768-dim (matches how load_qdrant.py indexes)
+        self.qdrant_embedding = EmbeddingClient(
+            self.config.ollama_base_url,
+            self.config.qdrant_embedding_model,
+            self.config.request_timeout,
+        )
+        self.neo4j = Neo4jConnector(self.config)
+        self.pg = PostgresConnector(self.config)
+        self.qdrant = QdrantConnector(self.config)
+        self.retriever = HybridRetriever(
+            self.config,
+            self.embedding,
+            self.neo4j,
+            self.qdrant,
+            qdrant_embedding_client=self.qdrant_embedding,
+        )
+        self.evaluator = CRAGEvaluator(self.config)
+
+    def fetch_company_overview(self, ticker: Optional[str]) -> Optional[Dict[str, Any]]:
+        return self.neo4j.fetch_company_overview(ticker)
+
+    def fetch_sentiment(self, ticker: Optional[str]) -> Optional[SentimentSnapshot]:
+        try:
+            return self.pg.fetch_sentiment(ticker)
+        except Exception as exc:
+            logger.warning("Postgres sentiment fetch failed: %s", exc)
+            return None
+
+    def retrieve(self, query: str, ticker: Optional[str]) -> RetrievalResult:
+        try:
+            return self.retriever.retrieve(query, ticker)
+        except Exception as exc:
+            logger.error("Hybrid retrieval failed: %s", exc)
+            return RetrievalResult(chunks=[], graph_facts=[], bm25_debug={})
+
+    def evaluate(self, chunks: Sequence[Chunk], ticker: Optional[str] = None) -> CRAGEvaluation:
+        return self.evaluator.evaluate(chunks, ticker=ticker)
+
+    def healthcheck(self) -> Dict[str, Any]:
+        health: Dict[str, Any] = {"neo4j": False, "postgres": False, "qdrant": False, "ollama": False}
+        try:
+            with self.neo4j.driver.session(database=None) as _session:
+                _session.run("RETURN 1")
+            health["neo4j"] = True
+        except Exception as exc:
+            health["neo4j_error"] = str(exc)
+
         try:
             conn = psycopg2.connect(
-                host=host, port=PG_PORT, dbname=PG_DB,
-                user=PG_USER, password=PG_PASS,
-                connect_timeout=5,
+                host=self.config.postgres_host,
+                port=self.config.postgres_port,
+                dbname=self.config.postgres_db,
+                user=self.config.postgres_user,
+                password=self.config.postgres_password,
             )
-            logger.debug(f"[tools] PostgreSQL connected via {host}")
-            break
-        except Exception as e:
-            logger.warning(f"[tools] PostgreSQL failed ({host}): {e}")
+            conn.close()
+            health["postgres"] = True
+        except Exception as exc:
+            health["postgres_error"] = str(exc)
 
-    if conn is None:
-        return {}
-
-    try:
-        with conn:
-            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-                cur.execute("""
-                    SELECT bullish_pct, bearish_pct, neutral_pct, date
-                    FROM sentiment_trends
-                    WHERE ticker = %s
-                    ORDER BY date DESC
-                    LIMIT 2
-                """, (ticker,))
-                rows = cur.fetchall()
-        conn.close()
-
-        if not rows:
-            return {}
-
-        latest = dict(rows[0])
-        trend  = "stable"
-        if len(rows) == 2:
-            diff = float(latest.get("bullish_pct") or 0) - float(rows[1].get("bullish_pct") or 0)
-            if diff > 3:    trend = "improving"
-            elif diff < -3: trend = "deteriorating"
-
-        return {
-            "bullish_pct": float(latest.get("bullish_pct") or 0),
-            "bearish_pct": float(latest.get("bearish_pct") or 0),
-            "neutral_pct": float(latest.get("neutral_pct") or 0),
-            "trend":       trend,
-            "source":      "postgresql:sentiment_trends",
-        }
-    except Exception as e:
-        logger.warning(f"[tools] PostgreSQL query failed: {e}")
-        return {}
-
-
-# ── Neo4j queries ────────────────────────────────────────────────────────────────
-
-def fetch_company_profile(ticker: str) -> Dict:
-    driver = get_neo4j_driver()
-    if not driver:
-        return {}
-    try:
-        with driver.session() as session:
-            result = session.run(
-                "MATCH (c:Company {ticker: $ticker}) RETURN properties(c) AS props",
-                ticker=ticker,
-            )
-            record = result.single()
-            if not record:
-                return {}
-            props = dict(record["props"])
-        return {
-            "name":          props.get("Name")    or props.get("name")    or ticker,
-            "sector":        props.get("Sector")  or props.get("sector"),
-            "market_cap":    _safe_float(props.get("Highlights_MarketCapitalization")),
-            "pe_ratio":      _safe_float(props.get("Valuation_TrailingPE") or props.get("Highlights_PERatio")),
-            "profit_margin": _safe_float(props.get("Highlights_ProfitMargin")),
-            "description":   props.get("Description") or props.get("description") or "",
-        }
-    except Exception as e:
-        logger.warning(f"[tools] Neo4j company profile failed: {e}")
-        return {}
-
-
-def fetch_graph_facts(ticker: str, keyword: str = "business") -> List[str]:
-    """
-    Flexible Cypher that works even when graph edges don't exist yet.
-    Falls back to a broader company-description search if no relationship edges found.
-    """
-    driver = get_neo4j_driver()
-    if not driver:
-        return []
-    try:
-        with driver.session() as session:
-            # Primary: structured relationship traversal
-            result = session.run("""
-                MATCH (c:Company {ticker: $ticker})-[r]->(n)
-                WHERE type(r) IN ['HAS_STRATEGY','FACES_RISK','OFFERS_PRODUCT']
-                  AND (
-                    toLower(coalesce(n.description,'')) CONTAINS toLower($keyword)
-                    OR toLower(coalesce(n.name,''))  CONTAINS toLower($keyword)
-                    OR toLower(coalesce(n.text,''))  CONTAINS toLower($keyword)
-                  )
-                RETURN coalesce(n.name, n.title, '') + ': '
-                     + coalesce(n.description, n.text, '') AS text
-                LIMIT 12
-            """, ticker=ticker, keyword=keyword)
-            rows = [r["text"] for r in result if r["text"].strip(" :")]
-
-            # Fallback: if no edge data, return Company description as context
-            if not rows:
-                fb = session.run(
-                    "MATCH (c:Company {ticker: $ticker}) "
-                    "RETURN coalesce(c.Description, c.description, '') AS text",
-                    ticker=ticker,
-                )
-                rec = fb.single()
-                if rec and rec["text"]:
-                    rows = [rec["text"][:800]]
-
-        return rows
-    except Exception as e:
-        logger.warning(f"[tools] Neo4j graph traversal failed: {e}")
-        return []
-
-
-def neo4j_vector_search(query: str, ticker: str, k: int = 10) -> List[str]:
-    driver = get_neo4j_driver()
-    if not driver:
-        return []
-    try:
-        embedding = get_embedder().encode(query).tolist()
-        with driver.session() as session:
-            result = session.run("""
-                CALL db.index.vector.queryNodes('chunk_embedding', $k, $embedding)
-                YIELD node, score
-                WHERE node.ticker CONTAINS $ticker
-                RETURN node.text AS text, node.chunk_id AS chunk_id, score
-                ORDER BY score DESC
-            """, k=k, embedding=embedding, ticker=ticker)
-            return [
-                f"[{r.get('chunk_id','unknown')}] {r.get('text','')}"
-                for r in result if r.get("text")
-            ]
-    except Exception as e:
-        logger.warning(f"[tools] Neo4j vector search failed: {e}")
-        return []
-
-
-# ── Qdrant: News semantic search ───────────────────────────────────────────────
-
-def qdrant_news_search(query: str, ticker: str, k: int = RAG_TOP_K) -> List[str]:
-    client = get_qdrant()
-    if not client:
-        return []
-    try:
-        from qdrant_client.models import Filter, FieldCondition, MatchValue  # noqa: lazy
-        embedding = get_embedder().encode(query).tolist()
-        hits = client.search(
-            collection_name=COLLECTION,
-            query_vector=embedding,
-            query_filter=Filter(must=[FieldCondition(
-                key="ticker_symbol", match=MatchValue(value=ticker),
-            )]) if ticker else None,
-            limit=k,
-            with_payload=True,
-        )
-        results = []
-        for hit in hits:
-            p       = hit.payload or {}
-            title   = p.get("title", "")
-            content = p.get("content") or p.get("text") or ""
-            date    = p.get("date") or p.get("published_date") or "unknown"
-            results.append(f"[news|{date}] {title}: {content[:400]}")
-        return results
-    except Exception as e:
-        logger.warning(f"[tools] Qdrant news search failed: {e}")
-        return []
-
-
-# ── Hybrid Retrieval ───────────────────────────────────────────────────────────
-
-def hybrid_retrieve(query: str, ticker: str, k_final: int = 5) -> Tuple[List[str], float]:
-    """Neo4j vector + graph + Qdrant news → BM25 + Cross-Encoder rerank."""
-    q_lower = query.lower()
-    keyword = next(
-        (kw for kw in ["risk","strategy","revenue","growth","competition","supply","moat"]
-         if kw in q_lower), "business"
-    )
-
-    vec_docs   = neo4j_vector_search(query, ticker, k=15)
-    graph_docs = fetch_graph_facts(ticker, keyword)
-    news_docs  = qdrant_news_search(query, ticker, k=5)
-
-    all_docs = list(dict.fromkeys(vec_docs + graph_docs + news_docs))
-    if not all_docs:
-        return [], 0.0
-
-    bm25_scores = [0.0] * len(all_docs)
-    if BM25_AVAILABLE:
         try:
-            tokenized   = [d.lower().split() for d in all_docs]
-            bm25        = BM25Okapi(tokenized)
-            raw         = bm25.get_scores(query.lower().split())
-            max_raw     = max(raw) if max(raw) > 0 else 1.0
-            bm25_scores = [s / max_raw for s in raw]
-        except Exception:
-            pass
+            self.qdrant.client.get_collections()
+            health["qdrant"] = True
+        except Exception as exc:
+            health["qdrant_error"] = str(exc)
 
-    reranker  = get_reranker()
-    ce_scores = reranker.predict([[query, d] for d in all_docs]).tolist()
+        try:
+            self.embedding.embed("health check ping")
+            health["ollama"] = True
+        except Exception as exc:
+            health["ollama_error"] = str(exc)
 
-    hybrid    = [0.3 * bm25_scores[i] + 0.7 * ce_scores[i] for i in range(len(all_docs))]
-    ranked    = sorted(zip(all_docs, hybrid), key=lambda x: x[1], reverse=True)
-    top_docs  = [doc for doc, _ in ranked[:k_final]]
-    top_score = ranked[0][1] if ranked else 0.0
+        return health
 
-    logger.info(f"[tools] hybrid_retrieve: {len(all_docs)} candidates → top score {top_score:.3f}")
-    return top_docs, top_score
+    def close(self) -> None:
+        self.neo4j.close()
 
 
-def crag_evaluate(score: float) -> str:
-    if score > 0.7:    return "CORRECT"
-    elif score >= 0.5: return "AMBIGUOUS"
-    else:              return "INCORRECT"
-
-
-# ── Utilities ──────────────────────────────────────────────────────────────────
-
-def extract_json_from_response(content: str) -> Optional[dict]:
-    for pattern in [r"```(?:json)?\s*(\{.*?\})\s*```", r"\{.*\}"]:
-        m = re.search(pattern, content, re.DOTALL)
-        if m:
-            try:    return json.loads(m.group(1) if "```" in pattern else m.group(0))
-            except: pass
-    try:    return json.loads(content.strip())
-    except: pass
-    logger.warning("[tools] Could not extract JSON from response")
-    return None
-
-
-def _safe_float(val) -> Optional[float]:
-    try:    return float(val) if val is not None else None
-    except: return None
+__all__ = [
+    "BusinessAnalystToolkit",
+    "EmbeddingClient",
+    "LocalEmbeddingClient",
+    "HybridRetriever",
+    "CRAGEvaluator",
+    "CRAGEvaluation",
+    "Neo4jConnector",
+    "PostgresConnector",
+    "QdrantConnector",
+]

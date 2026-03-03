@@ -28,6 +28,15 @@ from load_postgres import load_postgres_for_agent_ticker
 from load_neo4j import load_neo4j_for_agent_ticker
 from load_qdrant import load_qdrant_for_agent_ticker
 
+# Neo4j chunk ingestion (LLM synthesis + embedding into Neo4j :Chunk nodes)
+sys.path.insert(0, "/opt/airflow")
+from ingestion.etl.ingest_neo4j_chunks import main as ingest_neo4j_chunks_main
+
+
+def ingest_neo4j_chunks_for_ticker(ticker: str, **_context) -> None:
+    """Airflow task wrapper: synthesise and ingest Neo4j Chunk nodes for one ticker."""
+    ingest_neo4j_chunks_main(tickers=[ticker])
+
 # Default arguments
 default_args = {
     'owner': 'airflow',
@@ -45,7 +54,8 @@ BASE_OUTPUT_DIR = "/opt/airflow/etl/agent_data"
 
 TICKERS = [t.strip() for t in os.getenv('TRACKED_TICKERS', 'AAPL').split(',')]
 FMP_RATE_LIMIT = int(os.getenv('FMP_RATE_LIMIT', '300'))
-RATE_LIMIT_DELAY = 60.0 / FMP_RATE_LIMIT
+RATE_LIMIT_DELAY = 60.0 / max(FMP_RATE_LIMIT, 1)
+BOX_LINE = "-" * 70
 
 AGENT_CONFIGS = {
     "business_analyst": {
@@ -189,18 +199,15 @@ def save_data(agent_name, ticker, data_name, data, metadata, storage_dest):
     with open(agent_dir / f"{data_name}.json", 'w') as f:
         json.dump(data, f, indent=2)
 
-    # FIX: write CSV for both list and dict responses
+    # Write CSV for both list and dict responses
     try:
         if isinstance(data, list) and len(data) > 0:
             pd.DataFrame(data).to_csv(agent_dir / f"{data_name}.csv", index=False)
         elif isinstance(data, dict):
-            # Unwrap single-item lists wrapped in a dict key (e.g. FMP profile endpoint)
-            # Try to find a list value first
             list_val = next((v for v in data.values() if isinstance(v, list) and len(v) > 0), None)
             if list_val:
                 pd.DataFrame(list_val).to_csv(agent_dir / f"{data_name}.csv", index=False)
             else:
-                # Flatten top-level dict — drop nested dicts/lists
                 flat_row = {k: str(v) for k, v in data.items() if not isinstance(v, (dict, list))}
                 if flat_row:
                     pd.DataFrame([flat_row]).to_csv(agent_dir / f"{data_name}.csv", index=False)
@@ -219,10 +226,10 @@ def save_data(agent_name, ticker, data_name, data, metadata, storage_dest):
 
 
 def scrape_agent_ticker(agent_name, ticker, **context):
-    print(f"\n{'='*70}")
+    print("\n" + BOX_LINE)
     print(f"[FMP] Agent: {agent_name} | Ticker: {ticker}")
     print(f"Timestamp: {datetime.now().isoformat()}")
-    print(f"{'='*70}")
+    print(BOX_LINE)
 
     config = AGENT_CONFIGS[agent_name]
     metadata = load_metadata(agent_name, ticker)
@@ -248,9 +255,9 @@ def scrape_agent_ticker(agent_name, ticker, **context):
         time.sleep(RATE_LIMIT_DELAY)
 
     save_metadata(agent_name, ticker, metadata)
-    print(f"\n{'─'*70}")
+    print("\n" + BOX_LINE)
     print(f"[FMP] {agent_name}/{ticker}: {updates_made} updates, {errors} errors")
-    print(f"{'─'*70}")
+    print(BOX_LINE)
 
     context['task_instance'].xcom_push(
         key=f'{agent_name}_{ticker}_updates',
@@ -271,16 +278,16 @@ def report_summary(**context):
             summary[f'{agent_name}/{ticker}'] = updates or 0
             total_updates += (updates or 0)
 
-    print(f"\n{'='*70}")
+    print("\n" + BOX_LINE)
     print(f"FMP INGESTION SUMMARY — Total updates: {total_updates}")
-    print(f"{'='*70}")
+    print(BOX_LINE)
     for k, v in summary.items():
         print(f"  {k}: {v} updates")
-    print(f"{'='*70}")
+    print(BOX_LINE)
     return summary
 
 
-# ── DAG ──────────────────────────────────────────────────────────────────────
+# ── DAG ──────────────────────────────────────────────────────────────────────────
 with DAG(
     'fmp_complete_ingestion',
     default_args=default_args,
@@ -291,10 +298,11 @@ with DAG(
     tags=['fmp', 'complete', 'production'],
 ) as dag:
 
-    scrape_tasks      = {}
-    load_pg_tasks     = {}
-    load_neo4j_tasks  = {}
-    load_qdrant_tasks = {}
+    scrape_tasks               = {}
+    load_pg_tasks              = {}
+    load_neo4j_tasks           = {}
+    load_qdrant_tasks          = {}
+    ingest_neo4j_chunks_tasks  = {}
 
     for agent_name in AGENT_CONFIGS.keys():
         for ticker in TICKERS:
@@ -322,17 +330,40 @@ with DAG(
                 op_kwargs={'agent_name': agent_name, 'ticker_symbol': ticker},
             )
 
+            # Only business_analyst needs Neo4j chunk synthesis
+            if agent_name == "business_analyst":
+                ingest_neo4j_chunks_tasks[key] = PythonOperator(
+                    task_id=f'fmp_ingest_neo4j_chunks_{ticker}',
+                    python_callable=ingest_neo4j_chunks_for_ticker,
+                    op_kwargs={'ticker': ticker},
+                    provide_context=True,
+                    execution_timeout=None,  # LLM synthesis can take several minutes
+                )
+
     summary_task = PythonOperator(
         task_id='fmp_generate_summary',
         python_callable=report_summary,
         provide_context=True,
     )
 
-    # scrape → [postgres ∥ neo4j ∥ qdrant] → summary
-    for key in scrape_tasks:
-        scrape_tasks[key] >> load_pg_tasks[key]
-        scrape_tasks[key] >> load_neo4j_tasks[key]
-        scrape_tasks[key] >> load_qdrant_tasks[key]
-        load_pg_tasks[key]     >> summary_task
-        load_neo4j_tasks[key]  >> summary_task
-        load_qdrant_tasks[key] >> summary_task
+    # ── Wire dependencies ───────────────────────────────────────────────────────
+    # business_analyst: scrape -> [postgres || (neo4j -> ingest_chunks -> qdrant)] -> summary
+    # other agents:     scrape -> [postgres || neo4j || qdrant] -> summary
+    for agent_name in AGENT_CONFIGS.keys():
+        for ticker in TICKERS:
+            key = f'{agent_name}_{ticker}'
+            scrape_tasks[key] >> load_pg_tasks[key]
+            scrape_tasks[key] >> load_neo4j_tasks[key]
+            load_pg_tasks[key] >> summary_task
+
+            if agent_name == "business_analyst":
+                # Neo4j Company nodes -> LLM chunk synthesis -> Qdrant
+                load_neo4j_tasks[key] >> ingest_neo4j_chunks_tasks[key]
+                ingest_neo4j_chunks_tasks[key] >> load_qdrant_tasks[key]
+                ingest_neo4j_chunks_tasks[key] >> summary_task
+                load_qdrant_tasks[key] >> summary_task
+                load_neo4j_tasks[key] >> summary_task
+            else:
+                scrape_tasks[key] >> load_qdrant_tasks[key]
+                load_neo4j_tasks[key]  >> summary_task
+                load_qdrant_tasks[key] >> summary_task

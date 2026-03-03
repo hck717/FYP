@@ -27,8 +27,7 @@ def perplexity_chat_completions(
     recency_filter: str = "week",
     temperature: float = 0.1,
     max_tokens: int = 4096,
-    timeout_s: int = 90,
-    max_retries: int = 3,        # ← new
+    max_retries: int = 3,
 ) -> Dict:
     if not PERPLEXITY_API_KEY:
         raise EnvironmentError("PERPLEXITY_API_KEY not found.")
@@ -46,11 +45,11 @@ def perplexity_chat_completions(
         "search_recency_filter": recency_filter,
     }
 
-    last_error = None
+    last_error: Optional[Exception] = None
     for attempt in range(1, max_retries + 1):
         try:
             logger.debug(f"[tools] Attempt {attempt}/{max_retries} POST {PERPLEXITY_API_URL} model={model}")
-            resp = requests.post(PERPLEXITY_API_URL, headers=headers, json=payload, timeout=timeout_s)
+            resp = requests.post(PERPLEXITY_API_URL, headers=headers, json=payload)
             resp.raise_for_status()
             data = resp.json()
 
@@ -73,16 +72,9 @@ def perplexity_chat_completions(
                 continue
             raise   # non-retryable or final attempt
 
-        except requests.exceptions.Timeout as e:
-            if attempt < max_retries:
-                wait = 2 ** attempt
-                logger.warning(f"[tools] Timeout, retrying in {wait}s... (attempt {attempt}/{max_retries})")
-                time.sleep(wait)
-                last_error = e
-                continue
-            raise
-
-    raise last_error
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("perplexity_chat_completions: exhausted retries with no error captured")
 
 
 

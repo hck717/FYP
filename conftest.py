@@ -11,5 +11,5 @@ that don't have a pip-installable package.
 import sys
 from pathlib import Path
 
-# Insert repo root (/FYP) at the front of sys.path
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+root = Path(__file__).resolve().parent
+sys.path.insert(0, str(root))

@@ -138,7 +138,37 @@ def ensure_collection(client: QdrantClient):
 
 
 def _embed_single(text: str) -> list[float] | None:
-    """Embed one pre-sanitised text. Returns None on failure."""
+    """Embed one pre-sanitised text. Returns None on failure.
+
+    Uses the modern Ollama /api/embed endpoint (Ollama >= 0.1.26).
+    Falls back to legacy /api/embeddings for older Ollama versions.
+    """
+    # Try modern endpoint first
+    try:
+        resp = requests.post(
+            f"{OLLAMA_BASE_URL}/api/embed",
+            json={"model": EMBEDDING_MODEL, "input": text},
+            timeout=60,
+        )
+        if resp.status_code == 404:
+            raise requests.exceptions.HTTPError(response=resp)
+        resp.raise_for_status()
+        data = resp.json()
+        embeddings = data.get("embeddings")
+        if embeddings and len(embeddings) > 0 and embeddings[0]:
+            return embeddings[0]
+        print(f"[Qdrant Loader] /api/embed returned empty embeddings — trying legacy endpoint")
+    except requests.exceptions.HTTPError as e:
+        if e.response is not None and e.response.status_code == 404:
+            pass  # fall through to legacy endpoint
+        else:
+            print(f"[Qdrant Loader] Embedding failed (modern endpoint): {e}")
+            return None
+    except Exception as e:
+        print(f"[Qdrant Loader] Embedding failed (modern endpoint): {e}")
+        # Fall through to legacy endpoint
+
+    # Legacy fallback for Ollama < 0.1.26
     try:
         resp = requests.post(
             f"{OLLAMA_BASE_URL}/api/embeddings",
@@ -146,9 +176,13 @@ def _embed_single(text: str) -> list[float] | None:
             timeout=60,
         )
         resp.raise_for_status()
-        return resp.json()["embedding"]
+        embedding = resp.json().get("embedding")
+        if embedding:
+            return embedding
+        print(f"[Qdrant Loader] Legacy /api/embeddings returned empty vector")
+        return None
     except Exception as e:
-        print(f"[Qdrant Loader] Embedding failed: {e}")
+        print(f"[Qdrant Loader] Embedding failed (legacy endpoint): {e}")
         return None
 
 

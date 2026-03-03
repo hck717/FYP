@@ -6,4 +6,5 @@ testpaths = ["agents"]
 addopts = "-v"
 markers = [
     "integration: marks tests as requiring live Docker services + Ollama (deselect with -m 'not integration')",
+    "requires_ollama: tests that need Ollama embeddings or generation",
 ]

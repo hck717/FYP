@@ -28,6 +28,15 @@ from load_postgres import load_postgres_for_agent_ticker
 from load_neo4j import load_neo4j_for_agent_ticker
 from load_qdrant import load_qdrant_for_agent_ticker
 
+# Neo4j chunk ingestion (LLM synthesis + embedding into Neo4j :Chunk nodes)
+sys.path.insert(0, "/opt/airflow")
+from ingestion.etl.ingest_neo4j_chunks import main as ingest_neo4j_chunks_main
+
+
+def ingest_neo4j_chunks_for_ticker(ticker: str, **_context) -> None:
+    """Airflow task wrapper: synthesise and ingest Neo4j Chunk nodes for one ticker."""
+    ingest_neo4j_chunks_main(tickers=[ticker])
+
 # Default arguments
 default_args = {
     'owner': 'airflow',
@@ -298,10 +307,11 @@ with DAG(
     tags=['eodhd', 'complete', 'production'],
 ) as dag:
 
-    scrape_tasks      = {}
-    load_pg_tasks     = {}
-    load_neo4j_tasks  = {}
-    load_qdrant_tasks = {}
+    scrape_tasks               = {}
+    load_pg_tasks              = {}
+    load_neo4j_tasks           = {}
+    load_qdrant_tasks          = {}
+    ingest_neo4j_chunks_tasks  = {}
 
     for agent_name in AGENT_CONFIGS.keys():
         for ticker, ticker_symbol in zip(TICKERS, TICKER_SYMBOLS):
@@ -332,6 +342,16 @@ with DAG(
                 retry_delay=timedelta(minutes=2),
             )
 
+            # Only business_analyst needs Neo4j chunk synthesis
+            if agent_name == "business_analyst":
+                ingest_neo4j_chunks_tasks[key] = PythonOperator(
+                    task_id=f'eodhd_ingest_neo4j_chunks_{ticker_symbol}',
+                    python_callable=ingest_neo4j_chunks_for_ticker,
+                    op_kwargs={'ticker': ticker_symbol},
+                    provide_context=True,
+                    execution_timeout=None,  # LLM synthesis can take several minutes
+                )
+
     summary_task = PythonOperator(
         task_id='eodhd_generate_summary',
         python_callable=report_summary,
@@ -339,10 +359,22 @@ with DAG(
     )
 
     # scrape → [postgres ∥ neo4j ∥ qdrant] → summary
-    for key in scrape_tasks:
-        scrape_tasks[key] >> load_pg_tasks[key]
-        scrape_tasks[key] >> load_neo4j_tasks[key]
-        scrape_tasks[key] >> load_qdrant_tasks[key]
-        load_pg_tasks[key]     >> summary_task
-        load_neo4j_tasks[key]  >> summary_task
-        load_qdrant_tasks[key] >> summary_task
+    # business_analyst: scrape -> [postgres || (neo4j -> ingest_chunks -> qdrant)] -> summary
+    # other agents:     scrape -> [postgres || neo4j || qdrant] -> summary
+    for agent_name in AGENT_CONFIGS.keys():
+        for ticker_symbol in TICKER_SYMBOLS:
+            key = f'{agent_name}_{ticker_symbol}'
+            scrape_tasks[key] >> load_pg_tasks[key]
+            scrape_tasks[key] >> load_neo4j_tasks[key]
+            load_pg_tasks[key] >> summary_task
+
+            if agent_name == "business_analyst":
+                load_neo4j_tasks[key] >> ingest_neo4j_chunks_tasks[key]
+                ingest_neo4j_chunks_tasks[key] >> load_qdrant_tasks[key]
+                ingest_neo4j_chunks_tasks[key] >> summary_task
+                load_qdrant_tasks[key] >> summary_task
+                load_neo4j_tasks[key] >> summary_task
+            else:
+                scrape_tasks[key] >> load_qdrant_tasks[key]
+                load_neo4j_tasks[key]  >> summary_task
+                load_qdrant_tasks[key] >> summary_task

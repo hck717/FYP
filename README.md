@@ -184,14 +184,14 @@ The platform is structured in three runtime layers:
 - Storage: Qdrant with metadata `{filing_date, section, ticker, proposition_id}`.
 
 **Retrieval — Hybrid Search (3 Paths):**
-- **Dense (Vector):** Qdrant semantic search via `nomic-embed-text`.
+- **Dense (Vector):** Neo4j vector index (384-dim, `all-MiniLM-L6-v2`) for filing chunks; Qdrant semantic search (`nomic-embed-text`, 768-dim) for news embeddings.
 - **Sparse (Keyword):** BM25 for exact financial terms (e.g., "goodwill impairment", "covenant breach").
 - **Structural (Graph):** Neo4j Cypher traversal — `MATCH (:Strategy)-[:DEPENDS_ON]->(:Technology)`.
 
 **Refinement — Corrective RAG (CRAG):**
 - A BERT/small-LLM evaluator scores each retrieved document (0–1).
 - Score < 0.5: Discard and trigger the Web Search Agent as fallback.
-- Score 0.5–0.7: Supplement with web search for additional context.
+- Score 0.5–0.7: Rewrite the query and retry retrieval once; fall back to web search if still ambiguous.
 - Score > 0.7: Use directly.
 
 ---
@@ -199,29 +199,84 @@ The platform is structured in three runtime layers:
 #### 2. 📊 Quantitative Fundamental Agent (The "Math Auditor")
 **Goal:** Detect financial anomalies and compute fundamental factors with mathematical accuracy.
 
-**Architecture:** Chain-of-Table with Dual-Path Code Verification (Non-RAG).
+**Architecture:** LangGraph `StateGraph` — 8-node deterministic pipeline (Non-RAG). All numeric fields are Python-computed from PostgreSQL; the LLM is used only to generate the plain-text `quantitative_summary` narrative.
 
-**Data Sources:** FMP Ultimate & EODHD All-In-One → PostgreSQL (local).
+**Data Sources:** PostgreSQL (local Docker) — tables `raw_fundamentals`, `raw_timeseries`, `market_eod_us`.
 
-**Reasoning — Chain-of-Table:**
-1. `SELECT` relevant columns (Revenue, EBIT, Assets, Liabilities…)
-2. `FILTER` time range (TTM, FY2024, Last 4Q)
-3. `CALCULATE` metrics (DSO, Gross Margin, FCF Conversion)
-4. `RANK` by growth or quality score
-5. `IDENTIFY` outliers (Z-score > 2 = anomaly flag)
+**8-Node Pipeline:**
 
-**Execution — Dual-Path Verification:**
-- **Path A:** Python (Pandas)
-- **Path B:** SQL (DuckDB / PostgreSQL)
-- `IF Path_A_result != Path_B_result THEN RAISE CalculationAlert` → prevents silent numeric errors.
+| # | Node | Description |
+| :- | :--- | :--- |
+| 1 | `fetch_fundamentals` | Pulls `ratios_ttm`, `key_metrics_ttm`, `financial_scores`, `earnings_history`, `analyst_estimates_eodhd` from `raw_fundamentals` |
+| 2 | `fetch_price_history` | Pulls `historical_prices_eod` from `raw_timeseries` (252 trading days) |
+| 3 | `compute_value_factors` | Python: P/E, EV/EBITDA, P/FCF, EV/Revenue |
+| 4 | `compute_quality_factors` | Python: ROE, ROIC, Piotroski F-Score, Beneish M-Score |
+| 5 | `compute_momentum_risk` | Python: Beta (60-day), Sharpe Ratio, 12-month return |
+| 6 | `detect_anomalies` | Z-score flagging across computed factor set |
+| 7 | `data_quality_check` | Validates field presence and numeric range from PostgreSQL data |
+| 8 | `generate_summary` | LLM (Ollama `llama3.2:latest`) narrates findings as plain text |
 
-**Factor Analysis (OLAP):**
+**Factor Analysis:**
 
 | Category | Metrics |
 | :--- | :--- |
-| **Value** | P/E, EV/EBITDA, P/FCF, EV/Revenue |
+| **Value** | P/E trailing, EV/EBITDA, P/FCF, EV/Revenue |
 | **Quality** | ROE, ROIC, Piotroski F-Score, Beneish M-Score |
-| **Momentum/Risk** | Beta (60-day rolling), Sharpe Ratio, 12-Month Return |
+| **Momentum/Risk** | Beta (60-day rolling), Sharpe Ratio (12M), 12-Month Return % |
+| **Key Metrics** | Gross Margin, EBIT Margin, FCF Conversion, DSO Days, Current Ratio, D/E |
+
+**Output Schema:**
+```json
+{
+  "agent": "quant_fundamental",
+  "ticker": "AAPL",
+  "as_of_date": "2026-02-28",
+  "time_range": "TTM",
+  "value_factors":    { "pe_trailing": 33.08, "ev_ebitda": 25.6, "p_fcf": 31.85, "ev_revenue": 9.02 },
+  "quality_factors":  { "roe": 1.5994, "roic": 0.5101, "piotroski_f_score": 9, "beneish_m_score": null, "manipulation_risk": null },
+  "momentum_risk":    { "beta_60d": null, "sharpe_ratio_12m": 0.6906, "return_12m_pct": 2.38 },
+  "key_metrics":      { "gross_margin": 0.4733, "ebit_margin": 0.3238, "fcf_conversion": null, "dso_days": 58.92, "current_ratio": 0.9737, "debt_to_equity": 1.0263 },
+  "anomaly_flags":    [],
+  "data_quality":     { "status": "PASSED", "checks_passed": 9, "checks_total": 9, "issues": [] },
+  "quantitative_summary": "<plain-text narrative from LLM — no calculations, no invented numbers>",
+  "data_sources": {
+    "fundamentals": "postgresql:raw_fundamentals",
+    "price_history": "postgresql:raw_timeseries",
+    "benchmark":    "postgresql:market_eod_us",
+    "llm_scope":    "quantitative_summary narrative only",
+    "llm_model":    "llama3.2:latest"
+  }
+}
+```
+
+**CLI Usage:**
+
+Two input modes are supported. `--ticker` and `--prompt` are mutually exclusive.
+
+```bash
+# Mode 1: Direct ticker symbol
+.venv/bin/python -m agents.quant_fundamental.agent --ticker AAPL --log-level WARNING
+.venv/bin/python -m agents.quant_fundamental.agent --ticker MSFT --log-level WARNING
+.venv/bin/python -m agents.quant_fundamental.agent --ticker GOOGL --log-level WARNING
+.venv/bin/python -m agents.quant_fundamental.agent --ticker TSLA --log-level WARNING
+.venv/bin/python -m agents.quant_fundamental.agent --ticker NVDA --log-level WARNING
+
+# Mode 2: Natural-language prompt (planner-agent compatible)
+# The ticker is extracted automatically from the prompt text.
+.venv/bin/python -m agents.quant_fundamental.agent --prompt "Analyze AAPL fundamentals" --log-level WARNING
+.venv/bin/python -m agents.quant_fundamental.agent --prompt "Run quant fundamental analysis for MSFT" --log-level WARNING
+.venv/bin/python -m agents.quant_fundamental.agent --prompt "What are the fundamentals for ticker GOOGL?" --log-level WARNING
+.venv/bin/python -m agents.quant_fundamental.agent --prompt "TSLA analysis please" --log-level WARNING
+.venv/bin/python -m agents.quant_fundamental.agent --prompt "Please run the quantitative fundamental report for NVDA stock" --log-level WARNING
+
+# Programmatic usage (planner/synthesizer agent)
+# from agents.quant_fundamental.agent import run_full_analysis
+# run_full_analysis(ticker="AAPL")
+# run_full_analysis(prompt="Analyze AAPL fundamentals")
+
+# Run unit + integration tests
+.venv/bin/python -m pytest agents/quant_fundamental/tests/test_agent.py -v
+```
 
 ---
 
@@ -590,7 +645,7 @@ The system prompt explicitly forbids unsourced claims.
 | **Supervisor** | GPT-4o | Cloud (runtime) | Complex multi-step planning, conflict detection |
 | **Synthesizer** | GPT-4o | Cloud (runtime) | Coherent long-form narrative generation |
 | **Critic** | GPT-4o-mini | Cloud (runtime) | Cost-effective NLI verification |
-| **Business Analyst RAG** | GPT-4o-mini | Cloud (runtime) | CRAG evaluator scoring |
+| **Business Analyst RAG** | deepseek-v3.2-exp | Local Ollama | CRAG qualitative analysis and evaluator scoring |
 | **Ingestion ETL (News/Filings)** | Llama 3.2 (3B) | Local Ollama | High-volume offline extraction, zero cost |
 | **Web Search Agent** | Qwen 2.5 | Local Ollama | Fast real-time news triage, low latency |
 | **Embeddings** | nomic-embed-text | Local Ollama | 768-dim, zero API cost, fast |
