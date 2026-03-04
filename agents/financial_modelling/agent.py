@@ -44,6 +44,7 @@ import json
 import logging
 import re
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, TypedDict, cast
 
@@ -51,7 +52,7 @@ import requests
 from langgraph.graph import END, StateGraph
 
 from .config import FinancialModellingConfig, load_config
-from .models.dcf import DCFEngine
+from .models.dcf import DCFEngine, compute_benchmark_hv30, vix_mrp_adjustment
 from .models.technicals import TechnicalEngine
 from .models.valuation import CompsEngine
 from .prompts import build_system_prompt
@@ -86,6 +87,8 @@ class AgentState(TypedDict, total=False):
     # Computed results
     technicals: Optional[TechnicalSnapshot]
     dcf_result: Optional[DCFResult]
+    moe_consensus: Optional[Dict[str, Any]]   # 4A: MoE DCF consensus
+    macro_environment: Optional[Dict[str, Any]]  # 4B: macro regime snapshot
     comps_result: Optional[Any]   # CompsResult
     earnings: Optional[EarningsRecord]
     dividends: Optional[DividendRecord]
@@ -283,6 +286,90 @@ def _node_calculate_technicals(state: AgentState) -> AgentState:
 
 
 # ---------------------------------------------------------------------------
+# Node 4B: macro_environment — Dynamic WACC / VIX-adjusted MRP
+# ---------------------------------------------------------------------------
+
+def _node_macro_environment(state: AgentState) -> AgentState:
+    """4B: Enrich bundle with VIX-adjusted Market Risk Premium.
+
+    Reads 10Y Treasury yield from ``bundle.treasury_rates`` (already fetched by
+    ``_node_fetch_price_history``) and estimates VIX regime from the 30-day
+    realised volatility of the S&P 500 benchmark history (HV30 proxy).
+
+    Writes ``vix_adjusted_mrp`` into ``bundle.market_risk_premium`` so that
+    ``_compute_wacc()`` in ``dcf.py`` picks it up automatically.
+
+    Also populates ``state["macro_environment"]`` for downstream transparency.
+    """
+    bundle: Optional[FMDataBundle] = state.get("bundle")
+    if bundle is None:
+        return state
+
+    # ── 10Y Treasury (already in bundle) ─────────────────────────────────
+    rf: float = 0.043
+    if bundle.treasury_rates:
+        row = bundle.treasury_rates[0]
+        for key in ("year10", "tenYear", "10Y", "ten_year", "y10"):
+            v = row.get(key)
+            if v is not None:
+                try:
+                    fv = float(v)
+                    rf = fv / 100 if fv > 1 else fv
+                    break
+                except (TypeError, ValueError):
+                    pass
+
+    # ── HV30 VIX proxy ───────────────────────────────────────────────────
+    hv30: Optional[float] = compute_benchmark_hv30(bundle.benchmark_history)
+
+    # ── Base MRP from fundamentals ────────────────────────────────────────
+    base_mrp: float = 0.055
+    if bundle.market_risk_premium:
+        for key in ("marketRiskPremium", "equityRiskPremium", "market_risk_premium", "rp"):
+            raw = bundle.market_risk_premium.get(key)
+            if raw is not None:
+                try:
+                    fv = float(raw)
+                    base_mrp = fv / 100 if fv > 1 else fv
+                    break
+                except (TypeError, ValueError):
+                    pass
+
+    # ── Apply VIX regime adjustment ───────────────────────────────────────
+    delta = vix_mrp_adjustment(hv30)
+    adjusted_mrp = round(max(0.02, min(0.15, base_mrp + delta)), 5)
+
+    # Inject into bundle so _compute_wacc() uses the adjusted value
+    bundle.market_risk_premium["vix_adjusted_mrp"] = adjusted_mrp
+
+    # Determine VIX regime label
+    if hv30 is None:
+        regime = "unknown"
+    elif hv30 < 0.15:
+        regime = "low"
+    elif hv30 < 0.25:
+        regime = "normal"
+    elif hv30 < 0.35:
+        regime = "high"
+    else:
+        regime = "extreme"
+
+    macro_env: Dict[str, Any] = {
+        "risk_free_rate_10y": round(rf, 5),
+        "benchmark_hv30": hv30,
+        "vix_regime": regime,
+        "base_mrp": round(base_mrp, 5),
+        "mrp_delta": round(delta, 5),
+        "vix_adjusted_mrp": adjusted_mrp,
+    }
+    logger.info(
+        "[Macro] rf=%.3f hv30=%s regime=%s mrp=%.4f → %.4f",
+        rf, hv30, regime, base_mrp, adjusted_mrp,
+    )
+    return {**state, "bundle": bundle, "macro_environment": macro_env}
+
+
+# ---------------------------------------------------------------------------
 # Node 5: run_dcf_model
 # ---------------------------------------------------------------------------
 
@@ -305,8 +392,201 @@ def _node_run_dcf_model(
 
 
 # ---------------------------------------------------------------------------
-# Node 6: run_comparable_analysis
+# Node 4A: moe_consensus — Mixture-of-Experts DCF
 # ---------------------------------------------------------------------------
+
+# MoE persona parameter adjustments applied on top of the DCF engine's base result
+_MOE_PERSONAS: Dict[str, Dict[str, float]] = {
+    "Optimist": {
+        "terminal_growth_rate_delta": +0.005,   # +0.5% TGR
+        "discount_rate_delta":        -0.01,    # -1% WACC
+        "revenue_growth_multiplier":   1.25,    # 25% optimistic revenue uplift
+    },
+    "Pessimist": {
+        "terminal_growth_rate_delta": -0.005,   # -0.5% TGR
+        "discount_rate_delta":        +0.015,   # +1.5% WACC
+        "revenue_growth_multiplier":   0.70,    # 30% revenue haircut
+    },
+    "Realist": {
+        "terminal_growth_rate_delta":  0.0,
+        "discount_rate_delta":         0.0,
+        "revenue_growth_multiplier":   1.0,
+    },
+}
+
+
+def _moe_persona_valuation(
+    persona_name: str,
+    persona_params: Dict[str, float],
+    base_result: DCFResult,
+    config: FinancialModellingConfig,
+) -> Dict[str, Any]:
+    """Compute an LLM-narrated persona interpretation of the DCF result.
+
+    Adjusts Bear/Base/Bull intrinsic values by the persona's multipliers,
+    then calls the Ollama LLM to produce a 2-3 sentence persona narrative.
+    Returns {"persona": ..., "bear": ..., "base": ..., "bull": ..., "narrative": ...}
+    """
+    tgr_delta = persona_params.get("terminal_growth_rate_delta", 0.0)
+    dr_delta = persona_params.get("discount_rate_delta", 0.0)
+    rev_mult = persona_params.get("revenue_growth_multiplier", 1.0)
+
+    # Discount-rate adjustment affects intrinsic values inversely
+    # (higher WACC → lower value, lower WACC → higher value)
+    dr_impact = 1.0 - (dr_delta * 8)  # approx: 1% WACC change ≈ 8% value change
+    dr_impact = max(0.5, min(2.0, dr_impact))
+
+    # Terminal growth rate adjustment: more positive TGR → higher terminal value
+    tgr_impact = 1.0 + (tgr_delta * 15)  # approx: 0.5% TGR change ≈ 7.5% value change
+    tgr_impact = max(0.5, min(2.0, tgr_impact))
+
+    combined = dr_impact * tgr_impact * rev_mult
+
+    def _adj(val: Optional[float]) -> Optional[float]:
+        if val is None:
+            return None
+        return round(val * combined, 2)
+
+    bear = _adj(base_result.intrinsic_value_bear)
+    base = _adj(base_result.intrinsic_value_base)
+    bull = _adj(base_result.intrinsic_value_bull)
+
+    # Persona LLM narrative
+    prompt = (
+        f"You are the {persona_name} analyst in a 3-member DCF review committee.\n"
+        f"The base DCF model outputs: Bear=${base_result.intrinsic_value_bear}, "
+        f"Base=${base_result.intrinsic_value_base}, Bull=${base_result.intrinsic_value_bull}, "
+        f"WACC={base_result.wacc_used}.\n"
+        f"Your {persona_name} adjustments yield: Bear=${bear}, Base=${base}, Bull=${bull}.\n"
+        f"In exactly 2 sentences, justify your scenario adjustments as the {persona_name} analyst. "
+        f"Be specific about the economic assumptions driving your view."
+    )
+    narrative = f"[{persona_name} narrative unavailable]"
+    try:
+        resp = requests.post(
+            f"{config.ollama_base_url}/api/generate",
+            json={
+                "model": config.llm_model,
+                "prompt": prompt,
+                "temperature": 0.5,
+                "num_predict": 200,
+                "stream": False,
+                "think": False,
+            },
+            timeout=config.request_timeout or None,
+        )
+        resp.raise_for_status()
+        narrative = _clean_response(resp.json().get("response", "")).strip() or narrative
+    except Exception as exc:
+        logger.warning("[MoE] %s persona LLM call failed: %s", persona_name, exc)
+
+    return {
+        "persona": persona_name,
+        "bear": bear,
+        "base": base,
+        "bull": bull,
+        "wacc_adjustment": round(dr_delta, 4),
+        "tgr_adjustment": round(tgr_delta, 4),
+        "narrative": narrative,
+    }
+
+
+def _node_moe_consensus(
+    state: AgentState,
+    config: FinancialModellingConfig,
+) -> AgentState:
+    """4A: Mixture-of-Experts DCF consensus.
+
+    Runs 3 parallel LLM persona threads (Optimist, Pessimist, Realist), each
+    adjusting terminal growth rate and discount rate.  Synthesizes a final
+    Bear/Base/Bull consensus range using probability-weighted averaging.
+
+    Adds ``moe_consensus`` to state:
+        {
+          "personas": [{"persona": ..., "bear": ..., "base": ..., "bull": ..., "narrative": ...}, ...],
+          "consensus_bear": <float>,
+          "consensus_base": <float>,
+          "consensus_bull": <float>,
+          "consensus_narrative": <str>,
+        }
+    """
+    base_result: Optional[DCFResult] = state.get("dcf_result")
+    if base_result is None or base_result.intrinsic_value_base is None:
+        logger.info("[MoE] Skipping MoE consensus — no DCF base result")
+        return state
+
+    persona_results: List[Dict[str, Any]] = []
+    with ThreadPoolExecutor(max_workers=3, thread_name_prefix="moe") as executor:
+        futures = {
+            executor.submit(
+                _moe_persona_valuation, name, params, base_result, config
+            ): name
+            for name, params in _MOE_PERSONAS.items()
+        }
+        for future in as_completed(futures):
+            persona_name = futures[future]
+            try:
+                persona_results.append(future.result())
+            except Exception as exc:
+                logger.warning("[MoE] Persona '%s' failed: %s", persona_name, exc)
+
+    if not persona_results:
+        return state
+
+    # Probability-weighted consensus (equal weight = 1/3 each)
+    def _weighted_avg(key: str) -> Optional[float]:
+        vals = [p[key] for p in persona_results if p.get(key) is not None]
+        if not vals:
+            return None
+        return round(sum(vals) / len(vals), 2)
+
+    consensus_bear = _weighted_avg("bear")
+    consensus_base = _weighted_avg("base")
+    consensus_bull = _weighted_avg("bull")
+
+    # Final synthesis narrative via LLM
+    narratives_block = "\n".join(
+        f"  {p['persona']}: {p['narrative']}" for p in sorted(persona_results, key=lambda x: x["persona"])
+    )
+    synthesis_prompt = (
+        f"Three analysts have produced DCF scenario estimates:\n{narratives_block}\n\n"
+        f"Synthesise their views into a 3-sentence Bear/Base/Bull consensus:\n"
+        f"  Bear consensus: ${consensus_bear}\n"
+        f"  Base consensus: ${consensus_base}\n"
+        f"  Bull consensus: ${consensus_bull}\n"
+        f"Highlight the key points of disagreement and the most likely outcome."
+    )
+    consensus_narrative = "MoE consensus synthesis unavailable."
+    try:
+        resp = requests.post(
+            f"{config.ollama_base_url}/api/generate",
+            json={
+                "model": config.llm_model,
+                "prompt": synthesis_prompt,
+                "temperature": 0.3,
+                "num_predict": 300,
+                "stream": False,
+                "think": False,
+            },
+            timeout=config.request_timeout or None,
+        )
+        resp.raise_for_status()
+        consensus_narrative = _clean_response(resp.json().get("response", "")).strip() or consensus_narrative
+    except Exception as exc:
+        logger.warning("[MoE] Consensus synthesis LLM call failed: %s", exc)
+
+    moe_consensus: Dict[str, Any] = {
+        "personas": sorted(persona_results, key=lambda x: x["persona"]),
+        "consensus_bear": consensus_bear,
+        "consensus_base": consensus_base,
+        "consensus_bull": consensus_bull,
+        "consensus_narrative": consensus_narrative,
+    }
+    logger.info(
+        "[MoE] Consensus: bear=%s base=%s bull=%s",
+        consensus_bear, consensus_base, consensus_bull,
+    )
+    return {**state, "moe_consensus": moe_consensus}
 
 def _node_run_comparable_analysis(
     state: AgentState,
@@ -436,7 +716,10 @@ def _compute_altman_z(bundle: FMDataBundle) -> Optional[float]:
     retained_earnings = _sf(bal.get("retainedEarnings"))
     ebit = _sf(inc.get("operatingIncome") or inc.get("ebit"))
     market_cap = _sf(ent.get("marketCapitalization") or bundle.key_metrics_ttm.get("marketCapTTM"))
-    total_liabilities = _sf(bal.get("totalLiabilities"))
+    total_liabilities = _sf(
+        bal.get("totalLiabilities")
+        or bal.get("totalDebt")  # proxy: debt is the dominant liability for Z-score
+    )
     revenue = _sf(inc.get("revenue"))
 
     wc = (current_assets or 0) - (current_liabilities or 0)
@@ -657,6 +940,8 @@ def _node_format_json_output(
     bundle: Optional[FMDataBundle] = state.get("bundle")
     technicals: TechnicalSnapshot = state.get("technicals") or TechnicalSnapshot()
     dcf: DCFResult = state.get("dcf_result") or DCFResult()
+    moe_consensus: Optional[Dict[str, Any]] = state.get("moe_consensus")   # 4A
+    macro_env: Optional[Dict[str, Any]] = state.get("macro_environment")   # 4B
     comps = state.get("comps_result")
     earnings: EarningsRecord = state.get("earnings") or EarningsRecord()
     dividends: DividendRecord = state.get("dividends") or DividendRecord()
@@ -688,6 +973,7 @@ def _node_format_json_output(
         "as_of_date": today,
         "current_price": current_price,
         "dcf": dcf.to_dict(),
+        "moe_consensus": moe_consensus,             # 4A: MoE DCF consensus
         "comps": comps.to_dict(),
         "technicals": technicals.to_dict(),
         "earnings": earnings.to_dict(),
@@ -715,6 +1001,8 @@ def _node_format_json_output(
         "as_of_date": today,
         "current_price": current_price,
         "valuation": valuation,
+        "moe_consensus": moe_consensus,             # 4A: MoE DCF consensus
+        "macro_environment": macro_env,             # 4B: VIX-adjusted MRP snapshot
         "technicals": technicals.to_dict(),
         "earnings": earnings.to_dict(),
         "dividends": dividends.to_dict(),
@@ -751,8 +1039,16 @@ def build_graph(toolkit: FMToolkit, config: FinancialModellingConfig) -> Any:
         lambda state: _node_calculate_technicals(cast(AgentState, state)),
     )
     graph.add_node(
+        "macro_environment",
+        lambda state: _node_macro_environment(cast(AgentState, state)),
+    )
+    graph.add_node(
         "run_dcf_model",
         lambda state: _node_run_dcf_model(cast(AgentState, state), config),
+    )
+    graph.add_node(
+        "moe_consensus",
+        lambda state: _node_moe_consensus(cast(AgentState, state), config),
     )
     graph.add_node(
         "run_comparable_analysis",
@@ -771,8 +1067,10 @@ def build_graph(toolkit: FMToolkit, config: FinancialModellingConfig) -> Any:
     graph.add_edge("fetch_price_history", "fetch_fundamentals")
     graph.add_edge("fetch_fundamentals", "fetch_earnings_history")
     graph.add_edge("fetch_earnings_history", "calculate_technicals")
-    graph.add_edge("calculate_technicals", "run_dcf_model")
-    graph.add_edge("run_dcf_model", "run_comparable_analysis")
+    graph.add_edge("calculate_technicals", "macro_environment")  # 4B: macro before DCF
+    graph.add_edge("macro_environment", "run_dcf_model")
+    graph.add_edge("run_dcf_model", "moe_consensus")          # 4A: MoE after DCF
+    graph.add_edge("moe_consensus", "run_comparable_analysis")
     graph.add_edge("run_comparable_analysis", "assess_analyst_estimates")
     graph.add_edge("assess_analyst_estimates", "format_json_output")
     graph.add_edge("format_json_output", END)

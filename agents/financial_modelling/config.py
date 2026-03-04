@@ -56,7 +56,7 @@ class FinancialModellingConfig:
         default_factory=lambda: float(os.getenv("FM_LLM_TEMPERATURE", "0.1"))
     )
     llm_max_tokens: int = field(
-        default_factory=lambda: int(os.getenv("FM_LLM_MAX_TOKENS", "1500"))
+        default_factory=lambda: int(os.getenv("FM_LLM_MAX_TOKENS", "4096"))
     )
     ollama_base_url: str = field(
         default_factory=lambda: os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
@@ -77,13 +77,13 @@ class FinancialModellingConfig:
             os.getenv("FIN_MODEL_DCF_DISCOUNT_RATE", os.getenv("DCF_WACC", "0.09"))
         )
     )
-    dcf_terminal_growth_rate: float = field(
+    terminal_growth_rate: float = field(
         default_factory=lambda: float(
             os.getenv("FIN_MODEL_TERMINAL_GROWTH_RATE", os.getenv("DCF_TERMINAL_GROWTH_RATE", "0.025"))
         )
     )
     dcf_forecast_years: int = field(
-        default_factory=lambda: int(os.getenv("DCF_FORECAST_YEARS", "5"))
+        default_factory=lambda: int(os.getenv("DCF_FORECAST_YEARS", "10"))
     )
 
     # Scenario probability weights
@@ -108,9 +108,9 @@ class FinancialModellingConfig:
         default_factory=lambda: int(os.getenv("COMPS_SECTOR_PEERS", "5"))
     )
 
-    # SQL query timeout in seconds
+    # SQL query timeout in seconds (0 = no timeout)
     sql_timeout: int = field(
-        default_factory=lambda: int(os.getenv("FM_SQL_TIMEOUT", "30"))
+        default_factory=lambda: int(os.getenv("FM_SQL_TIMEOUT", "0"))
     )
 
     # Paths

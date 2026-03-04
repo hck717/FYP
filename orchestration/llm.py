@@ -236,8 +236,39 @@ Output ONLY a valid JSON object with this schema:
   "run_web_search": <true|false>,
   "run_financial_modelling": <true|false>,
   "complexity": <1|2|3>,
-  "reasoning": "<2-3 sentences explaining tool selection and multi-ticker handling>"
+  "reasoning": "<2-3 sentences explaining tool selection and multi-ticker handling>",
+  "chart_hints": ["<chart_type1>", "<chart_type2>"]
 }
+
+=== CHART_HINTS RULES ===
+"chart_hints" is an array of zero or more chart type strings selected from the list below.
+Choose ONLY charts that are directly relevant to what the user asked for.
+Do NOT include a chart just because its data might be available — it must match the user's intent.
+
+Available chart types and when to include them:
+  "dcf_scenarios"      — Include when: user asks about DCF, intrinsic value, fair value, valuation,
+                         overvalued/undervalued, price target, discounted cash flow, Bear/Base/Bull
+  "sensitivity_heatmap"— Include when: user asks about WACC sensitivity, scenario analysis, valuation
+                         sensitivity, or any comprehensive valuation question
+  "quarterly_trends"   — Include when: user asks about revenue growth, earnings trends, margin trends,
+                         quarterly performance, financial results, or financial history
+  "technicals"         — Include when: user asks about technicals, RSI, MACD, moving averages,
+                         support/resistance, Bollinger Bands, trend analysis, price action, "should I buy"
+  "sentiment_donut"    — Include when: user asks about sentiment, market opinion, investor mood,
+                         bullish/bearish positioning, or qualitative assessment
+  "peer_comps"         — Include when: user asks about peer comparison, relative valuation,
+                         sector comparison, how X compares to competitors, EV/EBITDA vs peers
+  "moe_consensus"      — Include when: user asks about analyst views, price range, consensus,
+                         different scenarios, bull/bear case, or any comprehensive valuation
+  "factor_radar"       — Include when: user asks about quality factors, financial health score,
+                         Piotroski, ROE, ROIC, gross margin, Sharpe ratio, or overall stock quality;
+                         also include for any comprehensive/fundamental analysis query
+  "altman_z"           — Include when: user asks about bankruptcy risk, financial distress,
+                         Altman Z-Score, solvency, credit risk, or company financial health
+
+For comprehensive/full analysis queries, include ALL relevant chart types.
+For narrow queries (e.g. "what is AAPL's RSI?"), include only the directly relevant chart ("technicals").
+Default to [] if no data-driven visualisation is clearly warranted.
 
 === COMPLEXITY SCORING ===
 Set "complexity" to an integer 1, 2, or 3 based on how deep the analysis required is:
@@ -293,18 +324,304 @@ For "complete", "full", "comprehensive", or "fundamental analysis" queries, enab
 """
 
 
+# ── Semantic Router (1C) ──────────────────────────────────────────────────────
+# Cache known plan outputs keyed by their all-MiniLM-L6-v2 embedding.
+# On a future query, if cosine similarity > threshold we return the cached plan
+# directly without calling the LLM — saving ~3s per repeat query.
+
+SEMANTIC_ROUTER_THRESHOLD: float = float(
+    os.getenv("SEMANTIC_ROUTER_THRESHOLD", "0.85")
+)
+_SEMANTIC_ROUTER_MAX_CACHE: int = int(
+    os.getenv("SEMANTIC_ROUTER_MAX_CACHE", "500")
+)
+
+
+def _router_embed(text: str) -> Optional[List[float]]:
+    """Embed text with all-MiniLM-L6-v2 for the semantic router.
+
+    Returns None if sentence_transformers is unavailable (graceful degradation).
+    """
+    try:
+        from sentence_transformers import SentenceTransformer  # type: ignore[import]
+        # Cache the model at module level to avoid repeated disk loads
+        if not hasattr(_router_embed, "_model"):
+            _old_hf = os.environ.get("HF_HUB_OFFLINE")
+            os.environ["HF_HUB_OFFLINE"] = "1"
+            try:
+                _router_embed._model = SentenceTransformer("all-MiniLM-L6-v2")  # type: ignore[attr-defined]
+            finally:
+                if _old_hf is None:
+                    os.environ.pop("HF_HUB_OFFLINE", None)
+                else:
+                    os.environ["HF_HUB_OFFLINE"] = _old_hf
+        vec = _router_embed._model.encode(text, normalize_embeddings=True).tolist()  # type: ignore[attr-defined]
+        return vec
+    except Exception as exc:
+        logger.debug("[semantic_router] Embedding unavailable: %s", exc)
+        return None
+
+
+def _router_cosine(a: List[float], b: List[float]) -> float:
+    """Dot product of two L2-normalised vectors (= cosine similarity)."""
+    if len(a) != len(b):
+        return 0.0
+    return sum(x * y for x, y in zip(a, b))
+
+
+class _SemanticRouter:
+    """In-process LRU-style cache mapping query embeddings → plan dicts.
+
+    Thread-safe for concurrent requests (uses a list + lock).
+    """
+
+    def __init__(self, max_size: int = _SEMANTIC_ROUTER_MAX_CACHE) -> None:
+        import threading
+        self._entries: List[Any] = []  # List[Tuple[List[float], Dict]]
+        self._max_size = max_size
+        self._lock = threading.Lock()
+
+    def lookup(self, query: str) -> Optional[Dict[str, Any]]:
+        """Return a cached plan if a similar query was seen before."""
+        vec = _router_embed(query)
+        if vec is None:
+            return None
+        with self._lock:
+            for stored_vec, plan in self._entries:
+                if _router_cosine(vec, stored_vec) >= SEMANTIC_ROUTER_THRESHOLD:
+                    return dict(plan)  # return a copy
+        return None
+
+    def store(self, query: str, plan: Dict[str, Any]) -> None:
+        """Persist a (query-embedding, plan) pair for future lookups."""
+        vec = _router_embed(query)
+        if vec is None:
+            return
+        with self._lock:
+            # Evict oldest entry if at capacity
+            if len(self._entries) >= self._max_size:
+                self._entries.pop(0)
+            self._entries.append((vec, dict(plan)))
+
+
+_semantic_router = _SemanticRouter()
+
+
+# ── C2: Dynamic Few-Shot helpers ──────────────────────────────────────────────
+
+def _fetch_top_successful_queries(limit: int = 5) -> List[Dict[str, Any]]:
+    """C2: Query PostgreSQL query_logs for recent high-rated queries.
+
+    Returns up to `limit` rows where overall_rating = 1 (positive feedback),
+    ordered by recorded_at DESC.  Each row is returned as a dict with keys:
+      user_query, agent_outputs (partial), plan (if stored).
+
+    Falls back to an empty list if the DB is unavailable or the table schema
+    differs — this keeps the planner functional even without any prior runs.
+    """
+    try:
+        import psycopg2  # type: ignore[import]
+        conn = psycopg2.connect(
+            host=os.getenv("POSTGRES_HOST", "localhost"),
+            port=int(os.getenv("POSTGRES_PORT", "5432")),
+            dbname=os.getenv("POSTGRES_DB", "financial_data"),
+            user=os.getenv("POSTGRES_USER", "postgres"),
+            password=os.getenv("POSTGRES_PASSWORD", "postgres"),
+        )
+        rows: List[Dict[str, Any]] = []
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT user_query, agent_outputs, plan
+                FROM query_logs
+                WHERE overall_rating = 1
+                ORDER BY recorded_at DESC
+                LIMIT %s
+                """,
+                (limit,),
+            )
+            for row in cur.fetchall():
+                user_query, agent_outputs_raw, plan_raw = row
+                if not user_query:
+                    continue
+                entry: Dict[str, Any] = {"user_query": str(user_query)}
+                # Parse JSON columns if they are strings
+                try:
+                    entry["agent_outputs"] = (
+                        json.loads(agent_outputs_raw)
+                        if isinstance(agent_outputs_raw, str)
+                        else (agent_outputs_raw or {})
+                    )
+                except Exception:
+                    entry["agent_outputs"] = {}
+                try:
+                    entry["plan"] = (
+                        json.loads(plan_raw)
+                        if isinstance(plan_raw, str)
+                        else (plan_raw or {})
+                    )
+                except Exception:
+                    entry["plan"] = {}
+                rows.append(entry)
+        conn.close()
+        return rows
+    except Exception as exc:
+        logger.debug("[planner/c2] Could not fetch few-shot examples: %s", exc)
+        return []
+
+
+def _build_few_shot_block(examples: List[Dict[str, Any]]) -> str:
+    """Format successful past queries as a few-shot prompt block.
+
+    Each example shows:
+      User question: <query>
+      JSON plan:     <plan JSON>
+
+    This primes the LLM to produce the same JSON schema and routing decisions.
+    """
+    if not examples:
+        return ""
+    lines = ["\n=== EXAMPLES OF CORRECT PLANS (from recent successful queries) ==="]
+    for i, ex in enumerate(examples, start=1):
+        plan = ex.get("plan") or {}
+        if not plan:
+            continue
+        # Keep only the schema-relevant fields to avoid polluting the prompt
+        clean_plan = {
+            k: plan[k] for k in (
+                "tickers", "ticker", "intent",
+                "run_business_analyst", "run_quant_fundamental",
+                "run_web_search", "run_financial_modelling",
+                "complexity", "reasoning",
+            ) if k in plan
+        }
+        if not clean_plan:
+            continue
+        try:
+            plan_str = json.dumps(clean_plan, separators=(",", ":"))
+        except Exception:
+            continue
+        lines.append(f"\nExample {i}:")
+        lines.append(f"User question: {ex['user_query']}")
+        lines.append(f"JSON plan: {plan_str}")
+    lines.append("=== END EXAMPLES ===\n")
+    return "\n".join(lines)
+
+
+def _infer_chart_hints(query_lower: str, plan: Dict[str, Any]) -> List[str]:
+    """Keyword-based chart_hints inference — used as fallback when LLM omits the field.
+
+    Maps query intent to chart type strings that the Streamlit UI knows how to render.
+    Deterministic, never raises.
+    """
+    hints: List[str] = []
+    run_fm = plan.get("run_financial_modelling", False)
+
+    # DCF / valuation
+    if run_fm and any(kw in query_lower for kw in [
+        "dcf", "intrinsic", "fair value", "overvalued", "undervalued",
+        "price target", "valuation", "discounted cash", "bear", "bull",
+    ]):
+        hints.append("dcf_scenarios")
+        hints.append("sensitivity_heatmap")
+
+    # WACC sensitivity — only if explicitly mentioned
+    if "wacc" in query_lower or "sensitivity" in query_lower:
+        if "sensitivity_heatmap" not in hints:
+            hints.append("sensitivity_heatmap")
+
+    # Technicals
+    if any(kw in query_lower for kw in [
+        "technical", "rsi", "macd", "sma", "moving average", "bollinger",
+        "support", "resistance", "trend", "momentum", "chart",
+        "buy", "sell", "entry", "breakout",
+    ]):
+        hints.append("technicals")
+
+    # Quarterly / revenue trends
+    if any(kw in query_lower for kw in [
+        "revenue", "earnings", "quarterly", "margin", "growth", "q1", "q2",
+        "q3", "q4", "financial results", "income", "profit",
+    ]):
+        hints.append("quarterly_trends")
+
+    # Sentiment
+    if any(kw in query_lower for kw in [
+        "sentiment", "bullish", "bearish", "market opinion", "investor",
+        "moat", "competitive", "qualitative",
+    ]):
+        hints.append("sentiment_donut")
+
+    # Peer comps
+    if any(kw in query_lower for kw in [
+        "compare", "vs ", "versus", "peer", "sector", "competitor", "relative",
+        "cheaper", "expensive", "premium", "discount",
+    ]):
+        hints.append("peer_comps")
+
+    # MoE consensus — always if FM is running
+    if run_fm:
+        hints.append("moe_consensus")
+
+    # Factor radar + Altman Z — always if QF is running
+    if plan.get("run_quant_fundamental", False):
+        hints.append("factor_radar")
+        hints.append("altman_z")
+
+    # Comprehensive / full analysis → show everything
+    if any(kw in query_lower for kw in [
+        "complete analysis", "full analysis", "fundamental analysis",
+        "comprehensive", "deep dive", "full report",
+    ]):
+        hints = list(dict.fromkeys([
+            "dcf_scenarios", "sensitivity_heatmap", "quarterly_trends",
+            "technicals", "sentiment_donut", "peer_comps", "moe_consensus",
+            "factor_radar", "altman_z",
+        ]))
+
+    return list(dict.fromkeys(hints))  # deduplicate, preserve order
+
+
 def plan_query(user_query: str) -> Dict[str, Any]:
     """Call DeepSeek planner and return the structured plan dict.
 
+    Before invoking the LLM, a semantic router checks cosine similarity
+    (all-MiniLM-L6-v2, 384-dim) against a cache of previously-seen queries.
+    If similarity > SEMANTIC_ROUTER_THRESHOLD (default 0.85), the cached
+    plan is returned immediately, bypassing the LLM entirely (~50ms vs ~3s).
+
+    C2: Up to 5 recent high-rated query plans are fetched from query_logs and
+    injected as few-shot examples into the planner prompt, improving routing
+    accuracy over time as user feedback accumulates.
+
     Returns a safe default plan on any LLM failure.
     """
+    # --- semantic router (1C) ----------------------------------------------
+    cached = _semantic_router.lookup(user_query)
+    if cached is not None:
+        logger.info("[planner] Semantic router cache hit (similarity>%.2f) — skipping LLM.",
+                    SEMANTIC_ROUTER_THRESHOLD)
+        return cached
+
     today_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     planner_prompt_with_date = (
         f"Today's date (UTC): {today_utc}\n"
         f"Use this date as the reference point when interpreting 'recent', 'latest', or 'current' queries.\n\n"
         f"{_PLANNER_SYSTEM}"
     )
-    prompt = f"{planner_prompt_with_date}\n\nUser question: {user_query}\n\nJSON plan:"
+
+    # C2: fetch dynamic few-shot examples from successful past runs
+    few_shot_examples = _fetch_top_successful_queries(limit=5)
+    few_shot_block = _build_few_shot_block(few_shot_examples)
+    if few_shot_block:
+        logger.debug("[planner/c2] Injecting %d few-shot example(s) into planner prompt.",
+                     len(few_shot_examples))
+
+    prompt = (
+        f"{planner_prompt_with_date}"
+        f"{few_shot_block}"
+        f"\n\nUser question: {user_query}\n\nJSON plan:"
+    )
 
     _query_lower = user_query.lower()
 
@@ -362,6 +679,11 @@ def plan_query(user_query: str) -> Dict[str, Any]:
                 "for comprehensive/fundamental query: %r", user_query[:80]
             )
             plan["run_financial_modelling"] = True
+        # Store in semantic router cache for future bypass
+        _semantic_router.store(user_query, plan)
+        # Ensure chart_hints is always present (may be absent in older cached plans)
+        if "chart_hints" not in plan:
+            plan["chart_hints"] = _infer_chart_hints(_query_lower, plan)
         return plan
     except Exception as exc:
         logger.warning("Planner LLM failed (%s) — using fallback plan", exc)
@@ -375,6 +697,9 @@ def plan_query(user_query: str) -> Dict[str, Any]:
             "run_financial_modelling": _is_comprehensive,
             "complexity": _default_complexity,
             "reasoning": "Fallback: planner LLM unavailable, running core agents.",
+            "chart_hints": _infer_chart_hints(_query_lower, {
+                "run_financial_modelling": _is_comprehensive,
+            }),
         }
 
 
@@ -1637,16 +1962,33 @@ def summarise_results(
         f"## Executive Summary"
     )
 
-    # ── 3. Call LLM ──────────────────────────────────────────────────────────
+    # ── 3. Trim prompt to fit within native 8192-token context ───────────────
+    # deepseek-r1:8b loaded with default num_ctx=8192. Passing num_ctx=16384
+    # via options causes Ollama to RELOAD the model, which OOMs on Apple Silicon
+    # and returns HTTP 500.  Instead we trim the context section to ≤ ~20 000
+    # chars (≈5 000 tokens at ~4 chars/token), leaving ~3 000 tokens for output.
+    #
+    # Trimming strategy: keep the system instructions intact (first ~4 000 chars
+    # and last ~2 000 chars of the full prompt); cut from the middle context block.
+    def _trim_prompt_to_window(text: str, max_chars: int = 20_000) -> str:
+        if len(text) <= max_chars:
+            return text
+        keep_head = (max_chars * 2) // 3   # ~13 333 chars (instructions + early context)
+        keep_tail = max_chars - keep_head   # ~6 667 chars (closing instructions)
+        return (
+            text[:keep_head]
+            + "\n\n[...context trimmed to fit 8192-token context window...]\n\n"
+            + text[-keep_tail:]
+        )
+
+    prompt = _trim_prompt_to_window(prompt)
+
     # deepseek-r1:8b at ~10-15 tok/s (think=False) on Apple Silicon:
-    #   single:     5000 tok ≈ 330-500s + ~60s prefill ≈ 6-10 min  → target 10-20 min total
-    #   comparison: 6000 tok ≈ 400-600s + ~60s prefill ≈ 7-11 min
-    # num_ctx=16384: the assembled prompt is ~11k tokens; Ollama's default 8192
-    # context silently truncates the tail, causing instruction loss.  16384 ensures
-    # the full prompt is visible.  Prefill adds ~30-40s but prevents correctness issues.
-    max_tokens = 6000 if is_comparison else 5000
+    #   single:     3000 tok ≈ 200-300s + ~45s prefill ≈ 4-6 min  → target 8-12 min total
+    #   comparison: 3000 tok ≈ 200-300s + ~45s prefill ≈ 4-6 min
+    max_tokens = 3000
     try:
-        raw     = _ollama_generate(_SUMMARIZER_MODEL, prompt, max_tokens=max_tokens, temperature=0.2, timeout=_SUMMARIZER_TIMEOUT, num_ctx=16384)
+        raw     = _ollama_generate(_SUMMARIZER_MODEL, prompt, max_tokens=max_tokens, temperature=0.2, timeout=_SUMMARIZER_TIMEOUT)
         cleaned = _strip_think(raw).strip()
         if not cleaned:
             cleaned = "Summary unavailable (LLM returned empty response)."

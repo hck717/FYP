@@ -6,12 +6,16 @@ Run from the repo root:
 Architecture:
     This app wraps the orchestration layer (orchestration/graph.py) and streams
     live node-by-node progress to the UI using orchestration.graph.stream().
+    Per-agent real-time progress is shown via a thread-safe queue that
+    node_parallel_agents pushes to as each agent finishes.
     Per-agent result cards are rendered once the full pipeline completes.
 """
 
 from __future__ import annotations
 
+import queue
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -22,6 +26,30 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 import streamlit as st
+from charts import (
+    # Core research charts
+    chart_revenue_trend,
+    chart_margin_trends,
+    chart_peer_comps,
+    chart_football_field,
+    chart_dcf_waterfall,
+    chart_sensitivity_heatmap,
+    chart_moe_consensus,
+    chart_technicals,
+    chart_sentiment_donut,
+    chart_factor_scorecard,
+    chart_eps_trend,
+    # Stubs for data not yet available
+    chart_ebitda_trend_stub,
+    chart_fcf_trend_stub,
+    chart_price_history_stub,
+    chart_price_performance_stub,
+    # Backward-compat aliases (kept so old chart_hints strings still work)
+    chart_dcf_scenarios,
+    chart_quarterly_trends,
+    chart_factor_radar,
+    chart_altman_z,
+)
 
 # ── Page config (must be first Streamlit call) ────────────────────────────────
 st.set_page_config(
@@ -48,6 +76,7 @@ NODE_LABELS = {
     "parallel_agents": ("Running Agents", "Business Analyst · Quant Fundamental · Financial Modelling · Web Search"),
     "react_check":     ("ReAct Check", "Evaluating agent outputs for gaps or errors…"),
     "summarizer":      ("Summarizing", "Generating final research note with DeepSeek-R1…"),
+    "memory_update":   ("Memory Update", "Persisting failure patterns to episodic memory…"),
 }
 
 # ── CSS ───────────────────────────────────────────────────────────────────────
@@ -295,7 +324,7 @@ def _render_financial_modelling(output: Dict[str, Any], ticker: str) -> None:
             base  = dcf.get("intrinsic_value_base")
             bear  = dcf.get("intrinsic_value_bear")
             bull  = dcf.get("intrinsic_value_bull")
-            wacc  = dcf.get("wacc")
+            wacc  = dcf.get("wacc_used") or dcf.get("wacc")
             upside = None
             if base and current_price:
                 try:
@@ -307,7 +336,7 @@ def _render_financial_modelling(output: Dict[str, Any], ticker: str) -> None:
             c1.metric("Bear",   f"${_fmt(bear)}")
             c2.metric("Base",   f"${_fmt(base)}")
             c3.metric("Bull",   f"${_fmt(bull)}")
-            c4.metric("WACC",   _pct(wacc))
+            c4.metric("WACC",   f"{float(wacc) * 100:.1f}%" if wacc is not None else "—")
             if current_price:
                 c5.metric("Current Price", f"${_fmt(current_price)}")
 
@@ -324,7 +353,7 @@ def _render_financial_modelling(output: Dict[str, Any], ticker: str) -> None:
                     import pandas as pd
                     df = pd.DataFrame(sensitivity)
                     st.caption("DCF Sensitivity Matrix (intrinsic value by WACC × growth)")
-                    st.dataframe(df, use_container_width=True)
+                    st.dataframe(df, width="stretch")
                 except Exception:
                     pass
 
@@ -361,6 +390,20 @@ def _render_financial_modelling(output: Dict[str, Any], ticker: str) -> None:
             c1.metric("Piotroski", _fmt(factors.get("piotroski_f_score")))
             c2.metric("Beneish M", _fmt(factors.get("beneish_m_score")))
             c3.metric("Altman Z",  _fmt(factors.get("altman_z_score")))
+
+        # MoE Consensus — show per-persona narratives (Optimist / Pessimist / Realist)
+        moe = output.get("moe_consensus") or {}
+        consensus_narrative = moe.get("consensus_narrative") or ""
+        personas = moe.get("personas") or []
+        if consensus_narrative or personas:
+            with st.expander("MoE Consensus reasoning", expanded=False):
+                if consensus_narrative:
+                    st.markdown(f"**Consensus:** {consensus_narrative}")
+                for p in personas:
+                    name_p = p.get("name") or p.get("persona") or "Agent"
+                    narr_p = p.get("narrative") or p.get("reasoning") or ""
+                    if narr_p:
+                        st.markdown(f"**{name_p}:** {narr_p}")
 
         # Narrative
         narrative = output.get("quantitative_summary") or output.get("summary") or ""
@@ -435,11 +478,272 @@ def _render_web_search(output: Dict[str, Any], ticker: str) -> None:
                 st.markdown(rationale)
 
 
+def _render_visualisations(state: Dict[str, Any]) -> None:
+    """Render Plotly charts driven by planner chart_hints + available data.
+
+    Called once after the pipeline completes, before agent detail cards.
+    For multi-ticker queries the charts for each ticker are shown in tabs.
+
+    Chart set mirrors buy-side equity research report structure:
+      Section 1 — Price & Performance (stubs if no price history)
+      Section 2 — P&L Trends: Revenue, Margins, Net Income, EBITDA (stub), EPS
+      Section 3 — Valuation: Football Field, DCF Scenarios, Sensitivity Heatmap
+      Section 4 — Peer Comparables
+      Section 5 — Cash Flow: FCF (stub)
+      Section 6 — Technical Indicators
+      Section 7 — Sentiment & Quality Factors
+      Section 8 — MoE Analyst Consensus
+    """
+    plan        = state.get("plan") or {}
+    chart_hints = plan.get("chart_hints") or []
+    tickers: List[str] = state.get("tickers") or []
+    if not tickers and state.get("ticker"):
+        tickers = [state["ticker"]]
+    if not tickers:
+        return
+
+    # Agent outputs per ticker (positional match)
+    fm_outputs = state.get("financial_modelling_outputs") or (
+        [state["financial_modelling_output"]] if state.get("financial_modelling_output") else []
+    )
+    qf_outputs = state.get("quant_fundamental_outputs") or (
+        [state["quant_fundamental_output"]] if state.get("quant_fundamental_output") else []
+    )
+    ba_outputs = state.get("business_analyst_outputs") or (
+        [state["business_analyst_output"]] if state.get("business_analyst_output") else []
+    )
+
+    # Full default chart suite — used when planner doesn't specify hints
+    _DEFAULT_HINTS = [
+        # Price & performance (stubs — no historical series in pipeline output)
+        "price_history",
+        "price_performance",
+        # P&L trends
+        "revenue_trend",
+        "margin_trends",
+        "eps_trend",
+        "ebitda_trend",
+        # Valuation
+        "football_field",
+        "dcf_waterfall",
+        "sensitivity_heatmap",
+        # Peer comps
+        "peer_comps",
+        # Cash flow
+        "fcf_trend",
+        # Technicals
+        "technicals",
+        # Sentiment & quality
+        "sentiment_donut",
+        "factor_scorecard",
+        # MoE consensus
+        "moe_consensus",
+    ]
+
+    # Fallback: if chart_hints is empty, use the full default suite
+    if not chart_hints:
+        chart_hints = list(_DEFAULT_HINTS)
+    else:
+        # Deduplicate while preserving order
+        seen: set = set()
+        deduped: List[str] = []
+        for h in chart_hints:
+            if h not in seen:
+                seen.add(h)
+                deduped.append(h)
+        chart_hints = deduped
+
+    st.subheader("Visualisations")
+
+    # If multiple tickers → tabbed layout; single ticker → plain layout
+    if len(tickers) > 1:
+        tab_objs = st.tabs(tickers)
+    else:
+        tab_objs = [st.container()]
+
+    for idx, (ticker, tab) in enumerate(zip(tickers, tab_objs)):
+        fm   = fm_outputs[idx] if idx < len(fm_outputs) else {}
+        qf   = qf_outputs[idx] if idx < len(qf_outputs) else {}
+        ba   = ba_outputs[idx] if idx < len(ba_outputs) else {}
+
+        valuation     = (fm or {}).get("valuation") or {}
+        dcf           = valuation.get("dcf") or {}
+        comps         = valuation.get("comps") or {}
+        technicals    = (fm or {}).get("technicals") or {}
+        moe           = (fm or {}).get("moe_consensus") or {}
+        current_price = (fm or {}).get("current_price")
+        q_trends      = (qf or {}).get("quarterly_trends") or []
+        key_metrics   = (qf or {}).get("key_metrics") or {}
+        sentiment     = (ba or {}).get("sentiment") or {}
+
+        rendered = False
+
+        with tab:
+            for hint in chart_hints:
+
+                # ── Price & Performance ──────────────────────────────────────
+                if hint == "price_history":
+                    st.plotly_chart(
+                        chart_price_history_stub(ticker),
+                        use_container_width=True,
+                        key=f"price_history_{ticker}_{idx}",
+                    )
+                    rendered = True
+
+                elif hint == "price_performance":
+                    st.plotly_chart(
+                        chart_price_performance_stub(ticker),
+                        use_container_width=True,
+                        key=f"price_perf_{ticker}_{idx}",
+                    )
+                    rendered = True
+
+                # ── P&L Trends ───────────────────────────────────────────────
+                elif hint == "revenue_trend":
+                    st.plotly_chart(
+                        chart_revenue_trend(q_trends, dcf, ticker),
+                        use_container_width=True,
+                        key=f"revenue_{ticker}_{idx}",
+                    )
+                    rendered = True
+
+                elif hint == "margin_trends":
+                    st.plotly_chart(
+                        chart_margin_trends(q_trends, key_metrics, ticker),
+                        use_container_width=True,
+                        key=f"margins_{ticker}_{idx}",
+                    )
+                    rendered = True
+
+                elif hint == "eps_trend":
+                    st.plotly_chart(
+                        chart_eps_trend(q_trends, ticker),
+                        use_container_width=True,
+                        key=f"eps_{ticker}_{idx}",
+                    )
+                    rendered = True
+
+                elif hint == "ebitda_trend":
+                    st.plotly_chart(
+                        chart_ebitda_trend_stub(ticker),
+                        use_container_width=True,
+                        key=f"ebitda_{ticker}_{idx}",
+                    )
+                    rendered = True
+
+                # ── Valuation ────────────────────────────────────────────────
+                elif hint == "football_field":
+                    st.plotly_chart(
+                        chart_football_field(dcf, comps, current_price, ticker),
+                        use_container_width=True,
+                        key=f"football_{ticker}_{idx}",
+                    )
+                    rendered = True
+
+                elif hint in ("dcf_waterfall", "dcf_scenarios") and dcf:
+                    st.plotly_chart(
+                        chart_dcf_waterfall(dcf, current_price, ticker),
+                        use_container_width=True,
+                        key=f"dcf_{ticker}_{idx}",
+                    )
+                    rendered = True
+
+                elif hint == "sensitivity_heatmap":
+                    sm = dcf.get("sensitivity_matrix")
+                    if sm and isinstance(sm, dict):
+                        st.plotly_chart(
+                            chart_sensitivity_heatmap(sm, ticker, current_price),
+                            use_container_width=True,
+                            key=f"sensitivity_{ticker}_{idx}",
+                        )
+                        rendered = True
+
+                # ── Peer Comps ───────────────────────────────────────────────
+                elif hint == "peer_comps":
+                    st.plotly_chart(
+                        chart_peer_comps(comps, ticker),
+                        use_container_width=True,
+                        key=f"peer_comps_{ticker}_{idx}",
+                    )
+                    rendered = True
+
+                # ── Cash Flow ────────────────────────────────────────────────
+                elif hint == "fcf_trend":
+                    st.plotly_chart(
+                        chart_fcf_trend_stub(ticker),
+                        use_container_width=True,
+                        key=f"fcf_{ticker}_{idx}",
+                    )
+                    rendered = True
+
+                # ── Technicals ───────────────────────────────────────────────
+                elif hint == "technicals":
+                    st.plotly_chart(
+                        chart_technicals(technicals, ticker, current_price),
+                        use_container_width=True,
+                        key=f"technicals_{ticker}_{idx}",
+                    )
+                    rendered = True
+
+                # ── Sentiment & Quality ──────────────────────────────────────
+                elif hint == "sentiment_donut":
+                    st.plotly_chart(
+                        chart_sentiment_donut(sentiment, ticker),
+                        use_container_width=True,
+                        key=f"sentiment_{ticker}_{idx}",
+                    )
+                    rendered = True
+
+                elif hint in ("factor_scorecard", "factor_radar") and qf:
+                    st.plotly_chart(
+                        chart_factor_scorecard(qf, ticker),
+                        use_container_width=True,
+                        key=f"factor_{ticker}_{idx}",
+                    )
+                    rendered = True
+
+                elif hint == "altman_z" and qf:
+                    st.plotly_chart(
+                        chart_altman_z(qf, ticker),
+                        use_container_width=True,
+                        key=f"altman_z_{ticker}_{idx}",
+                    )
+                    rendered = True
+
+                # ── MoE Consensus ────────────────────────────────────────────
+                elif hint == "moe_consensus":
+                    st.plotly_chart(
+                        chart_moe_consensus(moe, current_price, ticker),
+                        use_container_width=True,
+                        key=f"moe_{ticker}_{idx}",
+                    )
+                    rendered = True
+
+                # ── Backward-compat: quarterly_trends ────────────────────────
+                elif hint == "quarterly_trends" and q_trends:
+                    st.plotly_chart(
+                        chart_quarterly_trends(q_trends, ticker),
+                        use_container_width=True,
+                        key=f"q_trends_{ticker}_{idx}",
+                    )
+                    rendered = True
+
+            if not rendered:
+                st.caption(f"No chart data available for {ticker}.")
+
+
 def _render_agent_outputs(state: Dict[str, Any]) -> None:
     """Render all agent result cards from the final state."""
     tickers: List[str] = state.get("tickers") or []
     if not tickers and state.get("ticker"):
         tickers = [state["ticker"]]
+
+    # ── Planner Reasoning ────────────────────────────────────────────────────
+    plan = state.get("plan") or {}
+    plan_reasoning = plan.get("reasoning") or ""
+    if plan_reasoning:
+        with st.expander("Planner reasoning", expanded=False):
+            st.markdown(plan_reasoning)
 
     # ── Business Analyst ─────────────────────────────────────────────────────
     ba_outputs: List[Dict] = state.get("business_analyst_outputs") or []
@@ -502,62 +806,217 @@ def _render_plan_info(plan: Optional[Dict[str, Any]], state: Dict[str, Any]) -> 
 
 # ── Streaming runner ──────────────────────────────────────────────────────────
 
-def _run_with_streaming(query: str) -> Optional[Dict[str, Any]]:
-    """Stream orchestration events into the UI; return final state on completion."""
-    from orchestration.graph import stream as orch_stream
+# Human-readable agent display names for the live progress panel
+_AGENT_DISPLAY = {
+    "business_analyst":   "Business Analyst",
+    "quant_fundamental":  "Quant Fundamental",
+    "financial_modelling":"Financial Modelling",
+    "web_search":         "Web Search",
+}
 
-    progress_area = st.empty()
+
+def _run_with_streaming(query: str) -> Optional[Dict[str, Any]]:
+    """Stream orchestration events into the UI; return final state on completion.
+
+    Architecture
+    ------------
+    LangGraph's .stream() generator blocks the calling thread while each node
+    runs.  The parallel_agents node runs all four agents concurrently inside a
+    ThreadPoolExecutor, but only yields ONE event (when ALL agents finish).
+
+    To show live per-agent progress while parallel_agents is executing, we:
+      1. Run the LangGraph stream in a background thread, pushing (node_name,
+         node_output) tuples into a thread-safe ``output_queue``.
+      2. Subscribe to the session's ``progress_queue`` — nodes.py pushes a
+         progress event each time an individual agent starts or finishes.
+      3. The Streamlit main thread polls both queues in a tight loop, updating
+         the UI as events arrive.
+    """
+    from orchestration.graph import (
+        stream as orch_stream,
+        subscribe_agent_progress,
+        unsubscribe_agent_progress,
+    )
+
+    # ── Queues ────────────────────────────────────────────────────────────────
+    # output_queue: node-level events from the LangGraph stream thread
+    output_queue: queue.Queue = queue.Queue()
+    # progress_queue: per-agent events from node_parallel_agents (set after
+    # we know the session_id from the first __session__ event)
+    progress_queue: Optional[queue.Queue] = None
+    session_id_holder: List[str] = []  # mutable container so the thread can write it
+
+    _STREAM_DONE = object()   # sentinel to signal stream exhaustion
+    _STREAM_ERROR = object()  # sentinel to signal stream exception
+
+    def _stream_worker() -> None:
+        """Background thread: run the LangGraph generator and push events."""
+        try:
+            for node_name, node_output in orch_stream(query):
+                output_queue.put((node_name, node_output))
+        except Exception as exc:
+            output_queue.put((_STREAM_ERROR, exc))
+        finally:
+            output_queue.put((_STREAM_DONE, None))
+
+    thread = threading.Thread(target=_stream_worker, daemon=True)
+    thread.start()
+
+    # ── UI state ──────────────────────────────────────────────────────────────
+    progress_area = st.empty()        # top-level node status lines
+    agent_area    = st.empty()        # live per-agent progress during parallel_agents
     status_lines: List[str] = []
     final_state: Dict[str, Any] = {}
     pass_count = 0
+    in_parallel_agents = False        # True while we're waiting for parallel_agents node
+
+    # Track per-agent live state: {agent_name: "running"|"done"|"error"}
+    agent_statuses: Dict[str, str] = {}
+    agent_elapsed:  Dict[str, int]  = {}
+    agent_excerpts: Dict[str, str]  = {}
+
+    def _render_agent_progress() -> None:
+        """Re-render the per-agent progress box."""
+        if not agent_statuses:
+            return
+        lines = ["**Agents running:**"]
+        for agent, disp in _AGENT_DISPLAY.items():
+            status = agent_statuses.get(agent)
+            if status is None:
+                continue
+            elapsed = agent_elapsed.get(agent, 0)
+            if status == "running":
+                icon = "⏳"
+                tag  = "working…"
+            elif status == "done":
+                icon = "✅"
+                tag  = f"done ({elapsed/1000:.1f}s)"
+            else:
+                icon = "❌"
+                tag  = f"error ({elapsed/1000:.1f}s)"
+            line = f"- {icon} **{disp}**: {tag}"
+            excerpt = agent_excerpts.get(agent)
+            if excerpt and status == "done":
+                line += f"\n  *{excerpt}*"
+            lines.append(line)
+        agent_area.markdown("\n".join(lines))
 
     try:
         with st.spinner("Running pipeline…"):
-            for node_name, node_output in orch_stream(query):
-                label, desc = NODE_LABELS.get(node_name, (node_name, ""))
+            stream_done = False
+            while not stream_done:
+                # ── Drain output_queue (node-level events) ────────────────
+                while True:
+                    try:
+                        node_name, node_output = output_queue.get_nowait()
+                    except queue.Empty:
+                        break
 
-                # Track parallel_agents passes for ReAct display
-                if node_name == "parallel_agents":
-                    pass_count += 1
-                    line = f"**Pass {pass_count} — {label}:** {desc}"
-                elif node_name == "react_check":
-                    iteration = node_output.get("react_iteration") or pass_count
-                    react_max = node_output.get("react_max_iterations") or 1
-                    gaps = [
-                        a for a, (out_key, run_key) in [
-                            ("BA",  ("business_analyst_outputs",  "run_business_analyst")),
-                            ("QF",  ("quant_fundamental_outputs", "run_quant_fundamental")),
-                            ("FM",  ("financial_modelling_outputs","run_financial_modelling")),
-                            ("WS",  ("web_search_outputs",         "run_web_search")),
+                    if node_name is _STREAM_DONE:
+                        stream_done = True
+                        break
+                    if node_name is _STREAM_ERROR:
+                        raise node_output  # type: ignore[misc]
+
+                    # ── Handle __session__ — subscribe to progress queue ──
+                    if node_name == "__session__":
+                        sid = node_output.get("session_id", "")
+                        session_id_holder.append(sid)
+                        progress_queue = subscribe_agent_progress(sid)
+                        continue
+
+                    label, desc = NODE_LABELS.get(node_name, (node_name, ""))
+
+                    if node_name == "parallel_agents":
+                        pass_count += 1
+                        in_parallel_agents = False   # node just finished
+                        agent_area.empty()           # clear per-agent box
+                        agent_statuses.clear()
+                        line = f"**Pass {pass_count} — {label}:** {desc}"
+
+                    elif node_name == "react_check":
+                        iteration = node_output.get("react_iteration") or pass_count
+                        react_max = node_output.get("react_max_iterations") or 1
+                        gaps = [
+                            a for a, (out_key, run_key) in [
+                                ("BA",  ("business_analyst_outputs",  "run_business_analyst")),
+                                ("QF",  ("quant_fundamental_outputs", "run_quant_fundamental")),
+                                ("FM",  ("financial_modelling_outputs","run_financial_modelling")),
+                                ("WS",  ("web_search_outputs",         "run_web_search")),
+                            ]
+                            if node_output.get(run_key) and not node_output.get(out_key)
                         ]
-                        if node_output.get(run_key) and not node_output.get(out_key)
-                    ]
-                    gap_str = f" — retrying: {', '.join(gaps)}" if gaps else " — all agents OK"
-                    line = f"**{label} (pass {iteration}/{react_max}):**{gap_str}"
-                elif node_name == "planner":
-                    ticker   = node_output.get("ticker") or "?"
-                    tickers  = node_output.get("tickers") or []
-                    plan     = node_output.get("plan") or {}
-                    complexity = plan.get("complexity") or "?"
-                    line = (
-                        f"**{label}:** ticker={', '.join(tickers) or ticker}, "
-                        f"complexity={complexity}"
-                    )
-                else:
-                    line = f"**{label}:** {desc}"
+                        gap_str = f" — retrying: {', '.join(gaps)}" if gaps else " — all agents OK"
+                        line = f"**{label} (pass {iteration}/{react_max}):**{gap_str}"
+                        if gaps:
+                            in_parallel_agents = True  # about to re-enter parallel_agents
 
-                status_lines.append(line)
-                progress_area.markdown("\n\n".join(status_lines))
+                    elif node_name == "planner":
+                        ticker     = node_output.get("ticker") or "?"
+                        tickers    = node_output.get("tickers") or []
+                        plan       = node_output.get("plan") or {}
+                        complexity = plan.get("complexity") or "?"
+                        line = (
+                            f"**{label}:** ticker={', '.join(tickers) or ticker}, "
+                            f"complexity={complexity}"
+                        )
+                        in_parallel_agents = True  # next node will be parallel_agents
 
-                # Accumulate state — merge each node_output into final_state
-                if isinstance(node_output, dict):
-                    final_state.update(node_output)
+                    elif node_name == "memory_update":
+                        line = f"**{label}:** {desc}"
+                        in_parallel_agents = False
+
+                    else:
+                        line = f"**{label}:** {desc}"
+
+                    status_lines.append(line)
+                    progress_area.markdown("\n\n".join(status_lines))
+
+                    if isinstance(node_output, dict):
+                        final_state.update(node_output)
+
+                # ── Drain progress_queue (per-agent events) ───────────────
+                if progress_queue is not None and in_parallel_agents:
+                    drained = False
+                    while not drained:
+                        try:
+                            event = progress_queue.get_nowait()
+                        except queue.Empty:
+                            drained = True
+                            break
+                        agent = event.get("agent", "")
+                        if agent == "__done__":
+                            drained = True
+                            break
+                        status = event.get("status", "")
+                        elapsed = event.get("elapsed_ms", 0)
+                        if status == "started":
+                            agent_statuses[agent] = "running"
+                        elif status == "done":
+                            agent_statuses[agent] = "done"
+                            agent_elapsed[agent]  = elapsed
+                            excerpt = event.get("excerpt")
+                            if excerpt:
+                                agent_excerpts[agent] = excerpt
+                        elif status == "error":
+                            agent_statuses[agent] = "error"
+                            agent_elapsed[agent]  = elapsed
+                    _render_agent_progress()
+
+                if not stream_done:
+                    time.sleep(0.05)  # 50ms poll interval
 
     except Exception as exc:
         st.error(f"Pipeline error: {exc}")
+        if session_id_holder:
+            unsubscribe_agent_progress(session_id_holder[0])
         return None
 
+    if session_id_holder:
+        unsubscribe_agent_progress(session_id_holder[0])
+
     progress_area.empty()
+    agent_area.empty()
     return final_state
 
 
@@ -586,7 +1045,7 @@ def main() -> None:
     st.markdown("**Example queries:**")
     cols = st.columns(len(EXAMPLE_QUERIES))
     for col, q in zip(cols, EXAMPLE_QUERIES):
-        if col.button(q[:40] + "…", key=f"ex_{q[:20]}", use_container_width=True):
+        if col.button(q[:40] + "…", key=f"ex_{q[:20]}", width="stretch"):
             st.session_state["query_input"] = q
 
     # Query input
@@ -612,7 +1071,7 @@ def main() -> None:
             if ticker_override not in query.upper():
                 query = f"[{ticker_override}] {query}"
 
-    run_btn = st.button("Run Analysis", type="primary", use_container_width=True)
+    run_btn = st.button("Run Analysis", type="primary", width="stretch")
 
     # ── Run ───────────────────────────────────────────────────────────────────
     if run_btn:
@@ -648,6 +1107,10 @@ def main() -> None:
             st.error("**Agent errors detected:**")
             for agent, msg in errors.items():
                 st.error(f"  • **{agent}**: {msg}")
+
+        # Visualisations (chart library — driven by planner chart_hints)
+        # Rendered BEFORE the research note so charts appear at the top.
+        _render_visualisations(state)
 
         # Final research note
         final_summary = state.get("final_summary") or ""

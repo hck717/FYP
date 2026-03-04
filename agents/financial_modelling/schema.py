@@ -20,25 +20,40 @@ class DCFResult:
     intrinsic_value_base: Optional[float] = None
     intrinsic_value_bear: Optional[float] = None
     intrinsic_value_bull: Optional[float] = None
-    upside_pct_base: Optional[float] = None      # (base - current_price) / current_price * 100
+    intrinsic_value_weighted: Optional[float] = None  # probability-weighted: P(b)*bear + P(B)*base + P(u)*bull
+    upside_pct_base: Optional[float] = None           # (base - price) / price * 100
+    upside_pct_weighted: Optional[float] = None       # (weighted - price) / price * 100
     wacc_used: Optional[float] = None
     terminal_growth_rate: Optional[float] = None
+    forecast_years: int = 10
     scenario_probability: Dict[str, float] = field(
         default_factory=lambda: {"bear": 0.25, "base": 0.55, "bull": 0.20}
     )
+    # scenario_table: list of {"scenario", "revenue_growth", "ebit_margin", "wacc", "intrinsic_value"}
+    scenario_table: List[Dict[str, Any]] = field(default_factory=list)
     # sensitivity_matrix[wacc_str][growth_str] = implied_value
     sensitivity_matrix: Dict[str, Dict[str, Optional[float]]] = field(default_factory=dict)
+    # Reverse DCF: implied revenue CAGR at current market price
+    reverse_dcf_implied_cagr: Optional[float] = None
+    # Beta and WACC components for transparency
+    beta_used: Optional[float] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "intrinsic_value_base": self.intrinsic_value_base,
             "intrinsic_value_bear": self.intrinsic_value_bear,
             "intrinsic_value_bull": self.intrinsic_value_bull,
+            "intrinsic_value_weighted": self.intrinsic_value_weighted,
             "upside_pct_base": self.upside_pct_base,
+            "upside_pct_weighted": self.upside_pct_weighted,
             "wacc_used": self.wacc_used,
             "terminal_growth_rate": self.terminal_growth_rate,
+            "forecast_years": self.forecast_years,
             "scenario_probability": self.scenario_probability,
+            "scenario_table": self.scenario_table,
             "sensitivity_matrix": self.sensitivity_matrix,
+            "reverse_dcf_implied_cagr": self.reverse_dcf_implied_cagr,
+            "beta_used": self.beta_used,
         }
 
 
@@ -47,20 +62,26 @@ class CompsResult:
     """Output of the Comparable Company Analysis."""
 
     ev_ebitda: Optional[float] = None
+    ev_ebit: Optional[float] = None            # EV / EBIT — pure operating multiple
     pe_trailing: Optional[float] = None
     pe_forward: Optional[float] = None
     ps_ttm: Optional[float] = None
     ev_revenue: Optional[float] = None
-    vs_sector_avg: Optional[str] = None         # e.g. "premium +18%" or "discount -5%"
+    p_fcf: Optional[float] = None              # Market cap / Free cash flow to firm
+    peg_ratio: Optional[float] = None          # P/E ÷ (EPS growth rate × 100)
+    vs_sector_avg: Optional[str] = None        # e.g. "premium +18%" or "discount -5%"
     peer_group: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "ev_ebitda": self.ev_ebitda,
+            "ev_ebit": self.ev_ebit,
             "pe_trailing": self.pe_trailing,
             "pe_forward": self.pe_forward,
             "ps_ttm": self.ps_ttm,
             "ev_revenue": self.ev_revenue,
+            "p_fcf": self.p_fcf,
+            "peg_ratio": self.peg_ratio,
             "vs_sector_avg": self.vs_sector_avg,
             "peer_group": self.peer_group,
         }
@@ -90,9 +111,24 @@ class ValuationResult:
 
 @dataclass
 class TechnicalSnapshot:
-    """Output of the technical analysis module."""
+    """Output of the technical analysis module.
 
-    trend: Optional[str] = None               # "bullish" | "bearish" | "neutral"
+    Attribute naming:
+      Canonical names (used internally and by the pipeline):
+        macd_histogram, bollinger_upper, bollinger_lower,
+        stochastic_k, stochastic_d, high_52w, low_52w
+
+      Alias properties (expected by tests and external consumers):
+        macd         → macd_histogram
+        bb_upper     → bollinger_upper
+        bb_lower     → bollinger_lower
+        stoch_k      → stochastic_k
+        stoch_d      → stochastic_d
+        w52_high     → high_52w
+        w52_low      → low_52w
+    """
+
+    trend: Optional[str] = None               # "BULLISH" | "BEARISH" | "NEUTRAL" | "UNKNOWN"
     rsi_14: Optional[float] = None
     macd_signal: Optional[str] = None         # "buy" | "sell" | "neutral"
     macd_histogram: Optional[float] = None
@@ -116,10 +152,70 @@ class TechnicalSnapshot:
     high_52w: Optional[float] = None
     low_52w: Optional[float] = None
 
+    # ── Alias properties ─────────────────────────────────────────────────────
+    # These expose alternate attribute names expected by tests and callers.
+
+    @property
+    def macd(self) -> Optional[float]:
+        return self.macd_histogram
+
+    @macd.setter
+    def macd(self, value: Optional[float]) -> None:
+        self.macd_histogram = value
+
+    @property
+    def bb_upper(self) -> Optional[float]:
+        return self.bollinger_upper
+
+    @bb_upper.setter
+    def bb_upper(self, value: Optional[float]) -> None:
+        self.bollinger_upper = value
+
+    @property
+    def bb_lower(self) -> Optional[float]:
+        return self.bollinger_lower
+
+    @bb_lower.setter
+    def bb_lower(self, value: Optional[float]) -> None:
+        self.bollinger_lower = value
+
+    @property
+    def stoch_k(self) -> Optional[float]:
+        return self.stochastic_k
+
+    @stoch_k.setter
+    def stoch_k(self, value: Optional[float]) -> None:
+        self.stochastic_k = value
+
+    @property
+    def stoch_d(self) -> Optional[float]:
+        return self.stochastic_d
+
+    @stoch_d.setter
+    def stoch_d(self, value: Optional[float]) -> None:
+        self.stochastic_d = value
+
+    @property
+    def w52_high(self) -> Optional[float]:
+        return self.high_52w
+
+    @w52_high.setter
+    def w52_high(self, value: Optional[float]) -> None:
+        self.high_52w = value
+
+    @property
+    def w52_low(self) -> Optional[float]:
+        return self.low_52w
+
+    @w52_low.setter
+    def w52_low(self, value: Optional[float]) -> None:
+        self.low_52w = value
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "trend": self.trend,
             "rsi_14": self.rsi_14,
+            "macd": self.macd_histogram,
             "macd_signal": self.macd_signal,
             "macd_histogram": self.macd_histogram,
             "sma_20": self.sma_20,
@@ -155,8 +251,8 @@ class EarningsRecord:
     last_eps_actual: Optional[float] = None
     last_eps_estimate: Optional[float] = None
     surprise_pct: Optional[float] = None
-    beat_streak: Optional[int] = None
-    miss_streak: Optional[int] = None
+    beat_streak: int = 0
+    miss_streak: int = 0
     next_earnings_date: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:

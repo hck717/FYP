@@ -25,8 +25,8 @@ EMBEDDING_BATCH_SIZE = 20    # keep small for local Ollama
 MIN_TEXT_LEN = 10             # characters — skip trivially short texts
 MAX_TEXT_LEN = 2000           # characters — safe within nomic-embed-text context
 
-# How long to wait for Ollama to become ready (seconds)
-OLLAMA_WARMUP_TIMEOUT = int(os.getenv("OLLAMA_WARMUP_TIMEOUT", "60"))
+# How long to wait for Ollama to become ready (seconds, 0 = wait forever)
+OLLAMA_WARMUP_TIMEOUT = int(os.getenv("OLLAMA_WARMUP_TIMEOUT", "600"))
 OLLAMA_WARMUP_INTERVAL = 5   # seconds between probes
 
 _NULL_SENTINELS = {"", "nan", "none", "null", "n/a", "na", "undefined"}
@@ -148,7 +148,7 @@ def _embed_single(text: str) -> list[float] | None:
         resp = requests.post(
             f"{OLLAMA_BASE_URL}/api/embed",
             json={"model": EMBEDDING_MODEL, "input": text},
-            timeout=60,
+            timeout=None,
         )
         if resp.status_code == 404:
             raise requests.exceptions.HTTPError(response=resp)
@@ -173,7 +173,7 @@ def _embed_single(text: str) -> list[float] | None:
         resp = requests.post(
             f"{OLLAMA_BASE_URL}/api/embeddings",
             json={"model": EMBEDDING_MODEL, "prompt": text},
-            timeout=60,
+            timeout=None,
         )
         resp.raise_for_status()
         embedding = resp.json().get("embedding")

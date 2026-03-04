@@ -263,7 +263,7 @@ class TestNodes:
         state: AgentState = {"task": "moat?", "ticker": "AAPL"}
         result: Any = _node_hybrid_retrieval(state, self.toolkit)
         assert result["retrieval"] is retrieval
-        self.toolkit.retrieve.assert_called_once_with("moat?", "AAPL")
+        self.toolkit.retrieve.assert_called_once_with("AAPL: moat?", "AAPL")
 
     def test_crag_evaluate_node(self):
         retrieval = _make_retrieval(0.85)
@@ -483,7 +483,7 @@ class TestFullPipelineIntegration:
 
         call_count = {"n": 0}
 
-        def eval_side_effect(chunks):
+        def eval_side_effect(chunks, **kwargs):
             call_count["n"] += 1
             # First eval: AMBIGUOUS; second eval (after rewrite): CORRECT
             if call_count["n"] == 1:

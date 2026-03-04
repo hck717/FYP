@@ -45,7 +45,7 @@ class QuantFundamentalConfig:
         default_factory=lambda: float(os.getenv("QUANT_LLM_TEMPERATURE", "0.1"))
     )
     llm_max_tokens: int = field(
-        default_factory=lambda: int(os.getenv("QUANT_LLM_MAX_TOKENS", "1500"))
+        default_factory=lambda: int(os.getenv("QUANT_LLM_MAX_TOKENS", "4096"))
     )
     ollama_base_url: str = field(
         default_factory=lambda: os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
@@ -77,9 +77,9 @@ class QuantFundamentalConfig:
         default_factory=lambda: int(os.getenv("ROLLING_MEAN_YEARS", "3"))
     )
 
-    # SQL query timeout in seconds
+    # SQL query timeout in seconds (0 = no timeout)
     sql_timeout: int = field(
-        default_factory=lambda: int(os.getenv("QUANT_AGENT_SQL_TIMEOUT", "30"))
+        default_factory=lambda: int(os.getenv("QUANT_AGENT_SQL_TIMEOUT", "0"))
     )
 
     # Beneish M-Score threshold for manipulation risk

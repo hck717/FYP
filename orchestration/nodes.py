@@ -3,14 +3,14 @@
 Each function is a pure node — takes state, returns partial state update.
 
 Pipeline:
-  planner → parallel_agents → summarizer
+  planner → parallel_agents → react_check → (loop | summarizer) → memory_update → END
 
   parallel_agents fans out BA, QF, FM (and optionally WS) concurrently using
   a ThreadPoolExecutor so all enabled agents run at the same time.  Wall-clock
   time is bounded by the slowest single agent rather than their sum.
 
-  The legacy sequential ReAct nodes (react_dispatch / react_check) are kept for
-  backward-compatibility but are no longer wired into the default graph.
+  node_memory_update runs after summarizer to persist any failure patterns to
+  the agent_episodic_memory PostgreSQL table for use in future runs.
 
 Multi-ticker support
 --------------------
@@ -23,6 +23,10 @@ per-ticker result dicts in the ``*_outputs`` list keys.  The legacy single-value
 from __future__ import annotations
 
 import logging
+import os
+import queue
+import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, cast
 
@@ -34,6 +38,127 @@ logger = logging.getLogger(__name__)
 _MAX_REACT_ITERATIONS = 3  # safety cap (legacy sequential path only)
 
 
+# ── Per-session agent progress queues ────────────────────────────────────────
+# The Streamlit UI subscribes to a session's queue before the graph runs.
+# node_parallel_agents pushes AgentProgressEvent dicts as each agent
+# finishes so the UI can show live per-agent status without waiting for the
+# entire parallel_agents node to complete.
+
+_progress_queues: Dict[str, "queue.Queue[Dict[str, Any]]"] = {}
+
+
+def _extract_agent_excerpt(name: str, result_list: List[Dict[str, Any]]) -> Optional[str]:
+    """Return a short one-liner excerpt of an agent's output for the live UI panel.
+
+    Picks the most informative narrative field from the first result dict.
+    Never raises — returns None on any failure.
+    """
+    try:
+        if not result_list:
+            return None
+        r = result_list[0]
+        raw: Optional[str] = None
+        if name == "business_analyst":
+            raw = (
+                r.get("qualitative_summary")
+                or (r.get("qualitative_analysis") or {}).get("narrative")
+                or (r.get("sentiment_verdict") or {}).get("label")
+            )
+        elif name == "quant_fundamental":
+            raw = (
+                r.get("quantitative_summary")
+                or (r.get("cot_validation_notes") or [None])[0]
+            )
+        elif name == "web_search":
+            raw = (
+                r.get("sentiment_rationale")
+                or (r.get("breaking_news") or [None])[0]
+            )
+        elif name == "financial_modelling":
+            raw = (
+                r.get("quantitative_summary")
+                or (r.get("moe_consensus") or {}).get("consensus_narrative")
+            )
+        if raw and isinstance(raw, str):
+            # Trim to ~120 chars without cutting mid-word
+            raw = raw.strip().replace("\n", " ")
+            if len(raw) > 120:
+                raw = raw[:117].rsplit(" ", 1)[0] + "…"
+            return raw
+    except Exception:
+        pass
+    return None
+
+
+def subscribe_agent_progress(session_id: str) -> "queue.Queue[Dict[str, Any]]":
+    """Create (or replace) a progress queue for the given session_id.
+
+    Call this before starting the graph stream.  Drain it from the UI thread
+    while the parallel_agents node is running.  Call unsubscribe_agent_progress
+    when done to free memory.
+
+    Queue items are dicts::
+
+        {"agent": str, "status": "started" | "done" | "error",
+         "ticker": str | None, "elapsed_ms": int, "error": str | None}
+
+    A sentinel ``{"agent": "__done__", "status": "done"}`` is pushed when
+    node_parallel_agents finishes so the consumer knows to stop polling.
+    """
+    q: queue.Queue[Dict[str, Any]] = queue.Queue()
+    _progress_queues[session_id] = q
+    return q
+
+
+def unsubscribe_agent_progress(session_id: str) -> None:
+    """Remove the progress queue for the given session_id."""
+    _progress_queues.pop(session_id, None)
+
+
+# ── A2: Implicit telemetry helper ────────────────────────────────────────────
+
+def _log_telemetry(
+    run_id: str,
+    agent_name: str,
+    event_type: str,
+    latency_ms: Optional[int] = None,
+    complexity_declared: Optional[int] = None,
+    react_loops_used: Optional[int] = None,
+    notes: Optional[str] = None,
+) -> None:
+    """A2: Write one telemetry event to agent_run_telemetry (non-fatal).
+
+    event_type values:
+        'latency'             — per-agent wall-clock time
+        'complexity_mismatch' — declared complexity vs. actual loops
+        'crag_fallback'       — BA agent fell back from vector to web search
+        'timeout'             — an agent error contained the word 'timeout'
+    """
+    try:
+        import psycopg2
+        conn = psycopg2.connect(
+            host=os.getenv("POSTGRES_HOST", "localhost"),
+            port=int(os.getenv("POSTGRES_PORT", "5432")),
+            dbname=os.getenv("POSTGRES_DB", "financial_data"),
+            user=os.getenv("POSTGRES_USER", "postgres"),
+            password=os.getenv("POSTGRES_PASSWORD", "postgres"),
+        )
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO agent_run_telemetry
+                    (run_id, agent_name, event_type, latency_ms,
+                     complexity_declared, react_loops_used, notes, recorded_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())
+                """,
+                (run_id, agent_name, event_type, latency_ms,
+                 complexity_declared, react_loops_used, notes),
+            )
+        conn.close()
+    except Exception as exc:
+        logger.debug("[telemetry] Non-fatal log failure: %s", exc)
+
+
 # ── Node 1: Planner ───────────────────────────────────────────────────────────
 
 def node_planner(state: OrchestrationState) -> OrchestrationState:
@@ -41,6 +166,7 @@ def node_planner(state: OrchestrationState) -> OrchestrationState:
 
     Populates:
       - plan, ticker, tickers, run_business_analyst, run_quant_fundamental, run_web_search
+      - episodic_hints: pre-emptive hints from agent_episodic_memory for known failure patterns
     """
     user_query = state.get("user_query", "")
     logger.info("[planner] Analysing query: %r", user_query)
@@ -82,10 +208,10 @@ def node_planner(state: OrchestrationState) -> OrchestrationState:
     run_ws = bool(plan.get("run_web_search", False))
     run_fm = bool(plan.get("run_financial_modelling", False))
 
-    # complexity 1 → 1 pass, complexity 2 → 2 passes, complexity 3 → 3 passes
+    # complexity drives max ReAct passes — no upper cap
     raw_complexity = plan.get("complexity", 2)
     try:
-        react_max = max(1, min(3, int(raw_complexity)))
+        react_max = max(1, int(raw_complexity))
     except (TypeError, ValueError):
         react_max = 2
 
@@ -105,6 +231,25 @@ def node_planner(state: OrchestrationState) -> OrchestrationState:
     except Exception as exc:
         logger.warning("[planner] Data availability check failed: %s", exc)
 
+    # --- episodic memory lookup --------------------------------------------
+    # Query stored failure patterns; if a similar past query hit known agent
+    # failures, adjust the plan pre-emptively (e.g. force web search).
+    episodic_hints: Optional[Dict[str, Any]] = None
+    try:
+        from .episodic_memory import lookup_similar_failures, build_preemptive_plan_hints  # type: ignore[import]
+        failures = lookup_similar_failures(user_query, tickers=tickers or None)
+        episodic_hints = build_preemptive_plan_hints(failures)
+        if episodic_hints:
+            logger.info("[planner] Episodic hints from %d similar past failure(s): %s", len(failures), episodic_hints)
+            if episodic_hints.get("force_web_search"):
+                logger.info("[planner] Episodic memory → forcing run_web_search=True")
+                run_ws = True
+            degraded = episodic_hints.get("degraded_agents") or []
+            if degraded:
+                logger.info("[planner] Episodic memory → known degraded agents: %s", degraded)
+    except Exception as exc:
+        logger.warning("[planner] Episodic memory lookup failed (non-fatal): %s", exc)
+
     logger.info(
         "[planner] tickers=%s  ba=%s  quant=%s  web=%s  fm=%s  complexity=%s  react_max=%d",
         tickers, run_ba, run_qf, run_ws, run_fm, raw_complexity, react_max,
@@ -120,6 +265,7 @@ def node_planner(state: OrchestrationState) -> OrchestrationState:
         "run_web_search": run_ws,
         "run_financial_modelling": run_fm,
         "data_availability": data_availability,
+        "episodic_hints": episodic_hints,
         "react_steps": [],
         "react_iteration": 0,
         "react_max_iterations": react_max,
@@ -509,14 +655,37 @@ def node_parallel_agents(state: OrchestrationState) -> OrchestrationState:
     ws_outputs: List[Dict[str, Any]]  = list(state.get("web_search_outputs") or [])
     fm_outputs: List[Dict[str, Any]]  = list(state.get("financial_modelling_outputs") or [])
 
+    # A2: derive a stable run_id for telemetry (session_id set by UI, else generate one)
+    run_id: str = state.get("session_id", "") or str(uuid.uuid4())[:8]  # type: ignore[arg-type]
+    complexity: int = state.get("react_max_iterations") or 1
+
+    # Live-progress queue (subscribed by the Streamlit UI before the graph runs)
+    _pq = _progress_queues.get(run_id)
+
+    def _push(event: Dict[str, Any]) -> None:
+        if _pq is not None:
+            try:
+                _pq.put_nowait(event)
+            except Exception:
+                pass
+
     if not tasks:
         logger.warning("[parallel_agents] No agents enabled — proceeding to summarizer.")
     else:
         n_workers = len(tasks)  # one thread per agent
         with ThreadPoolExecutor(max_workers=n_workers, thread_name_prefix="agent") as pool:
-            future_to_name = {pool.submit(fn): name for name, fn in tasks.items()}
+            # A2: record start time per future so we can measure latency
+            future_to_name: Dict[Any, str] = {}
+            future_to_start: Dict[Any, float] = {}
+            for name, fn in tasks.items():
+                fut = pool.submit(fn)
+                future_to_name[fut] = name
+                future_to_start[fut] = time.time()
+                _push({"agent": name, "status": "started", "tickers": tickers, "elapsed_ms": 0, "error": None})
+
             for future in as_completed(future_to_name):
                 name = future_to_name[future]
+                elapsed_ms = int((time.time() - future_to_start[future]) * 1000)
                 try:
                     result_list: List[Dict[str, Any]] = future.result()
                     obs_parts = [
@@ -528,23 +697,59 @@ def node_parallel_agents(state: OrchestrationState) -> OrchestrationState:
                         "observation": f"Success — {', '.join(obs_parts)}",
                     })
                     logger.info("[parallel_agents] %s done (%d result(s)).", name, len(result_list))
+                    _excerpt = _extract_agent_excerpt(name, result_list)
+                    _push({"agent": name, "status": "done", "tickers": tickers, "elapsed_ms": elapsed_ms, "error": None, "excerpt": _excerpt})
                     if name == "business_analyst":
                         ba_outputs = result_list
+                        # A2: detect CRAG fallback
+                        if result_list and result_list[0].get("crag_status") == "fallback":
+                            _log_telemetry(
+                                run_id, "business_analyst", "crag_fallback",
+                                notes=f"crag_status=fallback ticker={result_list[0].get('ticker', '?')}",
+                            )
                     elif name == "quant_fundamental":
                         qf_outputs = result_list
                     elif name == "web_search":
                         ws_outputs = result_list
                     elif name == "financial_modelling":
                         fm_outputs = result_list
+                    # A2: log latency for every successful agent
+                    _log_telemetry(
+                        run_id, name, "latency",
+                        latency_ms=elapsed_ms,
+                        complexity_declared=complexity,
+                        react_loops_used=iteration,
+                    )
                 except Exception as exc:
                     msg = f"{type(exc).__name__}: {exc}"
                     logger.error("[parallel_agents] %s failed: %s", name, msg)
                     errors[name] = msg
+                    _push({"agent": name, "status": "error", "tickers": tickers, "elapsed_ms": elapsed_ms, "error": msg[:200]})
                     steps.append({
                         "tool": name,
                         "input": {"tickers": tickers, "query": query},
                         "observation": f"Error: {msg}",
                     })
+                    # A2: detect timeout events
+                    if "timeout" in msg.lower():
+                        _log_telemetry(
+                            run_id, name, "timeout",
+                            latency_ms=elapsed_ms,
+                            complexity_declared=complexity,
+                            react_loops_used=iteration,
+                            notes=msg[:500],
+                        )
+                    else:
+                        _log_telemetry(
+                            run_id, name, "latency",
+                            latency_ms=elapsed_ms,
+                            complexity_declared=complexity,
+                            react_loops_used=iteration,
+                            notes=f"error: {msg[:200]}",
+                        )
+
+    # Sentinel: tell the UI that this pass of parallel_agents is fully complete
+    _push({"agent": "__done__", "status": "done", "tickers": tickers, "elapsed_ms": 0, "error": None})
 
     return {
         **state,
@@ -612,11 +817,101 @@ def node_react_check(state: OrchestrationState) -> OrchestrationState:
         "loop" if should_loop else "summarizer",
     )
 
+    # A2: detect complexity mismatch — actual loops exceeded declared complexity
+    complexity_declared = state.get("react_max_iterations") or 1
+    run_id: str = state.get("session_id", "") or str(uuid.uuid4())[:8]  # type: ignore[arg-type]
+    if iteration > complexity_declared:
+        _log_telemetry(
+            run_id, "orchestration", "complexity_mismatch",
+            complexity_declared=complexity_declared,
+            react_loops_used=iteration,
+            notes=f"gaps={gaps} errors={list(errors.keys())}",
+        )
+
+    # C3: ReAct Loop Pruning — auto-disable agents with >3 timeouts in last 24h
+    # Check agent_run_telemetry to see which agents have been repeatedly timing out.
+    # If found, disable that agent for this run and log an auto_disabled event.
+    _KNOWN_AGENTS = ("business_analyst", "quant_fundamental", "web_search", "financial_modelling")
+    _TIMEOUT_PRUNE_THRESHOLD = int(os.getenv("REACT_PRUNE_TIMEOUT_THRESHOLD", "999"))
+
+    def _count_recent_timeouts(agent_name: str) -> int:
+        """Query agent_run_telemetry for timeout events in last 24h."""
+        try:
+            import psycopg2  # type: ignore[import]
+            conn = psycopg2.connect(
+                host=os.getenv("POSTGRES_HOST", "localhost"),
+                port=int(os.getenv("POSTGRES_PORT", "5432")),
+                dbname=os.getenv("POSTGRES_DB", "financial_data"),
+                user=os.getenv("POSTGRES_USER", "postgres"),
+                password=os.getenv("POSTGRES_PASSWORD", "postgres"),
+            )
+            with conn, conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT COUNT(*) FROM agent_run_telemetry
+                    WHERE agent_name = %s
+                      AND event_type = 'timeout'
+                      AND recorded_at >= NOW() - INTERVAL '24 hours'
+                    """,
+                    (agent_name,),
+                )
+                row = cur.fetchone()
+                count = int(row[0]) if row else 0
+            conn.close()
+            return count
+        except Exception as exc:
+            logger.debug("[react_check/c3] Could not count timeouts for %s: %s", agent_name, exc)
+            return 0
+
+    # Only prune agents that are currently enabled (run_* flag = True) and have
+    # no output yet (i.e. they would be dispatched again on the next loop pass).
+    _run_flags = {
+        "business_analyst":   "run_business_analyst",
+        "quant_fundamental":  "run_quant_fundamental",
+        "web_search":         "run_web_search",
+        "financial_modelling":"run_financial_modelling",
+    }
+    _output_keys = {
+        "business_analyst":   "business_analyst_outputs",
+        "quant_fundamental":  "quant_fundamental_outputs",
+        "web_search":         "web_search_outputs",
+        "financial_modelling":"financial_modelling_outputs",
+    }
+
+    # Build a dict of state overrides for auto-disabled agents
+    prune_overrides: Dict[str, Any] = {}
+    for agent in _KNOWN_AGENTS:
+        # Skip if agent is already disabled or already has output
+        if not state.get(_run_flags[agent]):
+            continue
+        if state.get(_output_keys[agent]):
+            continue
+        timeout_count = _count_recent_timeouts(agent)
+        if timeout_count > _TIMEOUT_PRUNE_THRESHOLD:
+            logger.warning(
+                "[react_check/c3] AUTO-DISABLING %s — %d timeout events in last 24h "
+                "(threshold=%d).",
+                agent, timeout_count, _TIMEOUT_PRUNE_THRESHOLD,
+            )
+            prune_overrides[_run_flags[agent]] = False
+            _log_telemetry(
+                run_id, agent, "auto_disabled",
+                react_loops_used=iteration,
+                notes=f"timeout_count_24h={timeout_count} threshold={_TIMEOUT_PRUNE_THRESHOLD}",
+            )
+            # Remove from retry_agents so we don't try to loop for it
+            if agent in retry_agents:
+                retry_agents.remove(agent)
+
+    # Re-evaluate should_loop after pruning
+    should_loop = bool(retry_agents) and iteration < react_max
+
     # Clear errors for agents that will be retried so they get a clean slate
     new_errors = {k: v for k, v in errors.items() if k not in retry_agents} if should_loop else errors
 
     return {
         **state,
+        **prune_overrides,
         "react_iteration": iteration,
         "agent_errors": new_errors,
     }
@@ -709,6 +1004,80 @@ def node_summarizer(state: OrchestrationState) -> OrchestrationState:
     return {**state, "final_summary": final_summary, "output": output}
 
 
+# ── Node 8: Episodic Memory Update ───────────────────────────────────────────
+
+def node_memory_update(state: OrchestrationState) -> OrchestrationState:
+    """Persist failure patterns to agent_episodic_memory after the pipeline completes.
+
+    Runs after the summarizer.  For each agent that was enabled but produced no
+    output (gap) AND multiple ReAct iterations were consumed, we write a failure
+    record keyed by the user query embedding + ticker so the planner can
+    pre-empt the same failure on future identical queries.
+
+    This node is a no-op if:
+      - No agents failed (no errors, no gaps)
+      - Only 1 ReAct iteration was consumed (single-pass failures may be transient)
+      - The episodic_memory module is unavailable (graceful degradation)
+    """
+    errors        = state.get("agent_errors") or {}
+    tickers       = state.get("tickers") or []
+    user_query    = state.get("user_query", "")
+    react_iters   = state.get("react_iteration") or 1
+
+    # Identify agents that were enabled but yielded no output (persistent gaps)
+    gap_agents: List[str] = []
+    if state.get("run_business_analyst") and not state.get("business_analyst_outputs"):
+        gap_agents.append("business_analyst")
+    if state.get("run_quant_fundamental") and not state.get("quant_fundamental_outputs"):
+        gap_agents.append("quant_fundamental")
+    if state.get("run_web_search") and not state.get("web_search_outputs"):
+        gap_agents.append("web_search")
+    if state.get("run_financial_modelling") and not state.get("financial_modelling_outputs"):
+        gap_agents.append("financial_modelling")
+
+    # Also include agents that ended with an error
+    error_agents = list(errors.keys())
+    agents_to_record = list(dict.fromkeys(gap_agents + error_agents))
+
+    if not agents_to_record:
+        logger.debug("[memory_update] No failures to record.")
+        return state
+
+    try:
+        from .episodic_memory import record_failure  # type: ignore[import]
+
+        for agent_name in agents_to_record:
+            reason = "INSUFFICIENT_DATA" if agent_name in gap_agents else "ERROR"
+            if agent_name in errors:
+                err_msg = errors[agent_name]
+                if "timeout" in err_msg.lower():
+                    reason = "TIMEOUT"
+                elif "insufficient" in err_msg.lower() or "no data" in err_msg.lower():
+                    reason = "INSUFFICIENT_DATA"
+                else:
+                    reason = "ERROR"
+
+            for ticker in (tickers or ["UNKNOWN"]):
+                record_failure(
+                    user_query=user_query,
+                    ticker=ticker,
+                    failure_agent=agent_name,
+                    failure_reason=reason,
+                    react_iterations_used=react_iters,
+                )
+
+        logger.info(
+            "[memory_update] Recorded %d failure event(s) for agents=%s tickers=%s",
+            len(agents_to_record) * max(len(tickers), 1),
+            agents_to_record,
+            tickers,
+        )
+    except Exception as exc:
+        logger.warning("[memory_update] Failed to persist episodic memory (non-fatal): %s", exc)
+
+    return state
+
+
 __all__ = [
     "node_planner",
     "node_business_analyst",
@@ -718,4 +1087,5 @@ __all__ = [
     "node_parallel_agents",
     "node_react_check",
     "node_summarizer",
+    "node_memory_update",
 ]

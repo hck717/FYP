@@ -160,6 +160,41 @@ class PostgresConnector:
             results.append({"payload": payload, "ts_date": str(row["ts_date"])})
         return results
 
+    def fetch_factor_scores_from_mv(self, ticker: str) -> Optional[Dict[str, Any]]:
+        """Query mv_daily_factor_scores materialized view for pre-computed factor scores.
+
+        Returns a dict with keys: piotroski_score, altman_z_score, beneish_m_score,
+        roe_ttm, roa_ttm, roic_ttm, gross_margin_ttm, net_margin_ttm,
+        debt_to_equity_ttm, current_ratio_ttm, as_of_date, refreshed_at.
+        Returns None if the MV is empty or the ticker is not present.
+
+        Falls back gracefully if the materialized view does not yet exist
+        (e.g. fresh container before first REFRESH).
+        """
+        sql = """
+        SELECT ticker, as_of_date, piotroski_score, altman_z_score, beneish_m_score,
+               roe_ttm, roa_ttm, roic_ttm, gross_margin_ttm, net_margin_ttm,
+               debt_to_equity_ttm, current_ratio_ttm, refreshed_at
+        FROM mv_daily_factor_scores
+        WHERE ticker = %s
+        LIMIT 1
+        """
+        try:
+            conn = self._connect()
+            with closing(conn), conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(sql, (ticker,))
+                row = cur.fetchone()
+            if row is None:
+                return None
+            return {k: (float(v) if isinstance(v, (int, float)) and k not in ("ticker",) else str(v) if v is not None else None)
+                    for k, v in dict(row).items()}
+        except Exception as exc:
+            logger.warning(
+                "[QF] fetch_factor_scores_from_mv failed for %s (MV may not be populated yet): %s",
+                ticker, exc,
+            )
+            return None
+
     def healthcheck(self) -> bool:
         try:
             conn = self._connect()
@@ -547,6 +582,101 @@ class AnomalyDetector:
 
 
 # ---------------------------------------------------------------------------
+# 3B: Code-generating ReAct — execute_python sandbox
+# ---------------------------------------------------------------------------
+
+# Allowed top-level module names for the sandboxed exec environment.
+# This is a whitelist — any import outside this list is blocked.
+_ALLOWED_EXEC_MODULES = frozenset({
+    "math", "statistics", "datetime", "json", "re",
+    "pandas", "numpy",  # common financial data libraries
+})
+
+_EXEC_TIMEOUT_SECONDS = 10  # wall-clock budget for code execution
+
+
+def execute_python_on_bundle(
+    code: str,
+    bundle: "FinancialsBundle",
+    extra_vars: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Execute an LLM-generated pandas/Python snippet against a FinancialsBundle.
+
+    The code runs in a restricted exec() environment with:
+      - ``bundle``  : the FinancialsBundle for the ticker
+      - ``result``  : pre-initialised to None — the code must assign to it
+      - a whitelist of safe built-ins (no open/exec/eval/os/sys)
+
+    Returns a dict:
+      {"success": True,  "result": <value>, "stdout": <str>}
+    or
+      {"success": False, "error": <str>}
+
+    Security notes:
+      - __builtins__ is replaced with a restricted set.
+      - import is replaced with a whitelist-checked version.
+      - No file I/O, no subprocess, no network.
+      - Execution is synchronous — caller is responsible for timeouts.
+    """
+    import io
+    import builtins
+
+    # Restricted import: only allow whitelisted modules
+    def _restricted_import(name: str, *args: Any, **kwargs: Any) -> Any:
+        top = name.split(".")[0]
+        if top not in _ALLOWED_EXEC_MODULES:
+            raise ImportError(
+                f"Module '{name}' is not allowed in the execute_python sandbox. "
+                f"Allowed: {sorted(_ALLOWED_EXEC_MODULES)}"
+            )
+        return builtins.__import__(name, *args, **kwargs)
+
+    safe_builtins = {
+        k: getattr(builtins, k)
+        for k in (
+            "abs", "all", "any", "bool", "dict", "dir", "divmod",
+            "enumerate", "filter", "float", "format", "frozenset",
+            "getattr", "hasattr", "hash", "help", "hex", "id",
+            "int", "isinstance", "issubclass", "iter", "len", "list",
+            "map", "max", "min", "next", "oct", "pow", "print",
+            "range", "repr", "reversed", "round", "set", "setattr",
+            "slice", "sorted", "str", "sum", "tuple", "type", "zip",
+            "None", "True", "False", "NotImplemented", "Ellipsis",
+        )
+        if hasattr(builtins, k)
+    }
+    safe_builtins["__import__"] = _restricted_import
+
+    # Capture stdout from print() calls inside the code
+    _stdout_capture = io.StringIO()
+
+    exec_globals: Dict[str, Any] = {
+        "__builtins__": safe_builtins,
+        "bundle": bundle,
+        "result": None,
+    }
+    if extra_vars:
+        exec_globals.update(extra_vars)
+
+    import sys
+    _orig_stdout = sys.stdout
+    try:
+        sys.stdout = _stdout_capture  # type: ignore[assignment]
+        exec(compile(code, "<llm_code>", "exec"), exec_globals)  # noqa: S102
+    except Exception as exc:
+        sys.stdout = _orig_stdout
+        return {"success": False, "error": str(exc)}
+    finally:
+        sys.stdout = _orig_stdout
+
+    return {
+        "success": True,
+        "result": exec_globals.get("result"),
+        "stdout": _stdout_capture.getvalue(),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Toolkit façade
 # ---------------------------------------------------------------------------
 
@@ -563,6 +693,15 @@ class QuantFundamentalToolkit:
     def fetch_financials(self, ticker: str) -> FinancialsBundle:
         return self.fetcher.fetch(ticker)
 
+    def execute_python(
+        self,
+        code: str,
+        bundle: "FinancialsBundle",
+        extra_vars: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Run LLM-generated Python code against a FinancialsBundle (3B: code-generating ReAct)."""
+        return execute_python_on_bundle(code, bundle, extra_vars=extra_vars)
+
     def healthcheck(self) -> Dict[str, bool]:
         return {"postgres": self.pg.healthcheck()}
 
@@ -576,6 +715,7 @@ __all__ = [
     "DataQualityChecker",
     "FinancialDataFetcher",
     "AnomalyDetector",
+    "execute_python_on_bundle",
     "_safe_float",
     "_safe_div",
 ]

@@ -6,7 +6,9 @@ import json
 import logging
 import math
 import os
+import re as _re_top
 from contextlib import closing
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -334,6 +336,79 @@ class Neo4jConnector:
             session.run(cypher, rows=rows)
         return len(rows)
 
+    def fetch_community_summary(self, ticker: Optional[str]) -> Optional[str]:
+        """Build a graph-community summary for *ticker* using relationship-count centrality.
+
+        Avoids GDS PageRank (community edition has no GDS plugin).  Instead we
+        count outgoing relationship types from the Company node and collect a
+        few sample neighbour property snippets to characterise the local
+        community.
+
+        Returns a human-readable string like:
+            "Apple (AAPL) is most centrally connected via HAS_STRATEGY (12 edges),
+             FACES_RISK (8 edges), COMPETES_WITH (5 edges).  Top connected entities:
+             [{'name': 'AI Integration', 'type': 'Strategy'}, ...]"
+        or *None* if Neo4j is unreachable or no Company node exists.
+        """
+        if not ticker:
+            return None
+        cypher = """
+        MATCH (c:Company {ticker: $ticker})-[r]->(n)
+        WITH type(r)        AS rel_type,
+             count(*)       AS rel_count,
+             collect(properties(n))[..3] AS sample_nodes
+        ORDER BY rel_count DESC
+        LIMIT 10
+        RETURN rel_type, rel_count, sample_nodes
+        """
+        try:
+            with self.driver.session(database=None) as session:
+                result = session.run(cypher, ticker=ticker)
+                rows = [dict(rec) for rec in result]
+        except Exception as exc:  # pragma: no cover
+            logger.warning("[Neo4j] community summary query failed for %s: %s", ticker, exc)
+            return None
+
+        if not rows:
+            return None
+
+        # Build a compact, readable summary string
+        rel_parts: List[str] = []
+        all_samples: List[Dict[str, Any]] = []
+        for row in rows:
+            rel_type = row.get("rel_type", "UNKNOWN")
+            count = row.get("rel_count", 0)
+            rel_parts.append(f"{rel_type} ({count} edges)")
+            # Flatten sample neighbour nodes, dropping embedding/vector fields
+            for node in row.get("sample_nodes") or []:
+                clean = {
+                    k: v for k, v in node.items()
+                    if k not in ("embedding", "vector") and v is not None
+                }
+                if clean:
+                    all_samples.append(clean)
+
+        company_name = ticker  # fallback to ticker symbol
+        # Try to fetch the Company node name for a friendlier label
+        try:
+            with self.driver.session(database=None) as session:
+                name_result = session.run(
+                    "MATCH (c:Company {ticker: $ticker}) RETURN c.name AS name LIMIT 1",
+                    ticker=ticker,
+                )
+                name_row = name_result.single()
+                if name_row and name_row.get("name"):
+                    company_name = name_row["name"]
+        except Exception:  # pragma: no cover
+            pass
+
+        rel_summary = ", ".join(rel_parts[:5]) if rel_parts else "no outgoing relationships found"
+        sample_str = json.dumps(all_samples[:5], ensure_ascii=False) if all_samples else "[]"
+        return (
+            f"{company_name} ({ticker}) is most centrally connected via {rel_summary}. "
+            f"Top connected entities: {sample_str}"
+        )
+
     def close(self) -> None:
         self.driver.close()
 
@@ -635,20 +710,83 @@ class HybridRetriever:
     def _rerank(self, query: str, chunks: List[Chunk]) -> Tuple[List[Chunk], Dict[str, float]]:
         """Blend BM25 lexical score (30%) with cross-encoder score (70%).
 
+        Enhancements:
+          2B — Time-Decayed Contrastive RAG:
+               Apply exponential time-decay to base scores:
+               ``final_score = base_score * exp(-DECAY_LAMBDA * days_old)``
+               where DECAY_LAMBDA = 0.005 (≈ half-life ~139 days).
+               Chunks are tagged ``temporal_band = "recent"`` (≤30 days) or
+               ``"historical"`` (≥335 days) in metadata so the LLM context can
+               analyse the delta between the two windows.
+
+          2C — Dynamic Reranker Weighting:
+               If the query contains specific alphanumeric product/model strings
+               (e.g. "M2 Ultra", "H100", "RTX 4090") the CE weight shifts to 0.40
+               and BM25 to 0.60 — precise keyword matches matter more for product
+               queries than semantic proximity.
+
         Falls back to dense + BM25 blend when cross-encoder is unavailable or
-        uniformly mis-calibrated (max CE score < 0.4, which happens when the
-        MS-MARCO cross-encoder receives long financial-news articles paired with
-        abstract qualitative queries).
+        uniformly mis-calibrated (max CE score < 0.4).
         Returns a (sorted_chunks, bm25_debug) tuple where bm25_debug maps
         chunk_id → raw BM25 token-overlap score (before blending).
         """
         if not chunks:
             return chunks, {}
 
+        # 2C: Detect product/model-specific query — shift weights to BM25-heavy
+        _PRODUCT_RE = _re_top.compile(
+            r"\b[A-Z][A-Za-z0-9]*\s*\d+\s*[A-Za-z]*\b"  # e.g. M2 Ultra, H100, RTX4090
+        )
+        is_product_query = bool(_PRODUCT_RE.search(query))
+        if is_product_query:
+            ce_w = 0.40
+            bm25_w = 0.60
+            logger.debug("_rerank: product query detected — CE=0.40 / BM25=0.60")
+        else:
+            ce_w = self.CE_WEIGHT   # 0.70
+            bm25_w = self.BM25_WEIGHT  # 0.30
+
         # Snapshot the incoming dense scores before any modification
         dense_scores = [float(min(1.0, c.score)) for c in chunks]
         for i, chunk in enumerate(chunks):
             chunk.score = dense_scores[i]
+
+        # 2B: Compute time-decay factor for each chunk
+        _DECAY_LAMBDA = 0.005  # half-life ≈ 139 days
+        _now = datetime.now(tz=timezone.utc)
+        time_decay_factors: List[float] = []
+        for chunk in chunks:
+            filing_date_raw = (chunk.metadata or {}).get("filing_date") or (chunk.metadata or {}).get("published_at")
+            days_old: float = 0.0
+            temporal_band: Optional[str] = None
+            if filing_date_raw:
+                try:
+                    if isinstance(filing_date_raw, str):
+                        # Parse ISO-8601 or YYYY-MM-DD
+                        for fmt in ("%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%d"):
+                            try:
+                                dt = datetime.strptime(filing_date_raw[:19], fmt[:len(filing_date_raw[:19])])
+                                if dt.tzinfo is None:
+                                    dt = dt.replace(tzinfo=timezone.utc)
+                                days_old = max(0.0, (_now - dt).days)
+                                break
+                            except ValueError:
+                                continue
+                    elif isinstance(filing_date_raw, (int, float)):
+                        # Unix timestamp
+                        dt = datetime.fromtimestamp(filing_date_raw, tz=timezone.utc)
+                        days_old = max(0.0, (_now - dt).days)
+                except Exception:
+                    pass
+            # Tag temporal band for contrastive analysis
+            if days_old <= 30:
+                temporal_band = "recent"
+            elif days_old >= 335:
+                temporal_band = "historical"
+            if temporal_band and chunk.metadata is not None:
+                chunk.metadata["temporal_band"] = temporal_band
+            decay = math.exp(-_DECAY_LAMBDA * days_old)
+            time_decay_factors.append(decay)
 
         bm25_scores = [keyword_overlap_score(c.text, query) for c in chunks]
 
@@ -656,19 +794,19 @@ class HybridRetriever:
         ce_scores = self._cross_encoder_scores(query, chunks)
 
         # Only use CE when scores are meaningful (max >= 0.4).
-        # When CE scores are uniformly low the model is mis-calibrated for this
-        # corpus, so we fall back to dense + BM25 to preserve the signal that
-        # the dense retriever already found.
         use_ce = ce_scores is not None and max(ce_scores) >= 0.4
 
         for i, chunk in enumerate(chunks):
             bm25 = bm25_scores[i]
+            decay = time_decay_factors[i]
             if use_ce:
                 ce = ce_scores[i]  # type: ignore[index]
-                chunk.score = float(min(1.0, self.CE_WEIGHT * ce + self.BM25_WEIGHT * bm25))
+                base = float(ce_w * ce + bm25_w * bm25)
             else:
                 # Dense + BM25 fallback: 70% dense score + 30% BM25
-                chunk.score = float(min(1.0, 0.7 * dense_scores[i] + 0.3 * bm25))
+                base = float(0.7 * dense_scores[i] + 0.3 * bm25)
+            # Apply time-decay (2B)
+            chunk.score = float(min(1.0, base * decay))
 
         if ce_scores is not None and not use_ce:
             logger.debug(
@@ -803,6 +941,14 @@ class BusinessAnalystToolkit:
 
     def fetch_company_overview(self, ticker: Optional[str]) -> Optional[Dict[str, Any]]:
         return self.neo4j.fetch_company_overview(ticker)
+
+    def fetch_community_summary(self, ticker: Optional[str]) -> Optional[str]:
+        """Return graph-community summary string for *ticker* (see Neo4jConnector)."""
+        try:
+            return self.neo4j.fetch_community_summary(ticker)
+        except Exception as exc:
+            logger.warning("Community summary fetch failed for %s: %s", ticker, exc)
+            return None
 
     def fetch_sentiment(self, ticker: Optional[str]) -> Optional[SentimentSnapshot]:
         try:

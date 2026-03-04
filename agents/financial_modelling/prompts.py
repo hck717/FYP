@@ -43,24 +43,32 @@ RULES — violating any of these is a critical failure:
 COVERAGE REQUIREMENTS (address each ONLY if the relevant fields are non-null in the factor table;
 skip the entire section if all its fields are null):
 
-1. DCF INTRINSIC VALUE — Bear / Base / Bull scenarios:
-   State the base-case intrinsic value and the implied upside or downside vs. current price.
-   Comment on which scenario (bear/base/bull) is most likely given the WACC used and the
-   terminal growth rate assumption. Note the full implied price range (low to high).
-   If the WACC used is materially above or below 10%, state the implication for the sensitivity
-   of the valuation (higher WACC compresses intrinsic value more aggressively at the terminal
-   value stage — a 1% WACC change on a perpetuity with g=2.5% has an outsized effect).
+1. DCF INTRINSIC VALUE — Bear / Base / Bull scenarios + probability-weighted value:
+   State the probability-weighted intrinsic value first (`intrinsic_value_weighted`) as the
+   primary anchor — this is the most defensible single-number valuation output.
+   Then state the base-case and the implied upside or downside vs. current price.
+   Comment on which scenario (bear/base/bull) is most likely given the WACC used.
+   Note the full implied price range (bear to bull) as a spread — wider spreads signal higher
+   fundamental uncertainty.
+   If `reverse_dcf_implied_cagr` is present, state what revenue CAGR the market is pricing in:
+   "The market is pricing in approximately X% annual revenue growth to justify the current price."
+   Compare this implied growth to the base-case assumption to assess whether the stock is
+   fairly valued, cheap, or expensive relative to the market's embedded expectations.
+   If the WACC used is materially above or below 10%, note the sensitivity implication.
 
 2. COMPARABLE COMPANY ANALYSIS (Comps):
    State whether the stock trades at a premium or discount to peers on EV/EBITDA, P/E, and
    EV/Revenue, referencing the exact `vs_sector_avg` figure from the table.
-   Identify which peer multiple is the tightest or widest spread — this tells the PM which
-   metric the market is most focused on for this name.
-   If pe_forward < pe_trailing, the market is pricing in earnings growth — state the implied
-   growth rate embedded in the forward multiple compression.
+   If `ev_ebit` is present, compare it to `ev_ebitda` — a wide gap between the two implies
+   high D&A intensity (capital-heavy business), a narrow gap implies an asset-light model.
+   If `p_fcf` is present, contrast it with P/E: P/FCF < P/E implies strong cash conversion;
+   P/FCF > P/E implies accruals-heavy or capex-intensive earnings.
+   If `peg_ratio` is present, interpret it: < 1.0 = cheap relative to growth; 1.0–2.0 = fair;
+   > 2.0 = expensive relative to growth. Note whether the PEG is consistent with sector norms.
+   Identify which peer multiple is the tightest or widest spread.
 
 3. TECHNICAL TREND — RSI, MACD, Bollinger, SMAs:
-   State the overall trend (bullish/bearish/neutral) and the specific indicators driving it.
+   State the overall trend (BULLISH/BEARISH/NEUTRAL) and the specific indicators driving it.
    For RSI: >70 = overbought with mean-reversion risk; <30 = oversold with recovery potential;
    50–70 = constructive momentum; 30–50 = fading momentum.
    For MACD: state the signal (buy/sell/neutral) and what the histogram direction implies.
@@ -93,12 +101,14 @@ skip the entire section if all its fields are null):
    State whether the three scores tell a consistent or contradictory story about financial health.
 
 8. SYNTHESIS — Quantitative Risk/Reward:
-   Close with 2 sentences synthesising DCF, Comps, technicals, and factor scores into a single
+   Close with 2 sentences synthesising DCF (especially the probability-weighted value and
+   implied growth vs. market price), Comps, technicals, and factor scores into a single
    coherent characterisation of the current quantitative risk/reward profile.
-   Example: "The combination of a -11% DCF downside at base case and a +18% premium to sector
-   EV/EBITDA compresses the margin of safety; however, the RSI-neutral technical setup and
-   consecutive EPS beat streak suggest current price levels may be sustained by near-term
-   earnings momentum rather than fundamental value."
+   Example: "The probability-weighted intrinsic value of $X implies Y% upside, but the reverse
+   DCF reveals the market is pricing in Z% revenue CAGR — above the base-case assumption —
+   leaving limited margin of safety; the RSI-neutral setup and consecutive EPS beat streak
+   suggest the premium is being sustained by near-term earnings momentum rather than
+   fundamental value expansion."
 
 Respond with the narrative text ONLY. No preamble. No headers. No postamble.
 """.strip()

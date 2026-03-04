@@ -46,7 +46,7 @@ class BusinessAnalystConfig:
     llm_provider: str = field(default_factory=lambda: os.getenv("BUSINESS_ANALYST_LLM_PROVIDER", "ollama"))
     llm_model: str = field(default_factory=lambda: os.getenv("BUSINESS_ANALYST_MODEL", os.getenv("LLM_MODEL_BUSINESS_ANALYST", "deepseek-r1:8b")))
     llm_temperature: float = field(default_factory=lambda: float(os.getenv("BUSINESS_ANALYST_TEMPERATURE", "0.2")))
-    llm_max_tokens: int = field(default_factory=lambda: int(os.getenv("BUSINESS_ANALYST_MAX_TOKENS", "3000")))
+    llm_max_tokens: int = field(default_factory=lambda: int(os.getenv("BUSINESS_ANALYST_MAX_TOKENS", "6000")))
     ollama_base_url: str = field(default_factory=lambda: os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"))
 
     # Neo4j chunk ingestion embedding model.

@@ -54,7 +54,7 @@ TICKERS = ["AAPL", "MSFT", "GOOGL", "TSLA", "NVDA"]
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 PRIMARY_MODEL   = os.getenv("CHUNK_SYNTH_MODEL", "qwen2.5:7b")
 FALLBACK_MODEL  = "deepseek-r1:8b"
-LLM_TIMEOUT     = 180  # seconds per LLM call
+LLM_TIMEOUT     = None  # no timeout — let the request complete
 
 # Embedding
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"

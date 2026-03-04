@@ -459,11 +459,50 @@ def _node_calculate_value_factors(state: AgentState) -> AgentState:
 # Node 5: calculate_quality_factors
 # ---------------------------------------------------------------------------
 
-def _node_calculate_quality_factors(state: AgentState) -> AgentState:
+def _node_calculate_quality_factors(
+    state: AgentState,
+    toolkit: QuantFundamentalToolkit,
+) -> AgentState:
+    """Compute Piotroski F-Score, Beneish M-Score, Altman Z-Score, ROE, ROIC.
+
+    3A: First attempts to read pre-computed scores from the
+    ``mv_daily_factor_scores`` PostgreSQL materialized view (populated nightly
+    by a REFRESH job).  Falls back to in-memory computation from the
+    FinancialsBundle when the MV is empty or not yet populated.
+    """
     bundle: Optional[FinancialsBundle] = state.get("bundle")
     if bundle is None:
         return {**state, "quality_factors": QualityFactors(), "key_metrics": KeyMetrics()}
 
+    ticker = bundle.ticker
+
+    # --- 3A: Try materialized view first ---
+    mv_row = toolkit.pg.fetch_factor_scores_from_mv(ticker)
+    if mv_row is not None:
+        logger.info("[QF] Using mv_daily_factor_scores for ticker=%s (as_of=%s)", ticker, mv_row.get("as_of_date"))
+        _piotroski_raw = _float_or_none(mv_row.get("piotroski_score"))
+        quality = QualityFactors(
+            piotroski_f_score=int(_piotroski_raw) if _piotroski_raw is not None else None,
+            beneish_m_score=_float_or_none(mv_row.get("beneish_m_score")),
+            altman_z_score=_float_or_none(mv_row.get("altman_z_score")),
+            roe=_float_or_none(mv_row.get("roe_ttm")),
+            roic=_float_or_none(mv_row.get("roic_ttm")),
+        )
+        km_dict = {
+            "roe": _float_or_none(mv_row.get("roe_ttm")),
+            "roa": _float_or_none(mv_row.get("roa_ttm")),
+            "roic": _float_or_none(mv_row.get("roic_ttm")),
+            "gross_margin": _float_or_none(mv_row.get("gross_margin_ttm")),
+            "net_margin": _float_or_none(mv_row.get("net_margin_ttm")),
+            "debt_to_equity": _float_or_none(mv_row.get("debt_to_equity_ttm")),
+            "current_ratio": _float_or_none(mv_row.get("current_ratio_ttm")),
+        }
+        key_metrics = KeyMetrics(**{k: v for k, v in km_dict.items() if v is not None})
+        logger.debug("quality_factors from MV for %s: %s", ticker, quality.to_dict())
+        return {**state, "quality_factors": quality, "key_metrics": key_metrics}
+
+    # --- Fallback: compute in-memory from FinancialsBundle ---
+    logger.info("[QF] MV empty for ticker=%s — computing quality factors in-memory", ticker)
     inc_prev = state.get("inc_prev") or {}
     bal_prev = state.get("bal_prev") or {}
     cf_prev = state.get("cf_prev") or {}
@@ -477,8 +516,18 @@ def _node_calculate_quality_factors(state: AgentState) -> AgentState:
     km_dict = compute_key_metrics_quality(bundle)
     key_metrics = KeyMetrics(**km_dict)
 
-    logger.debug("quality_factors for %s: %s", bundle.ticker, quality.to_dict())
+    logger.debug("quality_factors (in-memory) for %s: %s", ticker, quality.to_dict())
     return {**state, "quality_factors": quality, "key_metrics": key_metrics}
+
+
+def _float_or_none(val: Any) -> Optional[float]:
+    """Safe cast to float, returning None on failure."""
+    if val is None:
+        return None
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -803,8 +852,51 @@ def _node_format_json_output(
 
 
 # ---------------------------------------------------------------------------
-# Graph builder
+# Node 3B: execute_python — code-generating ReAct
 # ---------------------------------------------------------------------------
+
+def _node_execute_python(
+    state: AgentState,
+    toolkit: QuantFundamentalToolkit,
+) -> AgentState:
+    """Execute an LLM-generated pandas/Python snippet against the FinancialsBundle.
+
+    3B: Code-Generating ReAct — when the user asks for a non-standard metric
+    the ``format_json_output`` node can embed a ``custom_metric_code`` key in
+    the output dict containing a Python snippet.  This node detects that key,
+    executes the snippet in the sandboxed ``execute_python_on_bundle`` helper,
+    and appends the result to ``output["custom_metric_result"]``.
+
+    The code snippet MUST assign its final value to the variable ``result``.
+    Example snippet (written by the LLM):
+        import pandas as pd
+        prices = [row['close'] for row in bundle.price_history]
+        s = pd.Series(prices)
+        result = float(s.pct_change(30).iloc[-1]) if len(s) > 30 else None
+    """
+    output: Optional[Dict[str, Any]] = state.get("output")
+    bundle: Optional[FinancialsBundle] = state.get("bundle")
+
+    if output is None or bundle is None:
+        return state
+
+    code = output.get("custom_metric_code")
+    if not code or not isinstance(code, str):
+        return state
+
+    logger.info("[QF] execute_python: running custom metric code for ticker=%s", bundle.ticker)
+    exec_result = toolkit.execute_python(code, bundle)
+
+    updated_output = dict(output)
+    if exec_result.get("success"):
+        updated_output["custom_metric_result"] = exec_result.get("result")
+        updated_output["custom_metric_stdout"] = exec_result.get("stdout", "")
+        logger.info("[QF] execute_python result: %s", exec_result.get("result"))
+    else:
+        updated_output["custom_metric_error"] = exec_result.get("error")
+        logger.warning("[QF] execute_python failed: %s", exec_result.get("error"))
+
+    return {**state, "output": updated_output}
 
 def build_graph(
     toolkit: QuantFundamentalToolkit,
@@ -833,7 +925,7 @@ def build_graph(
     )
     graph.add_node(
         "calculate_quality_factors",
-        lambda state: _node_calculate_quality_factors(cast(AgentState, state)),
+        lambda state: _node_calculate_quality_factors(cast(AgentState, state), toolkit),
     )
     graph.add_node(
         "calculate_momentum_risk",
@@ -847,11 +939,15 @@ def build_graph(
         "format_json_output",
         lambda state: _node_format_json_output(cast(AgentState, state), llm),
     )
+    graph.add_node(
+        "execute_python",
+        lambda state: _node_execute_python(cast(AgentState, state), toolkit),
+    )
 
     # Entry point
     graph.set_entry_point("fetch_financials")
 
-    # Linear pipeline — no branching
+    # Linear pipeline — no branching through most nodes
     graph.add_edge("fetch_financials", "chain_of_table_reasoning")
     graph.add_edge("chain_of_table_reasoning", "data_quality_check")
     graph.add_edge("data_quality_check", "calculate_value_factors")
@@ -859,7 +955,17 @@ def build_graph(
     graph.add_edge("calculate_quality_factors", "calculate_momentum_risk")
     graph.add_edge("calculate_momentum_risk", "flag_anomalies")
     graph.add_edge("flag_anomalies", "format_json_output")
-    graph.add_edge("format_json_output", END)
+    # 3B: Conditional edge — run execute_python only when custom_metric_code present
+    graph.add_conditional_edges(
+        "format_json_output",
+        lambda state: (
+            "execute_python"
+            if (state.get("output") or {}).get("custom_metric_code")
+            else END
+        ),
+        {"execute_python": "execute_python", END: END},
+    )
+    graph.add_edge("execute_python", END)
 
     return graph.compile()
 

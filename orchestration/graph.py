@@ -7,8 +7,8 @@ Architecture (default — parallel dispatch + ReAct loop):
       │                   │                                                       │
       ▼                   │  planner (llama3.2:latest)                            │
   [planner]  ─────────────┼──► decides: ticker, which agents, complexity (1-3)   │
-      │                   │                                                       │
-      ▼                   │  parallel_agents  (ThreadPoolExecutor)               │
+      │                   │    also queries episodic_memory for known failures     │
+      ▼                   │                                                       │
   [parallel_agents] ──────┼──► BA + QF + FM + WS run concurrently               │◄─┐
       │                   │    wall-clock = max(T_BA, T_QF, T_FM, T_WS)          │  │
       ▼                   │                                                       │  │ loop if
@@ -18,7 +18,10 @@ Architecture (default — parallel dispatch + ReAct loop):
       │  (done)           │                                                       │
       ▼                   │  summarizer (deepseek-r1:8b)                          │
   [summarizer] (deepseek) │                                                       │
-      │                   └──────────────────────────────────────────────────────┘
+      │                   │  memory_update                                        │
+      ▼                   │  persists failure patterns to agent_episodic_memory   │
+  [memory_update]         └──────────────────────────────────────────────────────┘
+      │
       ▼
    output dict / final_summary
 
@@ -28,9 +31,6 @@ ReAct loop behaviour:
   - complexity 3 → max 3 passes (full report: up to two retries on gaps/errors)
   - On each loop iteration only agents with NO output yet (gaps) or errors are re-run.
     A successful agent is never re-executed.
-
-The legacy sequential ReAct graph (build_sequential_graph) is preserved for
-debugging and is accessible via the ORCHESTRATION_SEQUENTIAL=1 env var.
 
 Usage:
     from orchestration.graph import build_graph, run
@@ -42,10 +42,10 @@ Usage:
 from __future__ import annotations
 
 import logging
-import os
 import sys
+import uuid
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 # Ensure the repo root is on sys.path so agent imports work regardless of cwd
 _REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -55,23 +55,20 @@ if str(_REPO_ROOT) not in sys.path:
 from langgraph.graph import END, StateGraph
 
 from .nodes import (
-    node_business_analyst,
-    node_financial_modelling,
+    node_memory_update,
     node_parallel_agents,
     node_planner,
-    node_quant_fundamental,
     node_react_check,
     node_summarizer,
-    node_web_search,
+    subscribe_agent_progress,
+    unsubscribe_agent_progress,
 )
 from .state import OrchestrationState
 
 logger = logging.getLogger(__name__)
 
-_MAX_REACT_ITERATIONS = 6  # safety cap — legacy sequential path only
 
-
-# ── Parallel graph (default) ──────────────────────────────────────────────────
+# ── Parallel graph ────────────────────────────────────────────────────────────
 
 def _should_loop(state: OrchestrationState) -> str:
     """Conditional edge router after react_check.
@@ -104,10 +101,13 @@ def _should_loop(state: OrchestrationState) -> str:
     # No gaps — proceed to summarizer regardless of remaining iterations
     return "summarizer"
 
+
 def build_graph() -> Any:
     """Assemble and compile the parallel orchestration LangGraph with ReAct loop.
 
-    Topology: planner → parallel_agents → react_check → (parallel_agents | summarizer) → END
+    Topology:
+      planner → parallel_agents → react_check → (parallel_agents | summarizer)
+              → memory_update → END
 
     All enabled agents (BA, QF, FM, WS) run concurrently inside
     ``node_parallel_agents`` via a ThreadPoolExecutor.  After each pass,
@@ -117,6 +117,9 @@ def build_graph() -> Any:
     the graph loops back to ``node_parallel_agents`` to retry only the gap agents.
     Otherwise it advances to the summarizer.
 
+    After the summarizer, ``node_memory_update`` persists any failure patterns
+    to the ``agent_episodic_memory`` PostgreSQL table for future pre-emption.
+
     Returns a compiled StateGraph ready to call with .invoke() or .stream().
     """
     graph = StateGraph(OrchestrationState)
@@ -125,6 +128,7 @@ def build_graph() -> Any:
     graph.add_node("parallel_agents",  node_parallel_agents)
     graph.add_node("react_check",      node_react_check)
     graph.add_node("summarizer",       node_summarizer)
+    graph.add_node("memory_update",    node_memory_update)
 
     graph.set_entry_point("planner")
     graph.add_edge("planner",          "parallel_agents")
@@ -139,100 +143,9 @@ def build_graph() -> Any:
         },
     )
 
-    graph.add_edge("summarizer", END)
+    graph.add_edge("summarizer",       "memory_update")
+    graph.add_edge("memory_update",    END)
 
-    return graph.compile()
-
-
-# ── Legacy sequential ReAct graph (debug / fallback) ─────────────────────────
-
-def _react_dispatch(state: OrchestrationState) -> OrchestrationState:
-    """No-op pass-through node; routing logic is in conditional edges."""
-    return state
-
-
-def _route_from_dispatch(state: OrchestrationState) -> str:
-    """Fan-out: pick the first enabled agent not yet done (priority order)."""
-    if state.get("run_business_analyst") and not state.get("business_analyst_outputs"):
-        return "business_analyst"
-    if state.get("run_quant_fundamental") and not state.get("quant_fundamental_outputs"):
-        return "quant_fundamental"
-    if state.get("run_web_search") and not state.get("web_search_outputs"):
-        return "web_search"
-    if state.get("run_financial_modelling") and not state.get("financial_modelling_outputs"):
-        return "financial_modelling"
-    return "summarizer"
-
-
-def _route_after_agent(state: OrchestrationState) -> str:
-    """After an agent completes, loop back or proceed to summarizer."""
-    ba_needed = state.get("run_business_analyst") and not state.get("business_analyst_outputs")
-    qf_needed = state.get("run_quant_fundamental") and not state.get("quant_fundamental_outputs")
-    ws_needed = state.get("run_web_search") and not state.get("web_search_outputs")
-    fm_needed = state.get("run_financial_modelling") and not state.get("financial_modelling_outputs")
-
-    if ba_needed or qf_needed or ws_needed or fm_needed:
-        iteration = (state.get("react_iteration") or 0) + 1
-        if iteration >= _MAX_REACT_ITERATIONS:
-            logger.warning(
-                "[react_check] Max iterations reached (%d) — proceeding to summarizer.", iteration
-            )
-            return "summarizer"
-        return "react_dispatch"
-    return "summarizer"
-
-
-def _increment_iteration(state: OrchestrationState) -> OrchestrationState:
-    return {**state, "react_iteration": (state.get("react_iteration") or 0) + 1}
-
-
-def build_sequential_graph() -> Any:
-    """Build the legacy sequential ReAct graph (one agent at a time).
-
-    Useful for debugging individual agent failures without parallelism.
-    Enable with the env var: ORCHESTRATION_SEQUENTIAL=1
-    """
-    graph = StateGraph(OrchestrationState)
-
-    graph.add_node("planner",              node_planner)
-    graph.add_node("react_dispatch",       _react_dispatch)
-    graph.add_node("business_analyst",     node_business_analyst)
-    graph.add_node("quant_fundamental",    node_quant_fundamental)
-    graph.add_node("web_search",           node_web_search)
-    graph.add_node("financial_modelling",  node_financial_modelling)
-    graph.add_node("react_check",          _increment_iteration)
-    graph.add_node("summarizer",           node_summarizer)
-
-    graph.set_entry_point("planner")
-    graph.add_edge("planner", "react_dispatch")
-
-    graph.add_conditional_edges(
-        "react_dispatch",
-        _route_from_dispatch,
-        {
-            "business_analyst":    "business_analyst",
-            "quant_fundamental":   "quant_fundamental",
-            "web_search":          "web_search",
-            "financial_modelling": "financial_modelling",
-            "summarizer":          "summarizer",
-        },
-    )
-
-    graph.add_edge("business_analyst",    "react_check")
-    graph.add_edge("quant_fundamental",   "react_check")
-    graph.add_edge("web_search",          "react_check")
-    graph.add_edge("financial_modelling", "react_check")
-
-    graph.add_conditional_edges(
-        "react_check",
-        _route_after_agent,
-        {
-            "react_dispatch": "react_dispatch",
-            "summarizer":     "summarizer",
-        },
-    )
-
-    graph.add_edge("summarizer", END)
     return graph.compile()
 
 
@@ -245,12 +158,7 @@ _compiled_graph: Any = None
 def _get_graph() -> Any:
     global _compiled_graph
     if _compiled_graph is None:
-        use_sequential = os.getenv("ORCHESTRATION_SEQUENTIAL", "").strip() in ("1", "true", "yes")
-        if use_sequential:
-            logger.info("[orchestration] Using legacy sequential ReAct graph (ORCHESTRATION_SEQUENTIAL=1).")
-            _compiled_graph = build_sequential_graph()
-        else:
-            _compiled_graph = build_graph()
+        _compiled_graph = build_graph()
     return _compiled_graph
 
 
@@ -297,10 +205,21 @@ def stream(
     Yields (node_name, partial_state_dict) tuples as each node completes.
     Useful for streaming live progress to the Streamlit UI.
 
-    In the parallel graph the nodes are: planner → parallel_agents → react_check → summarizer.
-    For complexity-1 queries the UI sees exactly four events.  For complexity-2/3 queries,
-    parallel_agents + react_check may repeat before the summarizer fires.
+    The first yielded tuple is always::
+
+        ("__session__", {"session_id": <str>})
+
+    This lets the caller subscribe to the agent progress queue for the session
+    *before* the graph starts running (call subscribe_agent_progress(session_id)
+    after receiving this first event).
+
+    In the parallel graph the nodes are:
+      planner → parallel_agents → react_check → summarizer → memory_update.
+    For complexity-1 queries the UI sees exactly five node events.  For
+    complexity-2/3 queries, parallel_agents + react_check may repeat.
     """
+    if not session_id:
+        session_id = str(uuid.uuid4())[:12]
     graph = _get_graph()
     initial_state: OrchestrationState = {
         "user_query": user_query,
@@ -309,6 +228,8 @@ def stream(
         "react_iteration": 0,
         "agent_errors": {},
     }
+    # Yield session_id first so caller can subscribe to the progress queue
+    yield "__session__", {"session_id": session_id}
     for event in graph.stream(initial_state, stream_mode="updates"):
         if not isinstance(event, dict):
             continue
@@ -316,4 +237,4 @@ def stream(
             yield node_name, node_output
 
 
-__all__ = ["build_graph", "build_sequential_graph", "run", "stream"]
+__all__ = ["build_graph", "run", "stream", "subscribe_agent_progress", "unsubscribe_agent_progress"]

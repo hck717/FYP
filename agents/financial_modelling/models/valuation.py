@@ -52,11 +52,14 @@ class CompsEngine:
         enterprise = bundle.enterprise
         income = bundle.income
 
-        result.ev_ebitda = self._ev_ebitda(km_ttm, ratios_ttm, enterprise, income)
+        result.ev_ebitda  = self._ev_ebitda(km_ttm, ratios_ttm, enterprise, income)
+        result.ev_ebit    = self._ev_ebit(km_ttm, enterprise, income)
         result.pe_trailing = self._pe_trailing(km_ttm, ratios_ttm)
-        result.pe_forward = self._pe_forward(bundle)
-        result.ps_ttm = self._ps_ttm(km_ttm, ratios_ttm)
-        result.ev_revenue = self._ev_revenue(km_ttm, ratios_ttm, enterprise, income)
+        result.pe_forward  = self._pe_forward(bundle)
+        result.ps_ttm      = self._ps_ttm(km_ttm, ratios_ttm)
+        result.ev_revenue  = self._ev_revenue(km_ttm, ratios_ttm, enterprise, income)
+        result.p_fcf       = self._p_fcf(km_ttm, bundle)
+        result.peg_ratio   = self._peg_ratio(result.pe_trailing, bundle)
 
         # ── Peer median multiples ────────────────────────────────────────────
         peer_ev_ebitdas: List[float] = []
@@ -187,6 +190,94 @@ class CompsEngine:
         v2 = _safe_float(km_ttm.get("evToSalesTTM"))
         if v2 is not None and v2 > 0:
             return round(v2, 2)
+        return None
+
+    def _ev_ebit(
+        self,
+        km_ttm: Dict[str, Any],
+        enterprise: Dict[str, Any],
+        income: Dict[str, Any],
+    ) -> Optional[float]:
+        """EV / EBIT — pure operating multiple (excludes D&A from denominator vs EV/EBITDA)."""
+        ev = _safe_float(enterprise.get("enterpriseValue") or enterprise.get("enterpriseValueTTM"))
+        ebit = _safe_float(
+            income.get("ebit")
+            or income.get("operatingIncome")
+            or km_ttm.get("ebitTTM")
+        )
+        if ev and ebit and ebit > 0:
+            return round(ev / ebit, 2)
+        return None
+
+    def _p_fcf(
+        self,
+        km_ttm: Dict[str, Any],
+        bundle: FMDataBundle,
+    ) -> Optional[float]:
+        """P/FCF = Market Cap / Free Cash Flow to Firm."""
+        # Try pre-computed TTM ratio
+        v = _safe_float(km_ttm.get("priceToFreeCashFlowsRatioTTM") or km_ttm.get("pfcfRatioTTM"))
+        if v is not None and v > 0:
+            return round(v, 2)
+        # Compute from components
+        market_cap = _safe_float(
+            bundle.enterprise.get("marketCapitalization")
+            or km_ttm.get("marketCap")
+            or km_ttm.get("marketCapTTM")
+        )
+        fcff = _safe_float(
+            bundle.cashflow.get("freeCashFlowToFirm")
+            or km_ttm.get("freeCashFlowToFirmTTM")
+            or km_ttm.get("freeCashFlowPerShareTTM")
+        )
+        if market_cap and fcff and fcff > 0:
+            return round(market_cap / fcff, 2)
+        return None
+
+    def _peg_ratio(
+        self,
+        pe_trailing: Optional[float],
+        bundle: FMDataBundle,
+    ) -> Optional[float]:
+        """PEG Ratio = P/E ÷ (expected EPS growth rate × 100).
+
+        Uses analyst EPS estimates to derive forward EPS growth rate.
+        PEG < 1 = potentially undervalued relative to growth; > 2 = expensive relative to growth.
+        """
+        if pe_trailing is None or pe_trailing <= 0:
+            return None
+
+        estimates = bundle.analyst_estimates
+        if not estimates or len(estimates) < 1:
+            return None
+
+        # Derive EPS growth rate from analyst estimate vs. trailing EPS
+        est = estimates[0] if isinstance(estimates[0], dict) else {}
+        fwd_eps = _safe_float(
+            est.get("estimatedEpsAvg")
+            or est.get("estimatedEPS")
+            or est.get("epsEstimated")
+        )
+        # Trailing EPS: derive from P/E and current price if available
+        current_price = _safe_float(
+            bundle.key_metrics_ttm.get("stockPriceTTM")
+            or bundle.ratios_ttm.get("stockPriceTTM")
+        )
+        if (current_price is None or current_price <= 0) and bundle.price_history:
+            row = bundle.price_history[0]
+            current_price = _safe_float(
+                row.get("adjusted_close") or row.get("adjClose") or row.get("close")
+            )
+
+        trailing_eps = (current_price / pe_trailing) if current_price and pe_trailing > 0 else None
+
+        if fwd_eps and trailing_eps and trailing_eps > 0:
+            eps_growth_rate = (fwd_eps - trailing_eps) / trailing_eps  # as decimal
+            if eps_growth_rate > 0:
+                # PEG = P/E ÷ (EPS growth % per year)
+                peg = pe_trailing / (eps_growth_rate * 100)
+                return round(peg, 2)
+
         return None
 
 

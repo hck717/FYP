@@ -62,6 +62,12 @@ class OrchestrationState(TypedDict, total=False):
     # and the summarizer to avoid dead code-paths and surface data gaps.
     data_availability: Optional[Dict[str, Any]]
 
+    # ── Episodic memory hints ─────────────────────────────────────────────────
+    # Populated by node_planner from agent_episodic_memory table lookups.
+    # Keys: force_web_search (bool), degraded_agents (List[str]).
+    # Used to pre-empt known failure patterns before agents are dispatched.
+    episodic_hints: Optional[Dict[str, Any]]
+
     # ── Errors ───────────────────────────────────────────────────────────────
     agent_errors: Dict[str, str]            # {agent_name: error_message}
 

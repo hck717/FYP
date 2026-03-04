@@ -370,10 +370,10 @@ class TechnicalEngine:
             bearish_signals += 1
 
         if bullish_signals > bearish_signals + 1:
-            return "bullish"
+            return "BULLISH"
         elif bearish_signals > bullish_signals + 1:
-            return "bearish"
-        return "neutral"
+            return "BEARISH"
+        return "NEUTRAL"
 
 
 __all__ = ["TechnicalEngine"]

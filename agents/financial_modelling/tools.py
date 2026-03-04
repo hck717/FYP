@@ -401,6 +401,55 @@ class FMDataFetcher:
                 # marketCap from key_metrics_ttm uses key "marketCap"
                 if not bundle.enterprise.get("marketCapitalization"):
                     bundle.enterprise["marketCapitalization"] = bundle.key_metrics_ttm.get("marketCap")
+
+                # ── Populate cashflow from TTM metrics (no cashflow_statement in DB) ──
+                # freeCashFlowToFirmTTM is FCFF = NOPAT - net capex; use as OCF proxy
+                # for the DCF engine's base_fcf calculation.
+                fcff = _safe_float(bundle.key_metrics_ttm.get("freeCashFlowToFirmTTM"))
+                capex_to_rev = _safe_float(bundle.key_metrics_ttm.get("capexToRevenueTTM"))
+                revenue = _safe_float(bundle.income.get("revenue")) if bundle.income else None
+                if fcff is not None and fcff > 0:
+                    # Reconstruct OCF and capex from FCFF and capex/revenue ratio
+                    # FCFF ≈ OCF - capex (levered: FCFE = FCFF - interest*(1-t) + net debt changes)
+                    # For DCF purposes, treat FCFF directly as operating free cash flow
+                    capex_abs = (capex_to_rev * revenue) if (capex_to_rev and revenue) else 0.0
+                    bundle.cashflow = {
+                        "operatingCashFlow": fcff + capex_abs,  # back-derive OCF from FCFF + capex
+                        "capitalExpenditure": -abs(capex_abs),  # negative convention (outflow)
+                        "freeCashFlowToFirm": fcff,
+                    }
+                elif not bundle.cashflow:
+                    # No FCFF available — populate capex from capex/revenue ratio at least
+                    if capex_to_rev and revenue:
+                        capex_abs = capex_to_rev * revenue
+                        bundle.cashflow = {
+                            "operatingCashFlow": None,
+                            "capitalExpenditure": -abs(capex_abs),
+                        }
+
+                # ── Overlay actual EBIT margin onto income so DCF scenarios are anchored ──
+                # ebit and revenue are available from financial_scores; compute margin here.
+                if bundle.income and bundle.income.get("ebit") and bundle.income.get("revenue"):
+                    ebit_margin = bundle.income["ebit"] / bundle.income["revenue"]
+                    bundle.income["ebitMargin"] = round(ebit_margin, 6)
+
+                # ── Derive net debt from EV - market cap and inject into balance ──
+                # This provides the equity bridge in the DCF without needing a
+                # cashflow statement or balance sheet line items.
+                ev_ttm = _safe_float(bundle.key_metrics_ttm.get("enterpriseValueTTM"))
+                mkt_cap_ttm = _safe_float(bundle.key_metrics_ttm.get("marketCap"))
+                if ev_ttm and mkt_cap_ttm and ev_ttm > 0 and mkt_cap_ttm > 0:
+                    # Net Debt = EV - Market Cap (positive = net debt, negative = net cash)
+                    net_debt = ev_ttm - mkt_cap_ttm
+                    if bundle.balance is not None:
+                        if net_debt >= 0:
+                            # Net debtor: separate total_debt / cash aren't needed for EV→equity bridge
+                            bundle.balance["totalDebt"] = net_debt
+                            bundle.balance["cashAndCashEquivalents"] = 0.0
+                        else:
+                            # Net cash position
+                            bundle.balance["totalDebt"] = 0.0
+                            bundle.balance["cashAndCashEquivalents"] = abs(net_debt)
         except Exception as exc:
             logger.warning("key_metrics_ttm fetch failed for %s: %s", ticker, exc)
 

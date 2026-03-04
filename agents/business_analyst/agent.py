@@ -72,6 +72,7 @@ class AgentState(TypedDict, total=False):
     # Enrichment
     sentiment: Optional[SentimentSnapshot]
     company_node: Optional[Dict[str, Any]]   # raw Neo4j Company node properties
+    community_summary: Optional[str]         # graph-community summary (2A: Graph RAG)
     retrieval: Optional[RetrievalResult]
     rewrite_count: int          # guard: max 1 rewrite loop
 
@@ -94,14 +95,18 @@ class AgentState(TypedDict, total=False):
 
 def _node_fetch_sentiment(state: AgentState, toolkit: BusinessAnalystToolkit) -> AgentState:
     """Fetch bullish/bearish/neutral % from PostgreSQL sentiment_trends.
-    Also fetches the Company node properties from Neo4j for company_overview.
+    Also fetches the Company node properties from Neo4j for company_overview,
+    and builds a graph-community summary (2A: Graph RAG).
     """
     ticker = state.get("ticker")
     sentiment = toolkit.fetch_sentiment(ticker)
     if sentiment is None:
         logger.info("No sentiment data found for ticker=%s", ticker)
     company_node = toolkit.fetch_company_overview(ticker)
-    return {**state, "sentiment": sentiment, "company_node": company_node}
+    community_summary = toolkit.fetch_community_summary(ticker)
+    if community_summary:
+        logger.info("[BA] Graph community summary for %s: %s", ticker, community_summary[:120])
+    return {**state, "sentiment": sentiment, "company_node": company_node, "community_summary": community_summary}
 
 
 def _node_hybrid_retrieval(state: AgentState, toolkit: BusinessAnalystToolkit) -> AgentState:
@@ -170,6 +175,7 @@ def _node_generate_analysis(state: AgentState, llm: LLMClient) -> AgentState:
     sentiment: Optional[SentimentSnapshot] = state.get("sentiment")
     task = state.get("task", "")
     ticker = state.get("ticker", "")
+    community_summary: Optional[str] = state.get("community_summary")
 
     chunks = retrieval.chunks if retrieval else []
     graph_facts = retrieval.graph_facts if retrieval else []
@@ -236,12 +242,32 @@ def _node_generate_analysis(state: AgentState, llm: LLMClient) -> AgentState:
         facts_json = json.dumps(graph_facts[:25], indent=2)
         context_parts.append(f"=== GRAPH FACTS (Neo4j: Company relationships) ===\n{facts_json}\n")
 
+    # Graph community summary (2A: Graph RAG — relationship-count centrality)
+    if community_summary:
+        context_parts.append(
+            f"=== GRAPH COMMUNITY SUMMARY (Neo4j: relationship centrality) ===\n"
+            f"{community_summary}\n"
+            f"(Use this to understand the company's most prominent strategic/risk/competitive links)\n"
+        )
+
     # Top retrieved document chunks with explicit chunk IDs for citation
+    # 2B: Separate recent vs historical chunks for contrastive analysis
+    recent_chunks = [c for c in chunks[:7] if (c.metadata or {}).get("temporal_band") == "recent"]
+    historical_chunks = [c for c in chunks[:7] if (c.metadata or {}).get("temporal_band") == "historical"]
+    other_chunks = [c for c in chunks[:7] if (c.metadata or {}).get("temporal_band") not in ("recent", "historical")]
+
     if chunks:
         context_parts.append(f"=== RETRIEVED DOCUMENT CHUNKS (cite these IDs in your analysis) ===")
-        for chunk in chunks[:7]:  # top 7 chunks — balances context quality vs prompt size
+        if recent_chunks or historical_chunks:
             context_parts.append(
-                f"\n[chunk_id: {chunk.chunk_id}] (relevance={chunk.score:.3f}, source={chunk.source})\n"
+                "(2B: Chunks are tagged by recency. Where both RECENT and HISTORICAL chunks exist, "
+                "analyse the *delta* — what has changed and what the trend implies.)"
+            )
+        for chunk in chunks[:7]:
+            band = (chunk.metadata or {}).get("temporal_band", "")
+            band_label = f", temporal={band}" if band else ""
+            context_parts.append(
+                f"\n[chunk_id: {chunk.chunk_id}] (relevance={chunk.score:.3f}, source={chunk.source}{band_label})\n"
                 f"{chunk.text[:900]}"  # 900 chars per chunk
             )
 
