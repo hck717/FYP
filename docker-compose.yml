@@ -7,79 +7,70 @@ x-airflow-common:
     dockerfile: airflow.Dockerfile
   environment:
     &airflow-common-env
-    # Airflow Core (from .env)
-    AIRFLOW__CORE__EXECUTOR: ${AIRFLOW__CORE__EXECUTOR}
-    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: ${AIRFLOW__DATABASE__SQL_ALCHEMY_CONN}
-    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: ${AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION}
-    AIRFLOW__CORE__LOAD_EXAMPLES: ${AIRFLOW__CORE__LOAD_EXAMPLES}
-    AIRFLOW__CORE__ENABLE_XCOM_PICKLING: ${AIRFLOW__CORE__ENABLE_XCOM_PICKLING}
-    AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW__WEBSERVER__SECRET_KEY}
-    AIRFLOW_UID: ${AIRFLOW_UID}
-    AIRFLOW__WEBSERVER__WORKERS: ${AIRFLOW__WEBSERVER__WORKERS:-2}
-    AIRFLOW__WEBSERVER__WEB_SERVER_MASTER_TIMEOUT: ${AIRFLOW__WEBSERVER__WEB_SERVER_MASTER_TIMEOUT:-300}
-    AIRFLOW__WEBSERVER__WEB_SERVER_WORKER_TIMEOUT: ${AIRFLOW__WEBSERVER__WEB_SERVER_WORKER_TIMEOUT:-300}
-    AIRFLOW__CORE__PARALLELISM: ${AIRFLOW__CORE__PARALLELISM:-4}
-    AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG: ${AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG:-4}
-    AIRFLOW__CORE__MAX_ACTIVE_RUNS_PER_DAG: ${AIRFLOW__CORE__MAX_ACTIVE_RUNS_PER_DAG:-1}
+    # ───────────────────────────────────────────────
+    # Airflow core settings – fully hard-coded
+    # ───────────────────────────────────────────────
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: true
+    AIRFLOW__CORE__LOAD_EXAMPLES: false
+    AIRFLOW__CORE__ENABLE_XCOM_PICKLING: true
+    AIRFLOW__WEBSERVER__SECRET_KEY: f62540e0e9039f824adca35b71f2a132658e9fb3dc09372cd0ce4d48f1210c29
+    AIRFLOW_UID: 50000
+    AIRFLOW__WEBSERVER__WORKERS: 2
+    AIRFLOW__WEBSERVER__WEB_SERVER_MASTER_TIMEOUT: 300
+    AIRFLOW__WEBSERVER__WEB_SERVER_WORKER_TIMEOUT: 300
+    AIRFLOW__CORE__PARALLELISM: 4
+    AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG: 4
+    AIRFLOW__CORE__MAX_ACTIVE_RUNS_PER_DAG: 1
 
-    # API Keys (from .env) - Passed to DAGs
-    FMP_API_KEY: ${FMP_API_KEY}
-    EODHD_API_KEY: ${EODHD_API_KEY}
-    FRED_API_KEY: ${FRED_API_KEY}
-    REDDIT_CLIENT_ID: ${REDDIT_CLIENT_ID}
-    REDDIT_CLIENT_SECRET: ${REDDIT_CLIENT_SECRET}
-    REDDIT_USER_AGENT: ${REDDIT_USER_AGENT}
+    # Airflow web user (for init)
+    AIRFLOW_WWW_USER_USERNAME: admin
+    AIRFLOW_WWW_USER_PASSWORD: admin
 
-    # Database Connections (from .env)
-    POSTGRES_HOST: ${POSTGRES_HOST}
-    POSTGRES_PORT: ${POSTGRES_PORT}
-    POSTGRES_USER: ${POSTGRES_USER}
-    POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-    POSTGRES_DB: ${POSTGRES_DB}
-    QDRANT_HOST: ${QDRANT_HOST}
-    QDRANT_PORT: ${QDRANT_PORT}
-    QDRANT_COLLECTION_NAME: ${QDRANT_COLLECTION_NAME}
-    NEO4J_URI: ${NEO4J_URI}
-    NEO4J_USER: ${NEO4J_USER}
-    NEO4J_PASSWORD: ${NEO4J_PASSWORD}
-    NEO4J_HOST: ${NEO4J_HOST}
-    NEO4J_PORT: ${NEO4J_PORT}
+    # ───────────────────────────────────────────────
+    # Postgres – fully hard-coded to match connection string
+    # ───────────────────────────────────────────────
+    POSTGRES_USER: airflow
+    POSTGRES_PASSWORD: airflow
+    POSTGRES_DB: airflow
 
-    # LLM Configuration (from .env) - Passed to DAGs
-    OLLAMA_BASE_URL: ${OLLAMA_BASE_URL}
-    OLLAMA_HOST: ${OLLAMA_HOST}
-    OLLAMA_PORT: ${OLLAMA_PORT}
-    LLM_MODEL_BUSINESS_ANALYST: ${LLM_MODEL_BUSINESS_ANALYST}
-    LLM_MODEL_QUANTITATIVE: ${LLM_MODEL_QUANTITATIVE}
-    LLM_MODEL_FINANCIAL_MODELING: ${LLM_MODEL_FINANCIAL_MODELING}
-    EMBEDDING_MODEL: ${EMBEDDING_MODEL}
-    EMBEDDING_DIMENSION: ${EMBEDDING_DIMENSION}
+    # Neo4j – fully hard-coded auth
+    NEO4J_AUTH: neo4j/SecureNeo4jPass2025!
 
-    # Agent Settings (from .env) - Passed to DAGs
-    BUSINESS_ANALYST_MAX_CHUNKS: ${BUSINESS_ANALYST_MAX_CHUNKS}
-    BUSINESS_ANALYST_CHUNK_SIZE: ${BUSINESS_ANALYST_CHUNK_SIZE}
-    BUSINESS_ANALYST_OVERLAP: ${BUSINESS_ANALYST_OVERLAP}
-    QUANT_AGENT_SQL_TIMEOUT: ${QUANT_AGENT_SQL_TIMEOUT}
-    QUANT_AGENT_VERIFICATION_THRESHOLD: ${QUANT_AGENT_VERIFICATION_THRESHOLD}
-    FIN_MODEL_DCF_DISCOUNT_RATE: ${FIN_MODEL_DCF_DISCOUNT_RATE}
-    FIN_MODEL_TERMINAL_GROWTH_RATE: ${FIN_MODEL_TERMINAL_GROWTH_RATE}
-    RERANKER_MODEL: ${RERANKER_MODEL:-cross-encoder/ms-marco-MiniLM-L-6-v2}
-    CRAG_CORRECT_THRESHOLD: ${CRAG_CORRECT_THRESHOLD:-0.7}
-    CRAG_AMBIGUOUS_THRESHOLD: ${CRAG_AMBIGUOUS_THRESHOLD:-0.5}
-    RAG_TOP_K: ${RAG_TOP_K:-8}
-    RAG_SCORE_THRESHOLD: ${RAG_SCORE_THRESHOLD:-0.6}
-    QDRANT_EMBEDDING_MODEL: ${QDRANT_EMBEDDING_MODEL:-nomic-embed-text}
-    QDRANT_EMBEDDING_DIMENSION: ${QDRANT_EMBEDDING_DIMENSION:-768}
+    # API keys (using the values you provided earlier)
+    FMP_API_KEY: 6kqjitcYPxyr60Xy1Jfem92Q1z9LfCHM
+    EODHD_API_KEY: 6957671cac2858.27368157
 
-    # Ingestion Settings (from .env) - Passed to DAGs
-    TRACKED_TICKERS: ${TRACKED_TICKERS}
-    FMP_RATE_LIMIT: ${FMP_RATE_LIMIT}
-    EODHD_RATE_LIMIT: ${EODHD_RATE_LIMIT}
-    DATA_RETENTION_DAYS: ${DATA_RETENTION_DAYS}
+    # Ollama (Mac/Docker Desktop friendly)
+    OLLAMA_BASE_URL: http://host.docker.internal:11434
+    OLLAMA_HOST: host.docker.internal
+    OLLAMA_PORT: 11434
 
-    # Logging (from .env)
-    LOG_LEVEL: ${LOG_LEVEL}
-    LOG_FORMAT: ${LOG_FORMAT}
+    # LLM & Embedding models (using your earlier values)
+    LLM_MODEL_BUSINESS_ANALYST: llama3.2:3b
+    LLM_MODEL_QUANTITATIVE: llama3.2:3b
+    LLM_MODEL_FINANCIAL_MODELING: llama3.2:3b
+    EMBEDDING_MODEL: nomic-embed-text
+    EMBEDDING_DIMENSION: 768
+
+    # Other common database / agent settings
+    QDRANT_HOST: qdrant
+    QDRANT_PORT: 6333
+    QDRANT_COLLECTION_NAME: financial_docs
+    NEO4J_URI: bolt://neo4j:7687
+    NEO4J_USER: neo4j
+    NEO4J_PASSWORD: SecureNeo4jPass2025!
+    NEO4J_HOST: neo4j
+    NEO4J_PORT: 7687
+
+    BUSINESS_ANALYST_MAX_CHUNKS: 50
+    BUSINESS_ANALYST_CHUNK_SIZE: 1000
+    BUSINESS_ANALYST_OVERLAP: 200
+
+    # You can add more agent/ingestion settings here if needed (hard-coded)
+    # QUANT_AGENT_SQL_TIMEOUT: 30
+    # etc.
 
   volumes:
     - ./ingestion/dags:/opt/airflow/dags
@@ -87,15 +78,12 @@ x-airflow-common:
     - ./ingestion/etl:/opt/airflow/etl
     - ./ingestion:/opt/airflow/ingestion
     - ./agents:/opt/airflow/agents
-  env_file:
-    - .env
   depends_on:
     &airflow-common-depends-on
     postgres:
       condition: service_healthy
 
 services:
-  # 1. Vector Database (Qdrant)
   qdrant:
     image: qdrant/qdrant:latest
     container_name: fyp-qdrant
@@ -113,40 +101,37 @@ services:
       timeout: 5s
       retries: 5
 
-  # 2. Structured Database (PostgreSQL)
   postgres:
     image: postgres:15
     container_name: fyp-postgres
     environment:
-      POSTGRES_USER: ${POSTGRES_USER}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
     volumes:
       - ./data/postgres_data:/var/lib/postgresql/data
       - ./docker/init-db.sql:/docker-entrypoint-initdb.d/init-db.sql
     ports:
       - "5432:5432"
-    env_file:
-      - .env
     healthcheck:
-      test: ["CMD", "pg_isready", "-U", "${POSTGRES_USER}"]
+      test: ["CMD", "pg_isready", "-U", "airflow"]
       interval: 5s
       retries: 5
     restart: always
 
-  # 3. Graph Database (Neo4j)
   neo4j:
     image: neo4j:5.15-community
     container_name: fyp-neo4j
     ports:
-      - "${NEO4J_HTTP_PORT}:7474"
-      - "${NEO4J_PORT}:7687"
+      - "7474:7474"
+      - "7687:7687"
     environment:
-      NEO4J_AUTH: "${NEO4J_USER}/${NEO4J_PASSWORD}"
+      NEO4J_AUTH: neo4j/SecureNeo4jPass2025!
+      NEO4J_server_http_listen__address: ":7474"
+      NEO4J_server_bolt_listen__address: ":7687"
       NEO4J_server_memory_heap_initial__size: "256m"
       NEO4J_server_memory_heap_max__size: "512m"
       NEO4J_server_memory_pagecache_size: "256m"
-    # NO env_file here — that's what's injecting NEO4J_PORT and crashing it
     volumes:
       - ./data/neo4j_data:/data
       - ./data/neo4j_logs:/logs
@@ -159,8 +144,6 @@ services:
       timeout: 5s
       retries: 5
 
-
-  # 4. Airflow Webserver
   airflow-webserver:
     <<: *airflow-common
     container_name: fyp-airflow-webserver
@@ -174,14 +157,12 @@ services:
       retries: 5
     restart: always
 
-  # 5. Airflow Scheduler
   airflow-scheduler:
     <<: *airflow-common
     container_name: fyp-airflow-scheduler
     command: scheduler
     restart: always
 
-  # 6. Airflow Initialization
   airflow-init:
     <<: *airflow-common
     container_name: fyp-airflow-init
@@ -191,9 +172,13 @@ services:
       - |
         mkdir -p /opt/airflow/logs /opt/airflow/dags /opt/airflow/etl
         airflow db upgrade
-        airflow users create           --username ${AIRFLOW_WWW_USER_USERNAME}           --password ${AIRFLOW_WWW_USER_PASSWORD}           --firstname Admin           --lastname User           --role Admin           --email admin@example.com || true
-    environment:
-      <<: *airflow-common-env
+        airflow users create \
+          --username admin \
+          --password admin \
+          --firstname Admin \
+          --lastname User \
+          --role Admin \
+          --email admin@example.com || true
     depends_on:
       postgres:
         condition: service_healthy
