@@ -648,6 +648,45 @@ def _sf(val: Any) -> Optional[float]:
         return None
 
 
+def _serialise_price_history(
+    rows: List[Dict[str, Any]], limit: int = 260
+) -> List[Dict[str, Any]]:
+    """Serialise OHLCV rows for Streamlit charts.
+
+    Accepts rows in any key convention (FMP, yfinance, etc.) and returns a
+    clean list of ``{date, open, high, low, close, volume}`` dicts sorted
+    oldest-first, capped at *limit* rows.
+    """
+    out: List[Dict[str, Any]] = []
+    for row in rows:
+        date = str(
+            row.get("date") or row.get("Date") or row.get("timestamp") or ""
+        )
+        if not date:
+            continue
+        close = _sf(
+            row.get("adjClose")
+            or row.get("adjusted_close")
+            or row.get("close")
+            or row.get("Close")
+        )
+        if close is None:
+            continue
+        out.append(
+            {
+                "date": date,
+                "open": _sf(row.get("open") or row.get("Open")) or close,
+                "high": _sf(row.get("high") or row.get("High")) or close,
+                "low": _sf(row.get("low") or row.get("Low")) or close,
+                "close": close,
+                "volume": _sf(row.get("volume") or row.get("Volume")) or 0.0,
+            }
+        )
+    # DB rows are typically newest-first; reverse for charting (oldest→newest)
+    out.reverse()
+    return out[-limit:]
+
+
 def _compute_dividends(bundle: FMDataBundle) -> DividendRecord:
     record = DividendRecord()
     km_ttm = bundle.key_metrics_ttm
@@ -1009,6 +1048,13 @@ def _node_format_json_output(
         "factor_scores": factor_scores.to_dict(),
         "quantitative_summary": quantitative_summary,
         "data_sources": data_sources,
+        # Price series forwarded for Streamlit charts (serialised OHLCV, oldest-first)
+        "price_history": _serialise_price_history(
+            bundle.price_history if bundle else []
+        ),
+        "benchmark_history": _serialise_price_history(
+            bundle.benchmark_history if bundle else []
+        ),
     }
 
     return {**state, "output": output}

@@ -39,7 +39,12 @@ from charts import (
     chart_sentiment_donut,
     chart_factor_scorecard,
     chart_eps_trend,
-    # Stubs for data not yet available
+    # Live charts (previously stubs — now use real data when available)
+    chart_ebitda_trend,
+    chart_fcf_trend,
+    chart_price_history,
+    chart_price_performance,
+    # Backward-compat stub aliases (kept so old imports don't break)
     chart_ebitda_trend_stub,
     chart_fcf_trend_stub,
     chart_price_history_stub,
@@ -571,7 +576,10 @@ def _render_visualisations(state: Dict[str, Any]) -> None:
         comps         = valuation.get("comps") or {}
         technicals    = (fm or {}).get("technicals") or {}
         moe           = (fm or {}).get("moe_consensus") or {}
+        earnings_rec  = (fm or {}).get("earnings") or {}
         current_price = (fm or {}).get("current_price")
+        price_hist    = (fm or {}).get("price_history") or []
+        bench_hist    = (fm or {}).get("benchmark_history") or []
         q_trends      = (qf or {}).get("quarterly_trends") or []
         key_metrics   = (qf or {}).get("key_metrics") or {}
         sentiment     = (ba or {}).get("sentiment") or {}
@@ -584,7 +592,7 @@ def _render_visualisations(state: Dict[str, Any]) -> None:
                 # ── Price & Performance ──────────────────────────────────────
                 if hint == "price_history":
                     st.plotly_chart(
-                        chart_price_history_stub(ticker),
+                        chart_price_history(price_hist, technicals, ticker, current_price),
                         use_container_width=True,
                         key=f"price_history_{ticker}_{idx}",
                     )
@@ -592,7 +600,7 @@ def _render_visualisations(state: Dict[str, Any]) -> None:
 
                 elif hint == "price_performance":
                     st.plotly_chart(
-                        chart_price_performance_stub(ticker),
+                        chart_price_performance(price_hist, bench_hist, ticker),
                         use_container_width=True,
                         key=f"price_perf_{ticker}_{idx}",
                     )
@@ -617,7 +625,7 @@ def _render_visualisations(state: Dict[str, Any]) -> None:
 
                 elif hint == "eps_trend":
                     st.plotly_chart(
-                        chart_eps_trend(q_trends, ticker),
+                        chart_eps_trend(q_trends, ticker, earnings_rec),
                         use_container_width=True,
                         key=f"eps_{ticker}_{idx}",
                     )
@@ -625,7 +633,7 @@ def _render_visualisations(state: Dict[str, Any]) -> None:
 
                 elif hint == "ebitda_trend":
                     st.plotly_chart(
-                        chart_ebitda_trend_stub(ticker),
+                        chart_ebitda_trend(q_trends, ticker),
                         use_container_width=True,
                         key=f"ebitda_{ticker}_{idx}",
                     )
@@ -670,7 +678,7 @@ def _render_visualisations(state: Dict[str, Any]) -> None:
                 # ── Cash Flow ────────────────────────────────────────────────
                 elif hint == "fcf_trend":
                     st.plotly_chart(
-                        chart_fcf_trend_stub(ticker),
+                        chart_fcf_trend(q_trends, key_metrics, ticker),
                         use_container_width=True,
                         key=f"fcf_{ticker}_{idx}",
                     )

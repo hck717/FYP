@@ -21,10 +21,10 @@ Usage (from streamlit.py):
         chart_sentiment_donut,
         chart_factor_scorecard,
         chart_fcf_trend,
-        chart_price_history_stub,
-        chart_price_performance_stub,
-        chart_ebitda_trend_stub,
-        chart_eps_trend_stub,
+        chart_price_history,
+        chart_price_performance,
+        chart_ebitda_trend,
+        chart_eps_trend,
     )
 """
 
@@ -57,6 +57,18 @@ def _bn(val: Any) -> Optional[float]:
 def _pv(val: Any) -> Optional[float]:
     """Convert to plain float (for percentages already in fractional or % form)."""
     return _to_float(val)
+
+
+def _rolling_sma(values: List[Optional[float]], window: int) -> List[Optional[float]]:
+    """Pure-Python rolling simple moving average; returns None for insufficient data."""
+    result: List[Optional[float]] = []
+    for i, _ in enumerate(values):
+        if i < window - 1:
+            result.append(None)
+        else:
+            chunk = [x for x in values[i - window + 1 : i + 1] if x is not None]
+            result.append(sum(chunk) / len(chunk) if chunk else None)
+    return result
 
 
 # ── Colour palette ────────────────────────────────────────────────────────────
@@ -202,54 +214,165 @@ def chart_revenue_trend(
     return fig
 
 
-# ── 2. EBITDA Trend — stub (data not available from agents) ──────────────────
+# ── 2. EBIT / Operating Income Trend ─────────────────────────────────────────
 
-def chart_ebitda_trend_stub(ticker: str) -> go.Figure:
-    """Stub: EBITDA/EBIT trend (agent outputs do not include EBITDA history)."""
-    return _stub_fig(
-        f"{ticker} — EBITDA / EBIT Trend",
-        "EBITDA history requires D&A data not available in current agent outputs",
+def chart_ebitda_trend(
+    quarterly_trends: List[Dict[str, Any]],
+    ticker: str,
+) -> go.Figure:
+    """EBIT / Operating Income bars + EBIT margin % line on secondary axis.
+
+    Uses ``operating_income`` and ``ebit_margin`` from quarterly_trends.
+    Labelled as "EBIT / Operating Income" (not true EBITDA — D&A not disaggregated).
+    """
+    if not quarterly_trends:
+        return _stub_fig(f"{ticker} — EBIT / Operating Income Trend", "No quarterly data available")
+
+    rows = sorted(quarterly_trends, key=lambda r: str(r.get("period", "")))
+    periods = [str(r.get("period", "?")) for r in rows]
+    ebit    = [_bn(r.get("operating_income")) for r in rows]
+
+    def _norm_pct(v: Any) -> Optional[float]:
+        f = _pv(v)
+        if f is None:
+            return None
+        return f * 100 if abs(f) <= 1.5 else f
+
+    ebit_m = [_norm_pct(r.get("ebit_margin")) for r in rows]
+
+    if not any(v is not None for v in ebit):
+        return _stub_fig(f"{ticker} — EBIT / Operating Income Trend", "Operating income not available")
+
+    bar_colours = [_BULL_COLOUR if (v or 0) >= 0 else _BEAR_COLOUR for v in ebit]
+
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+
+    fig.add_trace(go.Bar(
+        x=periods, y=ebit,
+        name="EBIT / Op. Income",
+        marker_color=bar_colours,
+        text=[f"${v:.2f}B" if v is not None else "—" for v in ebit],
+        textposition="outside",
+        textfont=dict(size=10, color=_TEXT),
+        cliponaxis=False,
+        hovertemplate="%{x}<br>EBIT: $%{y:.2f}B<extra></extra>",
+    ), secondary_y=False)
+
+    if any(v is not None for v in ebit_m):
+        fig.add_trace(go.Scatter(
+            x=periods, y=ebit_m,
+            name="EBIT Margin %",
+            mode="lines+markers",
+            line=dict(color=_NEUTRAL_COLOUR, width=2),
+            marker=dict(size=7, symbol="circle"),
+            hovertemplate="%{x}<br>EBIT Margin: %{y:.1f}%<extra></extra>",
+        ), secondary_y=True)
+
+    fig.update_layout(
+        title=dict(
+            text=f"{ticker} — EBIT / Operating Income Trend  (Note: excl. D&A)",
+            x=0.02, font=dict(size=14, color=_TEXT),
+        ),
+        **_LAYOUT_BASE,
+        height=300,
     )
+    fig.update_yaxes(title_text="USD (Billions)", secondary_y=False, gridcolor=_GRID)
+    fig.update_yaxes(title_text="EBIT Margin (%)", secondary_y=True, showgrid=False)
+    fig.update_xaxes(title_text="Quarter", gridcolor=_GRID, zerolinecolor=_GRID)
+    return fig
 
 
-# ── 3. Net Income / EPS Trend — partial (net income from quarterly_trends) ───
+# Stub alias retained for backward-compat (streamlit.py may still import it)
+def chart_ebitda_trend_stub(ticker: str) -> go.Figure:
+    """Backward-compat alias → chart_ebitda_trend with empty data."""
+    return chart_ebitda_trend([], ticker)
+
+
+# ── 3. EPS Trend with beat/miss markers ──────────────────────────────────────
 
 def chart_eps_trend(
     quarterly_trends: List[Dict[str, Any]],
     ticker: str,
+    earnings: Optional[Dict[str, Any]] = None,
 ) -> go.Figure:
-    """Net income bar chart from quarterly_trends.
+    """Diluted EPS bar chart from quarterly_trends.
 
-    EPS per share is not available (no share count in agent outputs),
-    so this chart shows net income in absolute terms with a note.
+    Uses ``eps_diluted`` per quarter if available; falls back to net income (billions).
+    Annotates the most recent quarter with a beat/miss badge from the
+    ``earnings`` record (``surprise_pct``, ``beat_streak``).
     """
     if not quarterly_trends:
-        return _stub_fig(f"{ticker} — Net Income Trend", "No net income data available")
+        return _stub_fig(f"{ticker} — EPS Trend", "No quarterly earnings data available")
 
     rows = sorted(quarterly_trends, key=lambda r: str(r.get("period", "")))
     periods = [str(r.get("period", "?")) for r in rows]
-    ni      = [_bn(r.get("net_income")) for r in rows]
 
-    if not any(v is not None for v in ni):
-        return _stub_fig(f"{ticker} — Net Income Trend", "Net income not available")
+    # Prefer eps_diluted; fall back to net income in $B
+    eps_vals = [_to_float(r.get("eps_diluted")) for r in rows]
+    use_eps = any(v is not None for v in eps_vals)
 
-    colours = [_BULL_COLOUR if (v or 0) >= 0 else _BEAR_COLOUR for v in ni]
+    if use_eps:
+        y_vals   = eps_vals
+        y_label  = "Diluted EPS (USD)"
+        fmt_fn   = lambda v: f"${v:.2f}" if v is not None else "—"
+        hover_t  = "%{x}<br>EPS: $%{y:.2f}<extra></extra>"
+        title_sfx = "Diluted EPS"
+    else:
+        y_vals  = [_bn(r.get("net_income")) for r in rows]
+        y_label = "Net Income (USD Billions)"
+        fmt_fn  = lambda v: f"${v:.2f}B" if v is not None else "—"
+        hover_t = "%{x}<br>Net Income: $%{y:.2f}B<extra></extra>"
+        title_sfx = "Net Income"
+
+    if not any(v is not None for v in y_vals):
+        return _stub_fig(f"{ticker} — EPS Trend", "EPS / net income data not available")
+
+    colours = [_BULL_COLOUR if (v or 0) >= 0 else _BEAR_COLOUR for v in y_vals]
 
     fig = go.Figure()
     fig.add_trace(go.Bar(
-        x=periods, y=ni,
-        name="Net Income",
+        x=periods, y=y_vals,
+        name=title_sfx,
         marker_color=colours,
-        text=[f"${v:.2f}B" if v is not None else "—" for v in ni],
+        text=[fmt_fn(v) for v in y_vals],
         textposition="outside",
         textfont=dict(size=10, color=_TEXT),
         cliponaxis=False,
-        hovertemplate="%{x}<br>Net Income: $%{y:.2f}B<extra></extra>",
+        hovertemplate=hover_t,
     ))
 
-    _apply_base_layout(fig, f"{ticker} — Net Income Trend  (EPS unavailable — no share count)", height=280)
+    # Beat / miss annotation on most recent quarter
+    if earnings:
+        surp = _to_float((earnings or {}).get("surprise_pct"))
+        beat_streak = (earnings or {}).get("beat_streak") or 0
+        miss_streak = (earnings or {}).get("miss_streak") or 0
+        if surp is not None and periods:
+            beat = surp >= 0
+            sign = "+" if surp >= 0 else ""
+            streak_txt = ""
+            if beat and beat_streak:
+                streak_txt = f"  ({beat_streak}Q beat streak)"
+            elif not beat and miss_streak:
+                streak_txt = f"  ({miss_streak}Q miss streak)"
+            annot_col  = _BULL_COLOUR if beat else _BEAR_COLOUR
+            badge_icon = "BEAT" if beat else "MISS"
+            fig.add_annotation(
+                x=periods[-1],
+                y=y_vals[-1] if y_vals[-1] is not None else 0,
+                text=f"<b>{badge_icon} {sign}{surp:.1f}%{streak_txt}</b>",
+                showarrow=True,
+                arrowhead=2,
+                arrowcolor=annot_col,
+                font=dict(color=annot_col, size=10),
+                bgcolor=_CARD_BG,
+                bordercolor=annot_col,
+                borderwidth=1,
+                ay=-40,
+            )
+
+    _apply_base_layout(fig, f"{ticker} — {title_sfx} Trend", height=300)
     fig.update_xaxes(title_text="Quarter")
-    fig.update_yaxes(title_text="Net Income (USD Billions)", gridcolor=_GRID)
+    fig.update_yaxes(title_text=y_label, gridcolor=_GRID)
     fig.update_layout(margin=dict(l=70, r=60, t=55, b=50))
     return fig
 
@@ -707,34 +830,316 @@ def chart_sensitivity_heatmap(
     return fig
 
 
-# ── 9. Free Cash Flow Trend — stub ───────────────────────────────────────────
+# ── 9. Free Cash Flow Trend ───────────────────────────────────────────────────
 
+def chart_fcf_trend(
+    quarterly_trends: List[Dict[str, Any]],
+    key_metrics: Dict[str, Any],
+    ticker: str,
+) -> go.Figure:
+    """FCF proxy = net_income × fcf_conversion ratio from key_metrics.
+
+    ``fcf_conversion`` (FCF/Net Income) comes from the QF agent's key_metrics.
+    Applied uniformly to all quarterly net income values.  A caption note
+    explains the proxy methodology.
+    """
+    if not quarterly_trends:
+        return _stub_fig(f"{ticker} — Free Cash Flow Trend", "No quarterly data available")
+
+    fcf_conv = _to_float(key_metrics.get("fcf_conversion"))
+    rows = sorted(quarterly_trends, key=lambda r: str(r.get("period", "")))
+    periods = [str(r.get("period", "?")) for r in rows]
+    ni_vals = [_bn(r.get("net_income")) for r in rows]
+
+    if not any(v is not None for v in ni_vals):
+        return _stub_fig(f"{ticker} — Free Cash Flow Trend", "Net income data not available")
+
+    if fcf_conv is not None:
+        fcf_vals: List[Optional[float]] = [
+            v * fcf_conv if v is not None else None for v in ni_vals
+        ]
+        conv_pct = fcf_conv * 100 if abs(fcf_conv) <= 5 else fcf_conv
+        note = f"FCF = Net Income × {conv_pct:.0f}% conversion (LTM)"
+    else:
+        # No conversion ratio → show net income as FCF proxy with explicit warning
+        fcf_vals = list(ni_vals)
+        note = "FCF proxy: net income (fcf_conversion unavailable)"
+
+    bar_colours = [_TEAL if (v or 0) >= 0 else _BEAR_COLOUR for v in fcf_vals]
+
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        x=periods, y=fcf_vals,
+        name="FCF (proxy)",
+        marker_color=bar_colours,
+        text=[f"${v:.2f}B" if v is not None else "—" for v in fcf_vals],
+        textposition="outside",
+        textfont=dict(size=10, color=_TEXT),
+        cliponaxis=False,
+        hovertemplate="%{x}<br>FCF Proxy: $%{y:.2f}B<extra></extra>",
+    ))
+
+    # Zero reference line
+    fig.add_hline(y=0, line_dash="dot", line_color=_GREY, line_width=1, opacity=0.6)
+
+    _apply_base_layout(fig, f"{ticker} — Free Cash Flow Trend  ({note})", height=300)
+    fig.update_xaxes(title_text="Quarter")
+    fig.update_yaxes(title_text="FCF Proxy (USD Billions)", gridcolor=_GRID)
+    fig.update_layout(margin=dict(l=70, r=60, t=55, b=50))
+    return fig
+
+
+# Stub alias retained for backward-compat
 def chart_fcf_trend_stub(ticker: str) -> go.Figure:
-    """Stub: FCF trend (quarterly_trends does not include OCF/capex breakdown)."""
-    return _stub_fig(
-        f"{ticker} — Free Cash Flow Trend",
-        "FCF history (OCF − Capex) not disaggregated in current agent outputs",
+    """Backward-compat alias → chart_fcf_trend with empty data."""
+    return chart_fcf_trend([], {}, ticker)
+
+
+# ── 10. Historical Price Chart ────────────────────────────────────────────────
+
+def chart_price_history(
+    price_history: List[Dict[str, Any]],
+    technicals: Dict[str, Any],
+    ticker: str,
+    current_price: Optional[float] = None,
+) -> go.Figure:
+    """Candlestick OHLC + volume bars + 50/200-day SMAs + Bollinger band.
+
+    *price_history* is the serialised OHLCV list forwarded from the FM agent
+    (``fm_output["price_history"]``), sorted oldest-first.
+
+    Overlays:
+    - 50-day and 200-day SMA lines (computed in pure Python from close prices)
+    - Bollinger Bands from technicals snapshot (shaded fill between upper/lower)
+    - Current price horizontal dashed line
+    - 52W high / 52W low reference lines
+    """
+    if not price_history:
+        return _stub_fig(
+            f"{ticker} — Historical Share Price",
+            "Price series not available — no data forwarded from pipeline",
+        )
+
+    dates   = [r["date"]   for r in price_history]
+    opens   = [_to_float(r.get("open"))   for r in price_history]
+    highs   = [_to_float(r.get("high"))   for r in price_history]
+    lows    = [_to_float(r.get("low"))    for r in price_history]
+    closes  = [_to_float(r.get("close"))  for r in price_history]
+    volumes = [_to_float(r.get("volume")) for r in price_history]
+
+    # SMA
+    sma50  = _rolling_sma(closes, 50)
+    sma200 = _rolling_sma(closes, 200)
+
+    fig = make_subplots(
+        rows=2, cols=1,
+        shared_xaxes=True,
+        row_heights=[0.72, 0.28],
+        vertical_spacing=0.03,
     )
 
+    # ── Candlestick ──────────────────────────────────────────────────────────
+    fig.add_trace(go.Candlestick(
+        x=dates,
+        open=opens, high=highs, low=lows, close=closes,
+        name="OHLC",
+        increasing_line_color=_BULL_COLOUR,
+        decreasing_line_color=_BEAR_COLOUR,
+        increasing_fillcolor=_BULL_COLOUR,
+        decreasing_fillcolor=_BEAR_COLOUR,
+        line_width=1,
+        hovertext=[
+            f"O:{o:.2f}  H:{h:.2f}  L:{l:.2f}  C:{c:.2f}"
+            for o, h, l, c in zip(
+                [v or 0 for v in opens],
+                [v or 0 for v in highs],
+                [v or 0 for v in lows],
+                [v or 0 for v in closes],
+            )
+        ],
+    ), row=1, col=1)
 
-# ── 10. Historical Price Chart — stub ────────────────────────────────────────
+    # ── SMAs ─────────────────────────────────────────────────────────────────
+    if any(v is not None for v in sma50):
+        fig.add_trace(go.Scatter(
+            x=dates, y=sma50,
+            name="SMA 50",
+            mode="lines",
+            line=dict(color=_NEUTRAL_COLOUR, width=1.5),
+            hovertemplate="SMA50: %{y:.2f}<extra></extra>",
+        ), row=1, col=1)
 
+    if any(v is not None for v in sma200):
+        fig.add_trace(go.Scatter(
+            x=dates, y=sma200,
+            name="SMA 200",
+            mode="lines",
+            line=dict(color=_VIOLET, width=1.5, dash="dot"),
+            hovertemplate="SMA200: %{y:.2f}<extra></extra>",
+        ), row=1, col=1)
+
+    # ── Bollinger Bands (from technicals snapshot — single current values) ───
+    bb_upper = _to_float(technicals.get("bollinger_upper"))
+    bb_lower = _to_float(technicals.get("bollinger_lower"))
+    if bb_upper is not None and bb_lower is not None and dates:
+        fig.add_hrect(
+            y0=bb_lower, y1=bb_upper,
+            fillcolor="rgba(99,102,241,0.07)",
+            line_width=0,
+            row=1, col=1,
+        )
+        for val, label in [(bb_upper, "BB Upper"), (bb_lower, "BB Lower")]:
+            fig.add_hline(
+                y=val, line_dash="dot", line_color=_INDIGO, line_width=1, opacity=0.7,
+                annotation_text=f"  {label} {val:.2f}",
+                annotation_font=dict(color=_INDIGO, size=9),
+                annotation_position="right",
+                row=1, col=1,
+            )
+
+    # ── Current price ─────────────────────────────────────────────────────────
+    if current_price is not None:
+        fig.add_hline(
+            y=current_price, line_dash="dash", line_color=_TEXT, line_width=1.5, opacity=0.8,
+            annotation_text=f"  Current ${current_price:.2f}",
+            annotation_font=dict(color=_TEXT, size=9),
+            annotation_position="right",
+            row=1, col=1,
+        )
+
+    # ── 52W High / Low ────────────────────────────────────────────────────────
+    high52 = _to_float(technicals.get("52w_high") or technicals.get("high_52w"))
+    low52  = _to_float(technicals.get("52w_low")  or technicals.get("low_52w"))
+    for val, label, col in [(high52, "52W High", _BULL_COLOUR), (low52, "52W Low", _BEAR_COLOUR)]:
+        if val is not None:
+            fig.add_hline(
+                y=val, line_dash="longdash", line_color=col, line_width=1, opacity=0.5,
+                annotation_text=f"  {label} ${val:.2f}",
+                annotation_font=dict(color=col, size=9),
+                annotation_position="right",
+                row=1, col=1,
+            )
+
+    # ── Volume bars ───────────────────────────────────────────────────────────
+    vol_colours = []
+    for i, (o, c) in enumerate(zip(opens, closes)):
+        if o is not None and c is not None:
+            vol_colours.append(_BULL_COLOUR if c >= o else _BEAR_COLOUR)
+        else:
+            vol_colours.append(_GREY)
+
+    fig.add_trace(go.Bar(
+        x=dates, y=volumes,
+        name="Volume",
+        marker_color=vol_colours,
+        opacity=0.6,
+        showlegend=False,
+        hovertemplate="Vol: %{y:,.0f}<extra></extra>",
+    ), row=2, col=1)
+
+    # ── Layout ────────────────────────────────────────────────────────────────
+    fig.update_layout(
+        title=dict(text=f"{ticker} — Historical Share Price (OHLCV)", x=0.02, font=dict(size=14, color=_TEXT)),
+        **_LAYOUT_BASE,
+        height=520,
+        xaxis_rangeslider_visible=False,
+        xaxis2_rangeslider_visible=False,
+    )
+    fig.update_xaxes(gridcolor=_GRID, zerolinecolor=_GRID)
+    fig.update_yaxes(gridcolor=_GRID, zerolinecolor=_GRID)
+    fig.update_yaxes(title_text="Price (USD)", row=1, col=1)
+    fig.update_yaxes(title_text="Volume", row=2, col=1, showgrid=False)
+    return fig
+
+
+# Stub alias retained for backward-compat
 def chart_price_history_stub(ticker: str) -> go.Figure:
-    """Stub: price_history is not forwarded through the agent output dict."""
-    return _stub_fig(
-        f"{ticker} — Historical Share Price",
-        "Price series not forwarded through agent outputs — requires pipeline change",
-    )
+    """Backward-compat alias → chart_price_history with empty data."""
+    return chart_price_history([], {}, ticker)
 
 
-# ── 11. Price Performance vs Index — stub ────────────────────────────────────
+# ── 11. Price Performance vs Index (indexed to 100) ──────────────────────────
 
+def chart_price_performance(
+    price_history: List[Dict[str, Any]],
+    benchmark_history: List[Dict[str, Any]],
+    ticker: str,
+) -> go.Figure:
+    """Multi-line indexed performance chart.
+
+    Both the ticker and S&P 500 benchmark are indexed to 100 at the first
+    common date.  Returns a stub if neither series is available.
+    """
+    if not price_history and not benchmark_history:
+        return _stub_fig(
+            f"{ticker} — Price Performance vs S&P 500",
+            "No price or benchmark history available",
+        )
+
+    def _build_series(rows: List[Dict[str, Any]]) -> Tuple[List[str], List[Optional[float]]]:
+        dates  = [r["date"]  for r in rows]
+        closes = [_to_float(r.get("close")) for r in rows]
+        return dates, closes
+
+    t_dates, t_closes = _build_series(price_history)
+    b_dates, b_closes = _build_series(benchmark_history)
+
+    # Find first common date for indexing
+    t_map = {d: c for d, c in zip(t_dates, t_closes) if c is not None}
+    b_map = {d: c for d, c in zip(b_dates, b_closes) if c is not None}
+
+    common = sorted(set(t_map) & set(b_map))
+    if not common:
+        # No overlap — index each series to its own start independently
+        common_t = t_dates[0] if t_dates else None
+        common_b = b_dates[0] if b_dates else None
+        base_t = t_map.get(common_t) if common_t else None
+        base_b = b_map.get(common_b) if common_b else None
+    else:
+        base_t = t_map[common[0]]
+        base_b = b_map[common[0]]
+
+    def _index(vals: List[Optional[float]], base: Optional[float]) -> List[Optional[float]]:
+        if base is None or base == 0:
+            return [None] * len(vals)
+        return [v / base * 100 if v is not None else None for v in vals]
+
+    t_indexed = _index(t_closes, base_t)
+    b_indexed = _index(b_closes, base_b)
+
+    fig = go.Figure()
+
+    if any(v is not None for v in t_indexed):
+        fig.add_trace(go.Scatter(
+            x=t_dates, y=t_indexed,
+            name=ticker,
+            mode="lines",
+            line=dict(color=_BASE_COLOUR, width=2.5),
+            hovertemplate=f"{ticker}: %{{y:.1f}}<extra></extra>",
+        ))
+
+    if any(v is not None for v in b_indexed):
+        fig.add_trace(go.Scatter(
+            x=b_dates, y=b_indexed,
+            name="S&P 500",
+            mode="lines",
+            line=dict(color=_GREY, width=1.5, dash="dot"),
+            hovertemplate="S&P 500: %{y:.1f}<extra></extra>",
+        ))
+
+    # 100 baseline
+    fig.add_hline(y=100, line_dash="longdash", line_color=_GRID, line_width=1, opacity=0.8)
+
+    _apply_base_layout(fig, f"{ticker} — Price Performance vs S&P 500  (Indexed to 100)", height=320)
+    fig.update_xaxes(title_text="Date")
+    fig.update_yaxes(title_text="Indexed Return (base = 100)", gridcolor=_GRID)
+    return fig
+
+
+# Stub alias retained for backward-compat
 def chart_price_performance_stub(ticker: str) -> go.Figure:
-    """Stub: indexed price performance vs benchmark (no historical series available)."""
-    return _stub_fig(
-        f"{ticker} — Price Performance vs Index",
-        "Indexed performance requires historical OHLCV not currently in agent outputs",
-    )
+    """Backward-compat alias → chart_price_performance with empty data."""
+    return chart_price_performance([], [], ticker)
 
 
 # ── 12. MoE Consensus Dumbbell ───────────────────────────────────────────────

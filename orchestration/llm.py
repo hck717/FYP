@@ -246,12 +246,28 @@ Choose ONLY charts that are directly relevant to what the user asked for.
 Do NOT include a chart just because its data might be available — it must match the user's intent.
 
 Available chart types and when to include them:
+  "price_history"      — Include when: user asks about share price, price chart, historical prices,
+                         candlestick, OHLC, volume, 52-week range, support/resistance levels
+  "price_performance"  — Include when: user asks about stock performance vs market, relative
+                         performance, alpha, outperformance, vs S&P 500, indexed performance
+  "revenue_trend"      — Include when: user asks about revenue growth, sales trend, top line,
+                         quarterly revenue, financial results
+  "margin_trends"      — Include when: user asks about margin trends, gross margin, EBIT margin,
+                         profitability trends, margin expansion/compression
+  "ebitda_trend"       — Include when: user asks about EBITDA, EBIT, operating income,
+                         operating profit trend
+  "eps_trend"          — Include when: user asks about EPS, earnings per share, earnings trend,
+                         beat/miss history, quarterly earnings
   "dcf_scenarios"      — Include when: user asks about DCF, intrinsic value, fair value, valuation,
                          overvalued/undervalued, price target, discounted cash flow, Bear/Base/Bull
   "sensitivity_heatmap"— Include when: user asks about WACC sensitivity, scenario analysis, valuation
                          sensitivity, or any comprehensive valuation question
-  "quarterly_trends"   — Include when: user asks about revenue growth, earnings trends, margin trends,
-                         quarterly performance, financial results, or financial history
+  "football_field"     — Include when: user asks about valuation range, price target range,
+                         multiple methodologies, sum-of-parts, Bear/Base/Bull price range
+  "dcf_waterfall"      — Include when: user asks about DCF bridge, Bear/Base/Bull scenarios,
+                         intrinsic value scenario comparison
+  "fcf_trend"          — Include when: user asks about free cash flow, FCF, cash generation,
+                         cash conversion, capital returns
   "technicals"         — Include when: user asks about technicals, RSI, MACD, moving averages,
                          support/resistance, Bollinger Bands, trend analysis, price action, "should I buy"
   "sentiment_donut"    — Include when: user asks about sentiment, market opinion, investor mood,
@@ -260,9 +276,10 @@ Available chart types and when to include them:
                          sector comparison, how X compares to competitors, EV/EBITDA vs peers
   "moe_consensus"      — Include when: user asks about analyst views, price range, consensus,
                          different scenarios, bull/bear case, or any comprehensive valuation
-  "factor_radar"       — Include when: user asks about quality factors, financial health score,
+  "factor_scorecard"   — Include when: user asks about quality factors, financial health score,
                          Piotroski, ROE, ROIC, gross margin, Sharpe ratio, or overall stock quality;
                          also include for any comprehensive/fundamental analysis query
+  "factor_radar"       — Alias for factor_scorecard — use either name
   "altman_z"           — Include when: user asks about bankruptcy risk, financial distress,
                          Altman Z-Score, solvency, credit risk, or company financial health
 
@@ -517,6 +534,46 @@ def _infer_chart_hints(query_lower: str, plan: Dict[str, Any]) -> List[str]:
     hints: List[str] = []
     run_fm = plan.get("run_financial_modelling", False)
 
+    # Price history / OHLCV
+    if any(kw in query_lower for kw in [
+        "price chart", "candlestick", "ohlc", "historical price", "price history",
+        "52 week", "52w", "volume", "share price",
+    ]):
+        hints.append("price_history")
+
+    # Price performance vs benchmark
+    if any(kw in query_lower for kw in [
+        "vs s&p", "vs market", "relative performance", "outperform", "alpha",
+        "indexed", "benchmark", "performance vs",
+    ]):
+        hints.append("price_performance")
+
+    # Revenue trend
+    if any(kw in query_lower for kw in [
+        "revenue", "sales", "top line", "quarterly revenue", "financial results",
+    ]):
+        hints.append("revenue_trend")
+
+    # Margin trends
+    if any(kw in query_lower for kw in [
+        "margin", "gross margin", "ebit margin", "profitability trend",
+        "margin expansion", "margin compression",
+    ]):
+        hints.append("margin_trends")
+
+    # EBITDA / EBIT trend
+    if any(kw in query_lower for kw in [
+        "ebitda", "ebit", "operating income", "operating profit",
+    ]):
+        hints.append("ebitda_trend")
+
+    # EPS trend
+    if any(kw in query_lower for kw in [
+        "eps", "earnings per share", "earnings trend", "beat", "miss",
+        "quarterly earnings", "income",
+    ]):
+        hints.append("eps_trend")
+
     # DCF / valuation
     if run_fm and any(kw in query_lower for kw in [
         "dcf", "intrinsic", "fair value", "overvalued", "undervalued",
@@ -524,11 +581,25 @@ def _infer_chart_hints(query_lower: str, plan: Dict[str, Any]) -> List[str]:
     ]):
         hints.append("dcf_scenarios")
         hints.append("sensitivity_heatmap")
+        hints.append("football_field")
+
+    # Football field (valuation range)
+    if any(kw in query_lower for kw in [
+        "football field", "valuation range", "price target range", "sum of parts",
+    ]):
+        if "football_field" not in hints:
+            hints.append("football_field")
 
     # WACC sensitivity — only if explicitly mentioned
     if "wacc" in query_lower or "sensitivity" in query_lower:
         if "sensitivity_heatmap" not in hints:
             hints.append("sensitivity_heatmap")
+
+    # FCF trend
+    if any(kw in query_lower for kw in [
+        "free cash flow", "fcf", "cash generation", "cash conversion", "capital return",
+    ]):
+        hints.append("fcf_trend")
 
     # Technicals
     if any(kw in query_lower for kw in [
@@ -538,12 +609,12 @@ def _infer_chart_hints(query_lower: str, plan: Dict[str, Any]) -> List[str]:
     ]):
         hints.append("technicals")
 
-    # Quarterly / revenue trends
+    # Quarterly / revenue trends (backward compat)
     if any(kw in query_lower for kw in [
-        "revenue", "earnings", "quarterly", "margin", "growth", "q1", "q2",
-        "q3", "q4", "financial results", "income", "profit",
+        "quarterly", "growth", "q1", "q2", "q3", "q4", "profit",
     ]):
-        hints.append("quarterly_trends")
+        if "revenue_trend" not in hints:
+            hints.append("revenue_trend")
 
     # Sentiment
     if any(kw in query_lower for kw in [
@@ -563,9 +634,9 @@ def _infer_chart_hints(query_lower: str, plan: Dict[str, Any]) -> List[str]:
     if run_fm:
         hints.append("moe_consensus")
 
-    # Factor radar + Altman Z — always if QF is running
+    # Factor scorecard + Altman Z — always if QF is running
     if plan.get("run_quant_fundamental", False):
-        hints.append("factor_radar")
+        hints.append("factor_scorecard")
         hints.append("altman_z")
 
     # Comprehensive / full analysis → show everything
@@ -574,9 +645,12 @@ def _infer_chart_hints(query_lower: str, plan: Dict[str, Any]) -> List[str]:
         "comprehensive", "deep dive", "full report",
     ]):
         hints = list(dict.fromkeys([
-            "dcf_scenarios", "sensitivity_heatmap", "quarterly_trends",
-            "technicals", "sentiment_donut", "peer_comps", "moe_consensus",
-            "factor_radar", "altman_z",
+            "price_history", "price_performance",
+            "revenue_trend", "margin_trends", "ebitda_trend", "eps_trend",
+            "football_field", "dcf_scenarios", "sensitivity_heatmap",
+            "peer_comps", "fcf_trend",
+            "technicals", "sentiment_donut", "factor_scorecard", "altman_z",
+            "moe_consensus",
         ]))
 
     return list(dict.fromkeys(hints))  # deduplicate, preserve order
