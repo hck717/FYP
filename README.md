@@ -16,37 +16,51 @@
 # 1. Clone and configure
 git clone https://github.com/hck717/FYP.git
 cd FYP
-cp .env.example .env          # fill in API keys
+cp .env .env.bak              # back up existing .env if present, or create .env from scratch
+                               # (fill in all API keys — see Section 11)
 
-# 2. Start Ollama and pull required models
-ollama serve &
-ollama pull nomic-embed-text  # 768-dim embeddings
-ollama pull llama3.2:latest   # planner + quant narrative
-ollama pull deepseek-r1:8b    # business analyst + summarizer
-
-# 3. Start all Docker services (PostgreSQL, Qdrant, Neo4j, Airflow)
-docker compose up --build -d
-sleep 30                       # wait for containers to initialise
-
-# 4. Run the full analysis pipeline (Python API)
+# 2. Create and activate a Python 3.11+ virtual environment
+python3.11 -m venv .venv
 source .venv/bin/activate
+pip install -r requirements.txt
+
+# 3. Start Ollama and pull required models  (Ollama must be running before Docker starts)
+ollama serve &                 # skip if Ollama is already running as a system service
+ollama pull nomic-embed-text   # 768-dim embeddings (used by Business Analyst + ingestion)
+ollama pull llama3.2:latest    # planner + quant narrative
+ollama pull deepseek-r1:8b     # business analyst + summarizer + financial modelling
+
+# 4. Start all Docker services (PostgreSQL, Qdrant, Neo4j, Airflow x3)
+docker compose up --build -d
+sleep 60                        # wait for all containers to initialise and Airflow to migrate DB
+
+# 5. Verify all backends are healthy
+python ingestion/inspect_data.py
+# Expected:
+#   ✅ Connected to localhost:5432/airflow
+#   ✅ raw_timeseries     516,197 rows
+#   ✅ :Company           5 nodes
+#   ✅ Status: green | Points: 2390
+
+# 6. Run the full analysis pipeline (Python API)
 python - <<'EOF'
 from orchestration.graph import run
 result = run("What is Apple's competitive moat and current valuation?")
 print(result["final_summary"])
 EOF
 
-# 5. Launch the Streamlit UI
-streamlit run POC/streamlit/streamlit.py
+# 7. Launch the Streamlit UI
+streamlit run POC/streamlit/app.py
+# Opens at http://localhost:8501
 ```
 
 **Service endpoints once running:**
 
 | Service | URL | Credentials |
 |---|---|---|
-| Airflow UI | http://localhost:8080 | airflow / airflow |
+| Airflow UI | http://localhost:8080 | admin / admin |
 | Qdrant Dashboard | http://localhost:6333/dashboard | — |
-| Neo4j Browser | http://localhost:7474 | neo4j / changeme_neo4j_password |
+| Neo4j Browser | http://localhost:7474 | neo4j / SecureNeo4jPass2025! |
 | PostgreSQL | localhost:5432 | airflow / airflow |
 | Ollama API | http://localhost:11434 | — |
 | Streamlit UI | http://localhost:8501 | — |
@@ -129,7 +143,7 @@ The platform operates in three runtime layers:
 ┌─────────────────────────────────────────────────────────────────────┐
 │  LAYER 3: SYNTHESIS & UI  (Streamlit)                               │
 │                                                                     │
-│  POC/streamlit/streamlit.py                                         │
+│  POC/streamlit/app.py                                               │
 │  ├── streaming CoT display (plan → agents → synthesise)             │
 │  ├── per-agent result cards                                         │
 │  └── final research note with citations                             │
@@ -576,10 +590,10 @@ EOF
 **Inspect Neo4j:**
 ```bash
 # Browser: http://localhost:7474
-# Bolt:    bolt://localhost:7687  (neo4j / changeme_neo4j_password)
+# Bolt:    bolt://localhost:7687  (neo4j / SecureNeo4jPass2025!)
 
 # CLI
-docker exec -it fyp-neo4j cypher-shell -u neo4j -p changeme_neo4j_password
+docker exec -it fyp-neo4j cypher-shell -u neo4j -p SecureNeo4jPass2025!
 MATCH (c:Company) RETURN c.ticker, c.Name, c.Highlights_MarketCapitalization LIMIT 10;
 ```
 
@@ -760,14 +774,14 @@ All tests use mocked external services (Qdrant, Neo4j, PostgreSQL, Ollama). No l
 
 ## 10. Streamlit UI
 
-The Streamlit POC is at `POC/streamlit/streamlit.py`.
+The Streamlit POC is at `POC/streamlit/app.py`.
 
 ```bash
-# Install dependencies
+# Install dependencies (if running outside the main .venv)
 pip install streamlit plotly
 
 # Launch
-streamlit run POC/streamlit/streamlit.py
+streamlit run POC/streamlit/app.py
 # Opens at http://localhost:8501
 ```
 
@@ -786,7 +800,7 @@ See [`POC/streamlit/`](POC/streamlit/) for the full implementation.
 
 ## 11. Environment Variables
 
-Create `.env` at the repo root (copy from `.env.example`):
+Create `.env` at the repo root with the following variables:
 
 ```bash
 # ── API Keys ───────────────────────────────────────────────────────────────
@@ -812,7 +826,7 @@ QDRANT_COLLECTION_NAME=financial_documents
 
 NEO4J_URI=bolt://localhost:7687
 NEO4J_USER=neo4j
-NEO4J_PASSWORD=changeme_neo4j_password
+NEO4J_PASSWORD=SecureNeo4jPass2025!
 
 # ── LLM (Ollama local) ────────────────────────────────────────────────────
 OLLAMA_BASE_URL=http://localhost:11434
@@ -865,8 +879,8 @@ AIRFLOW__CORE__EXECUTOR=LocalExecutor
 AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:airflow@postgres/airflow
 AIRFLOW__WEBSERVER__SECRET_KEY=your-secret-key
 AIRFLOW_UID=50000
-AIRFLOW_WWW_USER_USERNAME=airflow
-AIRFLOW_WWW_USER_PASSWORD=airflow
+AIRFLOW_WWW_USER_USERNAME=admin
+AIRFLOW_WWW_USER_PASSWORD=admin
 ```
 
 ---
@@ -897,7 +911,7 @@ AIRFLOW_WWW_USER_PASSWORD=airflow
 
 ### Phase 3 — Trust, UI & Polish (Weeks 9–13)
 
-- [x] Streamlit POC UI (`POC/streamlit/streamlit.py`)
+- [x] Streamlit POC UI (`POC/streamlit/app.py`)
 - [ ] Critic Agent (GPT-4o-mini NLI verification, ≥90% pass rate)
 - [ ] Self-Improving RAG (`SelfImprovingRAG` class, Qdrant boost-factor updates)
 - [ ] Weekly retraining DAG (`citation_tracking` → `boost_factor` update)
@@ -926,8 +940,7 @@ AIRFLOW_WWW_USER_PASSWORD=airflow
 ```
 FYP/
 ├── README.md                     ← This file
-├── .env                          ← API keys and configuration (not committed)
-├── .env.example                  ← Template
+├── .env                          ← API keys and configuration (not committed — create manually)
 ├── docker-compose.yml            ← 6-service stack (PG, Qdrant, Neo4j, Airflow x3)
 ├── pyproject.toml                ← pytest configuration
 ├── conftest.py                   ← sys.path setup for pytest
@@ -956,7 +969,7 @@ FYP/
 │
 ├── POC/
 │   └── streamlit/
-│       ├── streamlit.py          ← Streamlit UI app
+│       ├── app.py                ← Streamlit UI app
 │       └── requirements.txt
 │
 ├── ui/                           ← Full production UI (Phase 3 — not yet built)
@@ -969,4 +982,4 @@ FYP/
 
 ---
 
-*Last updated: 2026-03-03 | Author: hck717*
+*Last updated: 2026-03-05 | Author: hck717*
