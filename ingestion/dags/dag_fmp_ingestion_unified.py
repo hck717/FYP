@@ -44,7 +44,7 @@ default_args = {
     'email_on_failure': False,
     'email_on_retry': False,
     'retries': 2,
-    'retry_delay': timedelta(minutes=5),
+    'retry_delay': timedelta(seconds=30),
 }
 
 # Configuration
@@ -53,8 +53,8 @@ BASE_URL = "https://financialmodelingprep.com/stable"
 BASE_OUTPUT_DIR = "/opt/airflow/etl/agent_data"
 
 TICKERS = [t.strip() for t in os.getenv('TRACKED_TICKERS', 'AAPL').split(',')]
-FMP_RATE_LIMIT = int(os.getenv('FMP_RATE_LIMIT', '300'))
-RATE_LIMIT_DELAY = 60.0 / max(FMP_RATE_LIMIT, 1)
+FMP_RATE_LIMIT = int(os.getenv('FMP_RATE_LIMIT', '3000'))
+RATE_LIMIT_DELAY = 60.0 / max(FMP_RATE_LIMIT, 1)  # 0.02s between calls at 3000/min
 BOX_LINE = "-" * 70
 
 AGENT_CONFIGS = {
@@ -153,7 +153,7 @@ def fetch_data(endpoint, params=None):
     params['apikey'] = FMP_API_KEY
 
     try:
-        response = requests.get(url, params=params, timeout=30)
+        response = requests.get(url, params=params, timeout=None)
         print(f"  URL: {endpoint}")
         print(f"  Status: {response.status_code}")
 
@@ -313,21 +313,25 @@ with DAG(
                 python_callable=scrape_agent_ticker,
                 op_kwargs={'agent_name': agent_name, 'ticker': ticker},
                 provide_context=True,
+                execution_timeout=None,
             )
             load_pg_tasks[key] = PythonOperator(
                 task_id=f'fmp_load_postgres_{agent_name}_{ticker}',
                 python_callable=load_postgres_for_agent_ticker,
                 op_kwargs={'agent_name': agent_name, 'ticker_symbol': ticker},
+                execution_timeout=None,
             )
             load_neo4j_tasks[key] = PythonOperator(
                 task_id=f'fmp_load_neo4j_{agent_name}_{ticker}',
                 python_callable=load_neo4j_for_agent_ticker,
                 op_kwargs={'agent_name': agent_name, 'ticker_symbol': ticker},
+                execution_timeout=None,
             )
             load_qdrant_tasks[key] = PythonOperator(
                 task_id=f'fmp_load_qdrant_{agent_name}_{ticker}',
                 python_callable=load_qdrant_for_agent_ticker,
                 op_kwargs={'agent_name': agent_name, 'ticker_symbol': ticker},
+                execution_timeout=None,
             )
 
             # Only business_analyst needs Neo4j chunk synthesis
@@ -344,6 +348,7 @@ with DAG(
         task_id='fmp_generate_summary',
         python_callable=report_summary,
         provide_context=True,
+        execution_timeout=None,
     )
 
     # ── Wire dependencies ───────────────────────────────────────────────────────

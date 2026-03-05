@@ -404,13 +404,21 @@ def ensure_vector_index(neo4j: Neo4jConnector, dimension: int = 384) -> None:
     }}}}
     """
     with neo4j.driver.session(database=None) as session:
-        result = session.run(check_cypher).data()
+        result = session.run(check_cypher).data()  # .data() consumes the result eagerly
         if result:
             print(f"[Ingest] Vector index 'chunk_embedding' already exists ({dimension}-dim)")
         else:
             print(f"[Ingest] Creating vector index 'chunk_embedding' ({dimension}-dim) ...")
-            session.run(create_cypher)
-            print("[Ingest] Vector index created.")
+            try:
+                session.run(create_cypher).consume()
+                print("[Ingest] Vector index created.")
+            except Exception as exc:
+                # Neo4j may raise EquivalentSchemaRuleAlreadyExists even with IF NOT EXISTS
+                # if the index was created under the same name/schema in a previous run.
+                if "EquivalentSchemaRuleAlreadyExists" in str(exc) or "already exists" in str(exc):
+                    print(f"[Ingest] Vector index already exists (concurrent creation): {exc}")
+                else:
+                    raise
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────

@@ -241,68 +241,171 @@ class FinancialDataFetcher:
         return results
 
     def fetch(self, ticker: str) -> FinancialsBundle:
-        """Fetch all data needed for factor computation for a single ticker."""
+        """Fetch all data needed for factor computation for a single ticker.
+
+        Primary source: FMP (raw_fundamentals data_names: income_statement,
+        balance_sheet, cash_flow, financial_ratios, key_metrics_ttm, ratios_ttm,
+        enterprise_values, financial_scores, shares_float).
+
+        EODHD fallback (same raw_fundamentals table, different data_names):
+          - income_statement  → EODHD financial_scores (has revenue, ebit, netIncome,
+                                totalAssets, totalLiabilities, workingCapital,
+                                retainedEarnings, marketCap, altmanZScore, piotroskiScore)
+          - balance_sheet     → same EODHD financial_scores payload
+          - cash_flow         → EODHD key_metrics_ttm (freeCashFlowToFirmTTM,
+                                freeCashFlowToEquityTTM, capexToRevenueTTM)
+          - financial_ratios  → EODHD ratios_ttm (same field-name convention)
+          - key_metrics_ttm   → EODHD key_metrics_ttm (same field-name convention)
+          - ratios_ttm        → EODHD ratios_ttm (same field-name convention)
+          - enterprise_values → derived from EODHD key_metrics_ttm
+            (enterpriseValueTTM, marketCap)
+          - financial_scores  → EODHD financial_scores (piotroskiScore, altmanZScore)
+        """
         bundle = FinancialsBundle(ticker=ticker)
 
-        # Income statement — most recent period
+        # Income statement — most recent period (FMP → EODHD financial_scores fallback)
         try:
             rows = self._latest_payload_list(ticker, "income_statement", limit=5)
             bundle.income = rows[0] if rows else {}
+            if not bundle.income:
+                # EODHD financial_scores has: revenue, ebit, netIncome, marketCap,
+                # totalAssets, totalLiabilities, workingCapital, retainedEarnings
+                eodhd_scores = self._latest_payload(ticker, "financial_scores")
+                if eodhd_scores:
+                    bundle.income = {
+                        "revenue":          eodhd_scores.get("revenue"),
+                        "operatingIncome":  eodhd_scores.get("ebit"),
+                        "ebit":             eodhd_scores.get("ebit"),
+                        "netIncome":        eodhd_scores.get("netIncome"),
+                    }
+                    logger.info(
+                        "[QF] income_statement: FMP empty for %s — using EODHD financial_scores fallback",
+                        ticker,
+                    )
         except Exception as exc:
             logger.warning("Failed to fetch income_statement for %s: %s", ticker, exc)
 
-        # Balance sheet
+        # Balance sheet (FMP → EODHD financial_scores fallback)
         try:
             rows = self._latest_payload_list(ticker, "balance_sheet", limit=5)
             bundle.balance = rows[0] if rows else {}
+            if not bundle.balance:
+                eodhd_scores = self._latest_payload(ticker, "financial_scores")
+                if eodhd_scores:
+                    bundle.balance = {
+                        "totalAssets":             eodhd_scores.get("totalAssets"),
+                        "totalLiabilities":        eodhd_scores.get("totalLiabilities"),
+                        "workingCapital":          eodhd_scores.get("workingCapital"),
+                        "retainedEarnings":        eodhd_scores.get("retainedEarnings"),
+                        "totalStockholdersEquity": (
+                            (eodhd_scores.get("totalAssets") or 0)
+                            - (eodhd_scores.get("totalLiabilities") or 0)
+                        ) or None,
+                    }
+                    logger.info(
+                        "[QF] balance_sheet: FMP empty for %s — using EODHD financial_scores fallback",
+                        ticker,
+                    )
         except Exception as exc:
             logger.warning("Failed to fetch balance_sheet for %s: %s", ticker, exc)
 
-        # Cash flow
+        # Cash flow (FMP → EODHD key_metrics_ttm fallback)
         try:
             rows = self._latest_payload_list(ticker, "cash_flow", limit=5)
             bundle.cashflow = rows[0] if rows else {}
+            if not bundle.cashflow:
+                km = self._latest_payload(ticker, "key_metrics_ttm")
+                if km:
+                    fcff = _safe_float(km.get("freeCashFlowToFirmTTM"))
+                    fcfe = _safe_float(km.get("freeCashFlowToEquityTTM"))
+                    revenue = _safe_float(bundle.income.get("revenue")) if bundle.income else None
+                    capex_ratio = _safe_float(km.get("capexToRevenueTTM"))
+                    capex_abs = -(capex_ratio * revenue) if (capex_ratio and revenue) else None
+                    ocf = (fcff + abs(capex_abs)) if (fcff and capex_abs) else fcff
+                    bundle.cashflow = {
+                        "freeCashFlow":       fcfe,
+                        "freeCashFlowToFirm": fcff,
+                        "operatingCashFlow":  ocf,
+                        "capitalExpenditure": capex_abs,
+                        "netIncome":          bundle.income.get("netIncome") if bundle.income else None,
+                    }
+                    logger.info(
+                        "[QF] cash_flow: FMP empty for %s — using EODHD key_metrics_ttm fallback",
+                        ticker,
+                    )
         except Exception as exc:
             logger.warning("Failed to fetch cash_flow for %s: %s", ticker, exc)
 
-        # Financial ratios
+        # Financial ratios (FMP → ratios_ttm fallback — same field-name convention)
         try:
             rows = self._latest_payload_list(ticker, "financial_ratios", limit=5)
             bundle.ratios = rows[0] if rows else {}
+            if not bundle.ratios:
+                # ratios_ttm uses *TTM suffix — strip or map as needed downstream
+                bundle.ratios = self._latest_payload(ticker, "ratios_ttm")
+                if bundle.ratios:
+                    logger.info(
+                        "[QF] financial_ratios: FMP empty for %s — using EODHD ratios_ttm fallback",
+                        ticker,
+                    )
         except Exception as exc:
             logger.warning("Failed to fetch financial_ratios for %s: %s", ticker, exc)
 
-        # TTM ratios
+        # TTM ratios (EODHD ratios_ttm uses same field-name convention as FMP)
         try:
             bundle.ratios_ttm = self._latest_payload(ticker, "ratios_ttm")
         except Exception as exc:
             logger.warning("Failed to fetch ratios_ttm for %s: %s", ticker, exc)
 
-        # Key metrics
+        # Key metrics (FMP → key_metrics_ttm as fallback)
         try:
             rows = self._latest_payload_list(ticker, "key_metrics", limit=5)
             bundle.key_metrics = rows[0] if rows else {}
+            if not bundle.key_metrics:
+                bundle.key_metrics = self._latest_payload(ticker, "key_metrics_ttm")
+                if bundle.key_metrics:
+                    logger.info(
+                        "[QF] key_metrics: FMP empty for %s — using EODHD key_metrics_ttm fallback",
+                        ticker,
+                    )
         except Exception as exc:
             logger.warning("Failed to fetch key_metrics for %s: %s", ticker, exc)
 
-        # TTM key metrics
+        # TTM key metrics (EODHD key_metrics_ttm uses same field-name convention as FMP)
         try:
             bundle.key_metrics_ttm = self._latest_payload(ticker, "key_metrics_ttm")
         except Exception as exc:
             logger.warning("Failed to fetch key_metrics_ttm for %s: %s", ticker, exc)
 
-        # Enterprise values
+        # Enterprise values (FMP → EODHD key_metrics_ttm fallback)
         try:
             rows = self._latest_payload_list(ticker, "enterprise_values", limit=5)
             bundle.enterprise = rows[0] if rows else {}
+            if not bundle.enterprise:
+                km = self._latest_payload(ticker, "key_metrics_ttm")
+                if km:
+                    bundle.enterprise = {
+                        "enterpriseValue":       km.get("enterpriseValueTTM"),
+                        "marketCapitalization":  km.get("marketCap"),
+                    }
+                    logger.info(
+                        "[QF] enterprise_values: FMP empty for %s — using EODHD key_metrics_ttm fallback",
+                        ticker,
+                    )
         except Exception as exc:
             logger.warning("Failed to fetch enterprise_values for %s: %s", ticker, exc)
 
-        # Financial scores (Piotroski, Beneish from FMP)
+        # Financial scores (EODHD financial_scores has piotroskiScore, altmanZScore)
         try:
             bundle.scores = self._latest_payload(ticker, "financial_scores")
         except Exception as exc:
             logger.warning("Failed to fetch financial_scores for %s: %s", ticker, exc)
+
+        # Shares float (FMP only — EODHD has no equivalent)
+        try:
+            bundle.shares_float = self._latest_payload(ticker, "shares_float")
+        except Exception as exc:
+            logger.warning("Failed to fetch shares_float for %s: %s", ticker, exc)
 
         # Historical price data
         # Preference order: daily EOD (up to 400 rows) → weekly (54 rows, ~1 year) →
@@ -591,8 +694,6 @@ _ALLOWED_EXEC_MODULES = frozenset({
     "math", "statistics", "datetime", "json", "re",
     "pandas", "numpy",  # common financial data libraries
 })
-
-_EXEC_TIMEOUT_SECONDS = 10  # wall-clock budget for code execution
 
 
 def execute_python_on_bundle(

@@ -10,7 +10,17 @@ BASE_ETL_DIR = Path(os.getenv("BASE_ETL_DIR", "/opt/airflow/etl/agent_data"))
 
 NEO4J_URI      = os.getenv("NEO4J_URI",      "bolt://neo4j:7687")
 NEO4J_USER     = os.getenv("NEO4J_USER",     "neo4j")
-NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "changeme_neo4j_password")
+NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "SecureNeo4jPass2025!")
+
+# FMP data_names that contain strategy / narrative content and should be
+# loaded as (Company)-[:HAS_STRATEGY]->(Strategy) nodes.
+# Matches actual data_name values used by the FMP scraper in
+# dag_fmp_ingestion_unified.py AGENT_CONFIGS.
+_STRATEGY_DATA_NAMES = {
+    "strategy", "narrative", "mda", "md&a",        # legacy / EODHD names
+    "management_discussion", "company_outlook",      # FMP actual names
+    "company_notes", "business_description",         # FMP actual names
+}
 
 
 def get_driver():
@@ -104,6 +114,66 @@ def _load_fact(tx, ticker_symbol, data_name, row):
     )
 
 
+def _load_peer_relationships(session, ticker_symbol: str, peers_csv_path: Path) -> int:
+    """Create (Company)-[:COMPETES_WITH]->(Company) edges from stock_peers CSV.
+
+    FMP /stock_peers returns: [{"symbol": "AAPL", "peersList": ["MSFT", "GOOGL", ...]}]
+    The CSV will have columns 'symbol' and 'peersList' (as string of JSON array).
+
+    Both business_analyst/tools.py (fetch_graph_facts) and
+    financial_modelling/tools.py (Neo4jPeerSelector.get_peers) query
+    COMPETES_WITH relationships — this function creates them so Neo4j peer
+    resolution works without falling back to the static map.
+    """
+    if not peers_csv_path.exists():
+        return 0
+
+    try:
+        df = pd.read_csv(peers_csv_path)
+    except Exception as e:
+        print(f"[Neo4j Loader] Failed to read stock_peers CSV: {e}")
+        return 0
+
+    if df.empty:
+        return 0
+
+    # FMP returns list of objects; each row has 'symbol' and 'peersList'
+    # peersList may be a JSON-array string like '["MSFT","GOOGL"]'
+    count = 0
+    for _, row in df.iterrows():
+        symbol = str(row.get("symbol", ticker_symbol)).strip().upper() or ticker_symbol
+        peers_raw = row.get("peersList", "[]")
+        try:
+            if isinstance(peers_raw, str):
+                peers = json.loads(peers_raw)
+            elif isinstance(peers_raw, list):
+                peers = peers_raw
+            else:
+                peers = []
+        except Exception:
+            peers = []
+
+        for peer in peers:
+            peer = str(peer).strip().upper()
+            if not peer or peer == symbol:
+                continue
+            session.run(
+                """
+                MERGE (c:Company {ticker: $ticker})
+                MERGE (p:Company {ticker: $peer})
+                MERGE (c)-[:COMPETES_WITH]->(p)
+                MERGE (p)-[:COMPETES_WITH]->(c)
+                """,
+                ticker=symbol,
+                peer=peer,
+            )
+            count += 1
+
+    if count:
+        print(f"[Neo4j Loader] Created {count} COMPETES_WITH edges for {ticker_symbol}")
+    return count
+
+
 def load_neo4j_for_agent_ticker(agent_name: str, ticker_symbol: str) -> int:
     agent_dir     = BASE_ETL_DIR / agent_name / ticker_symbol
     metadata_path = agent_dir / "metadata.json"
@@ -151,7 +221,7 @@ def load_neo4j_for_agent_ticker(agent_name: str, ticker_symbol: str) -> int:
                     session.execute_write(_load_risk_factor, ticker_symbol, row.to_dict())
                     count += 1
 
-            elif any(k in data_name for k in ["strategy", "narrative", "mda", "md&a"]):
+            elif any(k in data_name for k in _STRATEGY_DATA_NAMES):
                 # FIX 2: now creates (Company)-[:HAS_STRATEGY]->(Strategy)
                 for _, row in df.iterrows():
                     session.execute_write(
@@ -166,6 +236,12 @@ def load_neo4j_for_agent_ticker(agent_name: str, ticker_symbol: str) -> int:
                 for _, row in df.iterrows():
                     session.execute_write(_load_fact, ticker_symbol, data_name, row)
                     count += 1
+
+        # ── COMPETES_WITH peer relationships ──────────────────────────────────
+        # Load from stock_peers CSV if present (FMP financial_modeling agent).
+        # This enables Neo4j peer resolution in Neo4jPeerSelector.get_peers().
+        peers_csv = agent_dir / "stock_peers.csv"
+        count += _load_peer_relationships(session, ticker_symbol, peers_csv)
 
     driver.close()
     return count

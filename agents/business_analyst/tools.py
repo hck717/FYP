@@ -226,8 +226,11 @@ class Neo4jConnector:
     def fetch_graph_facts(self, ticker: Optional[str], limit: int = 25) -> List[Dict[str, Any]]:
         if not ticker:
             return []
+        # Only query relationship types that are guaranteed to exist (EODHD-ingested).
+        # FACES_RISK and COMPETES_WITH are FMP-sourced and absent when FMP DAG is paused;
+        # including them triggers Neo4j GqlStatusObject WARNING notifications.
         cypher = """
-        MATCH (c:Company {ticker:$ticker})-[r:FACES_RISK|HAS_STRATEGY|COMPETES_WITH|HAS_FACT]->(n)
+        MATCH (c:Company {ticker:$ticker})-[r:HAS_STRATEGY|HAS_FACT]->(n)
         RETURN type(r) AS rel_type, properties(n) AS node_props, properties(r) AS rel_props
         LIMIT $limit
         """
@@ -423,13 +426,13 @@ class PostgresConnector:
     def fetch_sentiment(self, ticker: Optional[str]) -> Optional[SentimentSnapshot]:
         if not ticker:
             return None
-        # NOTE: live DB uses 'date' column; 'trend' added via migration when present
+        # NOTE: live DB uses 'as_of_date' column; 'trend' added via migration when present
         sql = """
         SELECT bullish_pct, bearish_pct, neutral_pct,
                COALESCE(trend, 'unknown') AS trend
         FROM sentiment_trends
         WHERE ticker = %s
-        ORDER BY date DESC
+        ORDER BY as_of_date DESC
         LIMIT 1
         """
         conn = psycopg2.connect(

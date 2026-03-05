@@ -298,16 +298,72 @@ def load_qdrant_for_agent_ticker(agent_name: str, ticker_symbol: str) -> int:
             df["__text__"] = df.astype(str).agg(" | ".join, axis=1)
             text_col = "__text__"
 
-        for _, row in df.iterrows():
+        for row_idx, row in df.iterrows():
             raw_text = str(row.get(text_col, ""))
             if raw_text.strip().lower() in _NULL_SENTINELS:
                 continue
             payload = row.to_dict()
+
+            # ── Derive chunk_id, section, filing_date from available columns ──
+            # business_analyst/tools.py QdrantConnector.vector_search() reads
+            # these fields from Qdrant payload hits — they must be present.
+            #
+            # chunk_id: use an existing 'id' / 'chunk_id' column, else generate
+            # a deterministic ID from ticker + data_name + row index so it is
+            # stable across re-ingestion and can be used as a Qdrant point ID.
+            _chunk_id = (
+                str(row.get("chunk_id", ""))
+                or str(row.get("id", ""))
+                or f"{ticker_symbol}:{data_name}:{row_idx}"
+            )
+            _chunk_id = _chunk_id.strip() or f"{ticker_symbol}:{data_name}:{row_idx}"
+
+            # section: infer from data_name (e.g. "sec_filings_10k" → "10-K")
+            _section = (
+                str(row.get("section", ""))
+                or str(row.get("formType", ""))
+                or str(row.get("type", ""))
+                or str(row.get("form", ""))
+            )
+            if not _section or _section.lower() in _NULL_SENTINELS:
+                # Infer from data_name
+                dn = data_name.lower()
+                if "10k" in dn or "10-k" in dn:
+                    _section = "10-K"
+                elif "10q" in dn or "10-q" in dn:
+                    _section = "10-Q"
+                elif "8k" in dn or "8-k" in dn:
+                    _section = "8-K"
+                elif "transcript" in dn or "earnings" in dn:
+                    _section = "earnings_call"
+                elif "news" in dn:
+                    _section = "news"
+                elif "press" in dn:
+                    _section = "press_release"
+                else:
+                    _section = data_name
+
+            # filing_date: use any date-like column present in the row
+            _filing_date = (
+                str(row.get("filing_date", ""))
+                or str(row.get("date", ""))
+                or str(row.get("fillingDate", ""))
+                or str(row.get("acceptedDate", ""))
+                or str(row.get("publishedDate", ""))
+                or str(row.get("datetime", ""))
+            )
+            if not _filing_date or _filing_date.lower() in _NULL_SENTINELS:
+                _filing_date = ""
+
             payload.update({
                 "agent_name":    agent_name,
                 "ticker_symbol": ticker_symbol,
                 "data_name":     data_name,
                 "source":        info.get("source", "unknown"),
+                # Fields required by business_analyst/tools.py vector_search()
+                "chunk_id":      _chunk_id,
+                "section":       _section,
+                "filing_date":   _filing_date,
             })
             all_ids.append(str(uuid.uuid4()))
             all_texts.append(raw_text)

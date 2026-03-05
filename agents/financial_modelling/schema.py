@@ -344,6 +344,9 @@ class FMDataBundle:
     # Peer fundamentals for Comps
     peer_fundamentals: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
+    # Revenue segmentation (FMP)
+    revenue_segments: Dict[str, List[Dict[str, Any]]] = field(default_factory=dict)
+
     def is_empty(self) -> bool:
         return not any([
             self.income, self.balance, self.cashflow,

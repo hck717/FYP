@@ -46,7 +46,7 @@ _DEFAULT_ARGS = {
     "email_on_failure": False,
     "email_on_retry": False,
     "retries": 1,
-    "retry_delay": timedelta(minutes=5),
+    "retry_delay": timedelta(seconds=30),
 }
 
 
@@ -60,7 +60,7 @@ def _fetch_recent_run_ids(**context) -> List[str]:
     import sys
     import os
     # Ensure the repo root is on sys.path so the agents package is importable
-    repo_root = os.getenv("FYP_REPO_ROOT", "/opt/airflow/dags/repo")
+    repo_root = os.getenv("FYP_REPO_ROOT", "/opt/airflow")
     if repo_root not in sys.path:
         sys.path.insert(0, repo_root)
 
@@ -85,11 +85,11 @@ def _fetch_source_chunks_for_run(run_id: str) -> Dict[str, List[str]]:
     try:
         import psycopg2  # type: ignore[import]
         conn = psycopg2.connect(
-            host=os.getenv("POSTGRES_HOST", "localhost"),
+            host=os.getenv("POSTGRES_HOST", "postgres"),
             port=int(os.getenv("POSTGRES_PORT", "5432")),
-            dbname=os.getenv("POSTGRES_DB", "financial_data"),
-            user=os.getenv("POSTGRES_USER", "postgres"),
-            password=os.getenv("POSTGRES_PASSWORD", "postgres"),
+            dbname=os.getenv("POSTGRES_DB", "airflow"),
+            user=os.getenv("POSTGRES_USER", "airflow"),
+            password=os.getenv("POSTGRES_PASSWORD", "airflow"),
         )
         chunks_by_agent: Dict[str, List[str]] = {}
         with conn, conn.cursor() as cur:
@@ -123,11 +123,11 @@ def _fetch_agent_outputs_for_run(run_id: str) -> Dict[str, Any]:
     try:
         import psycopg2  # type: ignore[import]
         conn = psycopg2.connect(
-            host=os.getenv("POSTGRES_HOST", "localhost"),
+            host=os.getenv("POSTGRES_HOST", "postgres"),
             port=int(os.getenv("POSTGRES_PORT", "5432")),
-            dbname=os.getenv("POSTGRES_DB", "financial_data"),
-            user=os.getenv("POSTGRES_USER", "postgres"),
-            password=os.getenv("POSTGRES_PASSWORD", "postgres"),
+            dbname=os.getenv("POSTGRES_DB", "airflow"),
+            user=os.getenv("POSTGRES_USER", "airflow"),
+            password=os.getenv("POSTGRES_PASSWORD", "airflow"),
         )
         outputs: Dict[str, Any] = {}
         with conn, conn.cursor() as cur:
@@ -162,7 +162,7 @@ def _fetch_agent_outputs_for_run(run_id: str) -> Dict[str, Any]:
 def _run_nli_check(**context) -> Dict[str, Any]:
     """Task 2: Run NLI hallucination check for each run_id fetched in Task 1."""
     import sys
-    repo_root = os.getenv("FYP_REPO_ROOT", "/opt/airflow/dags/repo")
+    repo_root = os.getenv("FYP_REPO_ROOT", "/opt/airflow")
     if repo_root not in sys.path:
         sys.path.insert(0, repo_root)
 
@@ -215,7 +215,7 @@ def _run_nli_check(**context) -> Dict[str, Any]:
 def _compute_cur(**context) -> Dict[str, Any]:
     """Task 3: Compute Citation Utilisation Rate for each run_id."""
     import sys
-    repo_root = os.getenv("FYP_REPO_ROOT", "/opt/airflow/dags/repo")
+    repo_root = os.getenv("FYP_REPO_ROOT", "/opt/airflow")
     if repo_root not in sys.path:
         sys.path.insert(0, repo_root)
 

@@ -489,13 +489,10 @@ def _node_calculate_quality_factors(
             roic=_float_or_none(mv_row.get("roic_ttm")),
         )
         km_dict = {
-            "roe": _float_or_none(mv_row.get("roe_ttm")),
-            "roa": _float_or_none(mv_row.get("roa_ttm")),
-            "roic": _float_or_none(mv_row.get("roic_ttm")),
-            "gross_margin": _float_or_none(mv_row.get("gross_margin_ttm")),
-            "net_margin": _float_or_none(mv_row.get("net_margin_ttm")),
+            "gross_margin":   _float_or_none(mv_row.get("gross_margin_ttm")),
+            "ebit_margin":    _float_or_none(mv_row.get("net_margin_ttm")),   # best EODHD proxy for ebit_margin
             "debt_to_equity": _float_or_none(mv_row.get("debt_to_equity_ttm")),
-            "current_ratio": _float_or_none(mv_row.get("current_ratio_ttm")),
+            "current_ratio":  _float_or_none(mv_row.get("current_ratio_ttm")),
         }
         key_metrics = KeyMetrics(**{k: v for k, v in km_dict.items() if v is not None})
         logger.debug("quality_factors from MV for %s: %s", ticker, quality.to_dict())

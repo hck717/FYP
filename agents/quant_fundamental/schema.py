@@ -174,6 +174,7 @@ class FinancialsBundle:
     key_metrics_ttm: Dict[str, Any] = field(default_factory=dict)
     enterprise: Dict[str, Any] = field(default_factory=dict)  # enterprise_values payload
     scores: Dict[str, Any] = field(default_factory=dict)      # financial_scores payload
+    shares_float: Dict[str, Any] = field(default_factory=dict)  # shares_float payload (FMP)
     price_history: List[Dict[str, Any]] = field(default_factory=list)  # raw_timeseries rows
     benchmark_history: List[Dict[str, Any]] = field(default_factory=list)  # market_eod_us rows
     # Last 4 quarters of key income statement line items — populated by fetch_financials node

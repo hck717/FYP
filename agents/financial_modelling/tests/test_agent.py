@@ -42,7 +42,7 @@ def config() -> FinancialModellingConfig:
         llm_model="deepseek-r1:8b",
         llm_temperature=0.0,
         llm_max_tokens=512,
-        request_timeout=10,
+        request_timeout=None,
         dcf_discount_rate=0.10,
         terminal_growth_rate=0.03,
         beta_lookback_days=60,

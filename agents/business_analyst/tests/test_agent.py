@@ -124,7 +124,7 @@ def _minimal_config() -> BusinessAnalystConfig:
     from pathlib import Path
     cfg.repo_root = Path(".")
     cfg.agent_data_dir = Path("ingestion/etl/agent_data/business_analyst")
-    cfg.request_timeout = 60
+    cfg.request_timeout = None
     cfg.neo4j_verify = False
     cfg.enable_web_fallback = True
     return cfg

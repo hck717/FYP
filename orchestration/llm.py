@@ -441,9 +441,9 @@ def _fetch_top_successful_queries(limit: int = 5) -> List[Dict[str, Any]]:
         conn = psycopg2.connect(
             host=os.getenv("POSTGRES_HOST", "localhost"),
             port=int(os.getenv("POSTGRES_PORT", "5432")),
-            dbname=os.getenv("POSTGRES_DB", "financial_data"),
-            user=os.getenv("POSTGRES_USER", "postgres"),
-            password=os.getenv("POSTGRES_PASSWORD", "postgres"),
+            dbname=os.getenv("POSTGRES_DB", "airflow"),
+            user=os.getenv("POSTGRES_USER", "airflow"),
+            password=os.getenv("POSTGRES_PASSWORD", "airflow"),
         )
         rows: List[Dict[str, Any]] = []
         with conn, conn.cursor() as cur:

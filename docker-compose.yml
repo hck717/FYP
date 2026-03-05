@@ -57,7 +57,7 @@ x-airflow-common:
     # Other common database / agent settings
     QDRANT_HOST: qdrant
     QDRANT_PORT: 6333
-    QDRANT_COLLECTION_NAME: financial_docs
+    QDRANT_COLLECTION_NAME: financial_documents
     NEO4J_URI: bolt://neo4j:7687
     NEO4J_USER: neo4j
     NEO4J_PASSWORD: SecureNeo4jPass2025!
@@ -67,6 +67,8 @@ x-airflow-common:
     BUSINESS_ANALYST_MAX_CHUNKS: 50
     BUSINESS_ANALYST_CHUNK_SIZE: 1000
     BUSINESS_ANALYST_OVERLAP: 200
+
+    TRACKED_TICKERS: "AAPL,TSLA,NVDA,MSFT,GOOGL"
 
     # You can add more agent/ingestion settings here if needed (hard-coded)
     # QUANT_AGENT_SQL_TIMEOUT: 30
@@ -96,7 +98,7 @@ services:
       - QDRANT__SERVICE__GRPC_PORT=6334
     restart: always
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:6333/readyz || exit 1"]
+      test: ["CMD-SHELL", "bash -c 'echo -e \"GET /readyz HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n\" > /dev/tcp/localhost/6333' || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -171,7 +173,7 @@ services:
       - -c
       - |
         mkdir -p /opt/airflow/logs /opt/airflow/dags /opt/airflow/etl
-        airflow db upgrade
+        airflow db migrate
         airflow users create \
           --username admin \
           --password admin \

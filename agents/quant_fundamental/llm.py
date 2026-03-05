@@ -12,8 +12,7 @@ deepseek-r1 / Ollama notes
   chain-of-thought reasoning block. We always send this flag.
 - As a belt-and-suspenders measure, _clean_response() also strips any residual
   <think>...</think> tags from the response text.
-- `request_timeout` defaults to 120 s (config.py) to prevent indefinite hangs
-  on slow-thinking models with large num_predict budgets.
+- `request_timeout` defaults to None (no timeout) — let Ollama run to completion.
 """
 
 from __future__ import annotations

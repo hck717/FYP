@@ -21,7 +21,7 @@ Dependencies
 - Ollama running at OLLAMA_BASE_URL with qwen2.5:7b or deepseek-r1:8b pulled.
 - sentence-transformers installed in the Airflow Python environment.
 - Neo4j vector index `chunk_embedding` (384-dim) — created by the DAG if absent.
-- FYP_REPO_ROOT env var pointing to the repo root (default: /opt/airflow/repo).
+- FYP_REPO_ROOT env var pointing to the repo root (default: /opt/airflow).
 """
 
 from __future__ import annotations
@@ -51,13 +51,13 @@ _DEFAULT_ARGS = {
     "email_on_failure": False,
     "email_on_retry": False,
     "retries": 1,
-    "retry_delay": timedelta(minutes=10),
+    "retry_delay": timedelta(seconds=30),
     "execution_timeout": None,  # no cap — LLM synthesis can take a while
 }
 
 # ── configuration ─────────────────────────────────────────────────────────────
 
-_REPO_ROOT = os.getenv("FYP_REPO_ROOT", "/opt/airflow/repo")
+_REPO_ROOT = os.getenv("FYP_REPO_ROOT", "/opt/airflow")
 _TICKERS: List[str] = [
     t.strip()
     for t in os.getenv("TRACKED_TICKERS", "AAPL,MSFT,GOOGL,TSLA,NVDA").split(",")

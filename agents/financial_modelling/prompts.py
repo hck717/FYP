@@ -27,13 +27,41 @@ for a portfolio manager making a sizing or entry/exit decision.
 Depth, precision, sector context, and analytical synthesis are mandatory.
 Shallow observations are a critical failure.
 
-RULES — violating any of these is a critical failure:
+=== DATA AVAILABILITY TIERS ===
+
+The database currently reflects EODHD ingestion only. Understand which data is available:
+
+TIER 1 — Always available (EODHD):
+  - Price history (EOD/weekly), technicals (RSI, MACD, Bollinger, SMAs)
+  - Dividend history, payout ratio, dividend yield
+  - Factor scores: Piotroski F-Score, Altman Z-Score (from EODHD financial_scores)
+  - Capital efficiency: ROE, ROIC, current ratio (from EODHD key_metrics_ttm)
+  - Revenue segmentation: product and geographic breakdowns (from EODHD timeseries)
+  - EV/EBITDA, EV/Sales (from EODHD key_metrics_ttm)
+  - Analyst estimates (EODHD analyst_estimates_eodhd)
+
+TIER 2 — Requires FMP ingestion (currently PENDING — FMP DAG paused):
+  - DCF intrinsic value (requires revenue, FCF from FMP income_statement/cash_flow)
+  - Revenue-based comps multiples that depend on FMP income_statement
+  - Beneish M-Score (requires specific accruals from FMP balance_sheet/cash_flow)
+  - WACC inputs from FMP treasury_rates
+  - EPS surprise / beat streak (requires FMP analyst_estimates)
+
+When Tier 2 data is null (DCF values are null):
+  - Do NOT say "data unavailable" for every DCF field — acknowledge once and pivot.
+  - Lead your narrative with Tier 1 data: technicals, dividend profile, factor scores,
+    EV/EBITDA from EODHD, and any comps multiples that ARE populated.
+  - Synthesise the investment picture from technicals + dividend yield + factor scores.
+  - If `intrinsic_value_weighted` is null: state once "DCF analysis requires FMP financial
+    statement data which is pending ingestion" and immediately pivot to technicals and comps.
+
+=== RULES — violating any of these is a critical failure ===
 1. Use ONLY the numbers explicitly present in the factor table. Never invent, approximate,
    or extrapolate values that are not shown.
 2. Never recalculate, re-derive, or adjust any value — the Python pipeline is authoritative.
 3. If a field is null or not present in the factor table, SKIP that topic entirely — do not
    mention it at all. Do not say "data unavailable" or reference the missing metric by name.
-   Write as if that section simply does not exist.
+   Exception: for DCF specifically, acknowledge its absence ONCE and pivot — do not repeat.
 4. Do not make buy, sell, or hold recommendations.
 5. Plain prose only — no JSON, no markdown, no bullet points, no headers, no labels.
 6. Minimum 8 sentences (fewer if most data is null). Maximum 15 sentences.
@@ -41,20 +69,19 @@ RULES — violating any of these is a critical failure:
 8. Write as if briefing a PM who already knows the numbers — your value is the interpretation.
 
 COVERAGE REQUIREMENTS (address each ONLY if the relevant fields are non-null in the factor table;
-skip the entire section if all its fields are null):
+skip the entire section if all its fields are null — except DCF which gets one acknowledgment):
 
 1. DCF INTRINSIC VALUE — Bear / Base / Bull scenarios + probability-weighted value:
-   State the probability-weighted intrinsic value first (`intrinsic_value_weighted`) as the
-   primary anchor — this is the most defensible single-number valuation output.
+   If `intrinsic_value_weighted` is null: acknowledge once ("DCF intrinsic value is unavailable
+   pending FMP financial statement ingestion") and skip this section entirely.
+   If available: state the probability-weighted intrinsic value first as the primary anchor.
    Then state the base-case and the implied upside or downside vs. current price.
    Comment on which scenario (bear/base/bull) is most likely given the WACC used.
    Note the full implied price range (bear to bull) as a spread — wider spreads signal higher
    fundamental uncertainty.
-   If `reverse_dcf_implied_cagr` is present, state what revenue CAGR the market is pricing in:
-   "The market is pricing in approximately X% annual revenue growth to justify the current price."
+   If `reverse_dcf_implied_cagr` is present, state what revenue CAGR the market is pricing in.
    Compare this implied growth to the base-case assumption to assess whether the stock is
    fairly valued, cheap, or expensive relative to the market's embedded expectations.
-   If the WACC used is materially above or below 10%, note the sensitivity implication.
 
 2. COMPARABLE COMPANY ANALYSIS (Comps):
    State whether the stock trades at a premium or discount to peers on EV/EBITDA, P/E, and
@@ -101,14 +128,16 @@ skip the entire section if all its fields are null):
    State whether the three scores tell a consistent or contradictory story about financial health.
 
 8. SYNTHESIS — Quantitative Risk/Reward:
-   Close with 2 sentences synthesising DCF (especially the probability-weighted value and
-   implied growth vs. market price), Comps, technicals, and factor scores into a single
-   coherent characterisation of the current quantitative risk/reward profile.
-   Example: "The probability-weighted intrinsic value of $X implies Y% upside, but the reverse
-   DCF reveals the market is pricing in Z% revenue CAGR — above the base-case assumption —
-   leaving limited margin of safety; the RSI-neutral setup and consecutive EPS beat streak
-   suggest the premium is being sustained by near-term earnings momentum rather than
-   fundamental value expansion."
+   When DCF is available: close with 2 sentences synthesising DCF, Comps, technicals, and
+   factor scores into a single coherent characterisation of the current quantitative
+   risk/reward profile.
+   When DCF is unavailable (Tier 2 pending): synthesise from Tier 1 data only — technicals
+   trend, dividend yield vs. risk-free rate, factor score quality signal, and any EODHD comps
+   multiples. Example: "With DCF analysis pending FMP ingestion, the near-term risk/reward
+   picture is anchored by the technical setup and factor score quality: a [trend] technical
+   posture combined with a Piotroski score of [X] and Altman Z-Score of [Y] suggests
+   [characterisation]; the [X]% dividend yield provides [assessment] income support relative
+   to the current risk-free rate."
 
 Respond with the narrative text ONLY. No preamble. No headers. No postamble.
 """.strip()

@@ -160,20 +160,30 @@ class PostgresConnector:
         exclude_ticker: str,
         limit: int = 5,
     ) -> List[str]:
-        """Fallback: top-N tickers by market cap in the same GICS sector."""
+        """Fallback: top-N tickers by market cap in the same GICS sector.
+
+        Queries the 'key_metrics_ttm' data_name (FMP) joined with company_core_info
+        for sector classification.  Falls back to income_statement sector field.
+        """
         sql = """
-        SELECT DISTINCT ticker_symbol
-        FROM raw_fundamentals
-        WHERE data_name = 'key_metrics_ttm'
-          AND ticker_symbol != %s
-          AND payload->>'sector' = %s
-        ORDER BY (payload->>'marketCapTTM')::numeric DESC NULLS LAST
+        SELECT DISTINCT f.ticker_symbol
+        FROM raw_fundamentals f
+        JOIN raw_fundamentals km
+          ON km.ticker_symbol = f.ticker_symbol
+         AND km.data_name = 'key_metrics_ttm'
+        WHERE f.data_name = 'company_core_info'
+          AND f.ticker_symbol != %s
+          AND (
+            f.payload->>'sector' = %s
+            OR f.payload->>'Sector' = %s
+          )
+        ORDER BY (km.payload->>'marketCapTTM')::numeric DESC NULLS LAST
         LIMIT %s
         """
         try:
             conn = self._connect()
             with closing(conn), conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute(sql, (exclude_ticker, sector, limit))
+                cur.execute(sql, (exclude_ticker, sector, sector, limit))
                 rows = cur.fetchall()
             return [r["ticker_symbol"] for r in rows]
         except Exception as exc:
@@ -301,189 +311,286 @@ class FMDataFetcher:
     def fetch(self, ticker: str) -> FMDataBundle:
         """Fetch all data needed for the FM pipeline for one ticker.
 
-        Data layout in the actual PostgreSQL schema:
-          raw_fundamentals:
-            - "financial_scores"     : revenue, ebit, totalAssets, totalLiabilities,
-                                       workingCapital, retainedEarnings, marketCap,
-                                       altmanZScore, piotroskiScore
-            - "fundamentals"         : Highlights_*/Valuation_* flat keys (company overview)
-            - "key_metrics_ttm"      : evToEBITDATTM, evToSalesTTM, marketCap,
-                                       enterpriseValueTTM, capexToRevenueTTM, etc.
-            - "ratios_ttm"           : priceToEarningsRatioTTM, priceToSalesRatioTTM,
-                                       dividendYieldTTM, dividendPayoutRatioTTM, etc.
-            - "earnings_history"     : stub metadata only (no EPS data usable)
-            - "analyst_estimates_eodhd": same shape as "fundamentals"
+        Primary source is FMP (raw_fundamentals); when FMP ingestion is paused
+        the method falls back to EODHD data already in the database:
 
-          raw_timeseries:
-            - "historical_prices_eod"    : ~23 daily rows  (open/high/low/close/volume)
-            - "historical_prices_weekly" : ~54 weekly rows
-            - "historical_prices_monthly": ~26 monthly rows
-            - "dividends_history"        : quarterly dividend rows with "value" key
+          raw_fundamentals — FMP (primary) or EODHD (fallback):
+            FMP data_names:
+              "income_statement", "balance_sheet", "cash_flow",
+              "income_statement_as_reported", "balance_sheet_as_reported",
+              "cash_flow_as_reported", "key_metrics_ttm", "ratios_ttm",
+              "financial_scores", "analyst_estimates",
+              "revenue_product_segmentation" (FMP), "revenue_geographic_segmentation" (FMP),
+              "treasury_rates", "stock_peers"
+            EODHD fallback data_names (same table):
+              "financial_scores"   : revenue, ebit, totalAssets, totalLiabilities,
+                                     workingCapital, retainedEarnings, altmanZScore,
+                                     piotroskiScore — used to reconstruct income/balance
+              "key_metrics_ttm"    : freeCashFlowToFirmTTM, enterpriseValueTTM,
+                                     returnOnEquityTTM, returnOnInvestedCapitalTTM, etc.
+              "ratios_ttm"         : priceToEarningsRatioTTM, grossProfitMarginTTM,
+                                     effectiveTaxRateTTM, dividendYieldTTM, etc.
+              "fundamentals"       : Highlights_EBITDA, Highlights_MarketCapitalization,
+                                     Valuation_EnterpriseValue (flattened payload)
+              "analyst_estimates_eodhd": EODHD analyst estimates
+
+          raw_timeseries — EODHD:
+            "historical_prices_weekly"       : ~54 weekly rows (preferred for indicators)
+            "historical_prices_eod"          : daily rows
+            "dividends_history"              : quarterly dividend rows (value key)
+            "revenue_product_segmentation"   : EODHD product revenue by fiscal year
+            "revenue_geographic_segmentation": EODHD geographic revenue by fiscal year
         """
         bundle = FMDataBundle(ticker=ticker)
 
-        # ── financial_scores: income/balance proxies + Piotroski + Altman ────
-        # This table has revenue, ebit, totalAssets, totalLiabilities,
-        # workingCapital, retainedEarnings, marketCap — sufficient for DCF + Altman Z.
+        # ── Income statement (FMP primary → EODHD fallback) ───────────────────
         try:
-            scores_payload = self._latest_payload(ticker, "financial_scores")
-            bundle.scores = scores_payload
+            rows = self._latest_payload_list(ticker, "income_statement", limit=5)
+            inc = rows[0] if rows else {}
+            if not inc:
+                # EODHD fallback: financial_scores has revenue, ebit, netIncome etc.
+                inc = self._latest_payload(ticker, "financial_scores")
+                logger.info(
+                    "[FM] income_statement: FMP empty for %s — using EODHD financial_scores fallback",
+                    ticker,
+                )
+            # EBITDA overlay from EODHD fundamentals if still missing
+            ebitda_val = inc.get("ebitda")
+            if ebitda_val is None:
+                fund = self._latest_payload(ticker, "fundamentals")
+                ebitda_val = fund.get("Highlights_EBITDA")
+            bundle.income = {
+                "revenue":              inc.get("revenue"),
+                "grossProfit":          inc.get("grossProfit"),
+                "ebit":                 inc.get("operatingIncome") or inc.get("ebit"),
+                "operatingIncome":      inc.get("operatingIncome") or inc.get("ebit"),
+                "ebitda":               ebitda_val,
+                "netIncome":            inc.get("netIncome"),
+                "interestExpense":      inc.get("interestExpense"),
+                "incomeTaxExpense":     inc.get("incomeTaxExpense"),
+                "incomeBeforeTax":      inc.get("incomeBeforeTax"),
+                "depreciationAmortization": inc.get("depreciationAndAmortization"),
+            }
+        except Exception as exc:
+            logger.warning("income_statement fetch failed for %s: %s", ticker, exc)
 
-            # Populate income/balance from financial_scores so DCF + Altman Z work
-            if scores_payload:
-                bundle.income = {
-                    "revenue":        scores_payload.get("revenue"),
-                    "ebit":           scores_payload.get("ebit"),
-                    "operatingIncome": scores_payload.get("ebit"),
-                    # Derive net income: income * profit margin from fundamentals overlay later
-                    "netIncome":      None,
-                    "interestExpense": None,
-                    "incomeTaxExpense": None,
-                    "incomeBeforeTax":  None,
-                }
-                bundle.balance = {
-                    "totalAssets":          scores_payload.get("totalAssets"),
-                    "totalLiabilities":     scores_payload.get("totalLiabilities"),
-                    "workingCapital":       scores_payload.get("workingCapital"),
-                    "retainedEarnings":     scores_payload.get("retainedEarnings"),
-                    # totalCurrentAssets/Liabilities not stored; approximate from workingCapital
-                    "totalCurrentAssets":   None,
-                    "totalCurrentLiabilities": None,
-                    "totalDebt":            None,
-                    "cashAndCashEquivalents": None,
-                    "longTermDebt":         None,
-                }
+        # ── Balance sheet (FMP primary → EODHD fallback) ──────────────────────
+        try:
+            rows = self._latest_payload_list(ticker, "balance_sheet", limit=5)
+            bal = rows[0] if rows else {}
+            if not bal:
+                # EODHD fallback: financial_scores has totalAssets, totalLiabilities,
+                # workingCapital, retainedEarnings
+                bal = self._latest_payload(ticker, "financial_scores")
+                logger.info(
+                    "[FM] balance_sheet: FMP empty for %s — using EODHD financial_scores fallback",
+                    ticker,
+                )
+            bundle.balance = {
+                "totalAssets":              bal.get("totalAssets"),
+                "totalLiabilities":         bal.get("totalLiabilities"),
+                "totalDebt":                bal.get("totalDebt") or bal.get("longTermDebt"),
+                "longTermDebt":             bal.get("longTermDebt"),
+                "cashAndCashEquivalents":   bal.get("cashAndCashEquivalents"),
+                "workingCapital":           bal.get("totalCurrentAssets", 0)
+                                            - bal.get("totalCurrentLiabilities", 0)
+                                            if (bal.get("totalCurrentAssets") and bal.get("totalCurrentLiabilities"))
+                                            else bal.get("workingCapital"),
+                "retainedEarnings":         bal.get("retainedEarnings"),
+                "totalCurrentAssets":       bal.get("totalCurrentAssets"),
+                "totalCurrentLiabilities":  bal.get("totalCurrentLiabilities"),
+                "totalStockholdersEquity":  bal.get("totalStockholdersEquity"),
+                "marketCapitalization":     None,  # populated from key_metrics_ttm below
+            }
+        except Exception as exc:
+            logger.warning("balance_sheet fetch failed for %s: %s", ticker, exc)
+
+        # ── Cash flow statement (FMP primary → EODHD key_metrics_ttm fallback) ─
+        try:
+            rows = self._latest_payload_list(ticker, "cash_flow", limit=5)
+            cf = rows[0] if rows else {}
+            bundle.cashflow = {
+                "operatingCashFlow":   cf.get("operatingCashFlow"),
+                "capitalExpenditure":  cf.get("capitalExpenditure"),
+                "freeCashFlow":        cf.get("freeCashFlow"),
+                "netIncome":           cf.get("netIncome"),
+                "depreciationAmortization": cf.get("depreciationAndAmortization"),
+            }
+            if not cf:
+                # EODHD fallback: key_metrics_ttm has freeCashFlowToFirmTTM,
+                # freeCashFlowToEquityTTM, capexToRevenueTTM etc.
+                km = self._latest_payload(ticker, "key_metrics_ttm")
+                if km:
+                    logger.info(
+                        "[FM] cash_flow: FMP empty for %s — using EODHD key_metrics_ttm fallback",
+                        ticker,
+                    )
+                    fcff = _safe_float(km.get("freeCashFlowToFirmTTM"))
+                    fcfe = _safe_float(km.get("freeCashFlowToEquityTTM"))
+                    revenue = _safe_float(bundle.income.get("revenue")) if bundle.income else None
+                    capex_ratio = _safe_float(km.get("capexToRevenueTTM"))
+                    capex_abs = -(capex_ratio * revenue) if (capex_ratio and revenue) else None
+                    ocf = _safe_float(km.get("freeCashFlowToFirmTTM"))
+                    # OCF ≈ FCFF + capex (capex is negative)
+                    if ocf and capex_abs:
+                        ocf = ocf + abs(capex_abs)
+                    bundle.cashflow = {
+                        "operatingCashFlow":        ocf,
+                        "capitalExpenditure":       capex_abs,
+                        "freeCashFlow":             fcfe,
+                        "freeCashFlowToFirm":       fcff,
+                        "netIncome":                bundle.income.get("netIncome") if bundle.income else None,
+                        "depreciationAmortization": None,
+                    }
+        except Exception as exc:
+            logger.warning("cash_flow fetch failed for %s: %s", ticker, exc)
+
+        # ── Financial scores (FMP Piotroski / Altman / Beneish) ───────────────
+        try:
+            bundle.scores = self._latest_payload(ticker, "financial_scores")
         except Exception as exc:
             logger.warning("financial_scores fetch failed for %s: %s", ticker, exc)
 
-        # ── fundamentals (flat): overlay additional income/balance fields ────
-        try:
-            fund_payload = self._latest_payload(ticker, "fundamentals")
-            if fund_payload:
-                # Derive net income from revenue × profit margin
-                revenue = bundle.income.get("revenue") if bundle.income else None
-                profit_margin = _safe_float(fund_payload.get("Highlights_ProfitMargin"))
-                if revenue and profit_margin:
-                    bundle.income["netIncome"] = revenue * profit_margin
-
-                # Use Highlights_EBITDA to back-derive cash flow proxy
-                ebitda = _safe_float(fund_payload.get("Highlights_EBITDA"))
-                if ebitda and bundle.income:
-                    bundle.income["ebitda"] = ebitda
-
-                # Market cap from fundamentals for WACC capital structure
-                mkt_cap = _safe_float(fund_payload.get("Highlights_MarketCapitalization"))
-                if mkt_cap and bundle.balance:
-                    bundle.balance["marketCapitalization"] = mkt_cap
-
-                # Enterprise value
-                ev = _safe_float(fund_payload.get("Valuation_EnterpriseValue"))
-                if ev:
-                    bundle.enterprise["enterpriseValue"] = ev
-                    bundle.enterprise["enterpriseValueTTM"] = ev
-                    bundle.enterprise["marketCapitalization"] = mkt_cap
-
-                # Forward P/E proxy for earnings estimate
-                fwd_pe = _safe_float(fund_payload.get("Valuation_ForwardPE"))
-                if fwd_pe:
-                    bundle.enterprise["forwardPE"] = fwd_pe
-
-        except Exception as exc:
-            logger.warning("fundamentals fetch failed for %s: %s", ticker, exc)
-
-        # ── key_metrics_ttm ────────────────────────────────────────────────────
+        # ── key_metrics_ttm (FMP) — EV, market cap, FCFF, capex/rev ──────────
         try:
             bundle.key_metrics_ttm = self._latest_payload(ticker, "key_metrics_ttm")
-            # Overlay useful fields onto enterprise if not already set
             if bundle.key_metrics_ttm:
-                if not bundle.enterprise.get("enterpriseValueTTM"):
-                    bundle.enterprise["enterpriseValueTTM"] = bundle.key_metrics_ttm.get("enterpriseValueTTM")
-                # marketCap from key_metrics_ttm uses key "marketCap"
-                if not bundle.enterprise.get("marketCapitalization"):
-                    bundle.enterprise["marketCapitalization"] = bundle.key_metrics_ttm.get("marketCap")
+                ev_ttm  = _safe_float(bundle.key_metrics_ttm.get("enterpriseValueTTM"))
+                mkt_cap = _safe_float(bundle.key_metrics_ttm.get("marketCap"))
+                bundle.enterprise["enterpriseValueTTM"]   = ev_ttm
+                bundle.enterprise["marketCapitalization"] = mkt_cap
 
-                # ── Populate cashflow from TTM metrics (no cashflow_statement in DB) ──
-                # freeCashFlowToFirmTTM is FCFF = NOPAT - net capex; use as OCF proxy
-                # for the DCF engine's base_fcf calculation.
-                fcff = _safe_float(bundle.key_metrics_ttm.get("freeCashFlowToFirmTTM"))
-                capex_to_rev = _safe_float(bundle.key_metrics_ttm.get("capexToRevenueTTM"))
-                revenue = _safe_float(bundle.income.get("revenue")) if bundle.income else None
-                if fcff is not None and fcff > 0:
-                    # Reconstruct OCF and capex from FCFF and capex/revenue ratio
-                    # FCFF ≈ OCF - capex (levered: FCFE = FCFF - interest*(1-t) + net debt changes)
-                    # For DCF purposes, treat FCFF directly as operating free cash flow
-                    capex_abs = (capex_to_rev * revenue) if (capex_to_rev and revenue) else 0.0
-                    bundle.cashflow = {
-                        "operatingCashFlow": fcff + capex_abs,  # back-derive OCF from FCFF + capex
-                        "capitalExpenditure": -abs(capex_abs),  # negative convention (outflow)
-                        "freeCashFlowToFirm": fcff,
-                    }
-                elif not bundle.cashflow:
-                    # No FCFF available — populate capex from capex/revenue ratio at least
-                    if capex_to_rev and revenue:
-                        capex_abs = capex_to_rev * revenue
-                        bundle.cashflow = {
-                            "operatingCashFlow": None,
-                            "capitalExpenditure": -abs(capex_abs),
-                        }
+                # Backfill market cap into balance sheet
+                if mkt_cap and bundle.balance is not None:
+                    bundle.balance["marketCapitalization"] = mkt_cap
 
-                # ── Overlay actual EBIT margin onto income so DCF scenarios are anchored ──
-                # ebit and revenue are available from financial_scores; compute margin here.
-                if bundle.income and bundle.income.get("ebit") and bundle.income.get("revenue"):
-                    ebit_margin = bundle.income["ebit"] / bundle.income["revenue"]
-                    bundle.income["ebitMargin"] = round(ebit_margin, 6)
-
-                # ── Derive net debt from EV - market cap and inject into balance ──
-                # This provides the equity bridge in the DCF without needing a
-                # cashflow statement or balance sheet line items.
-                ev_ttm = _safe_float(bundle.key_metrics_ttm.get("enterpriseValueTTM"))
-                mkt_cap_ttm = _safe_float(bundle.key_metrics_ttm.get("marketCap"))
-                if ev_ttm and mkt_cap_ttm and ev_ttm > 0 and mkt_cap_ttm > 0:
-                    # Net Debt = EV - Market Cap (positive = net debt, negative = net cash)
-                    net_debt = ev_ttm - mkt_cap_ttm
+                # Net debt bridge (EV - Market Cap)
+                if ev_ttm and mkt_cap and ev_ttm > 0 and mkt_cap > 0:
+                    net_debt = ev_ttm - mkt_cap
                     if bundle.balance is not None:
                         if net_debt >= 0:
-                            # Net debtor: separate total_debt / cash aren't needed for EV→equity bridge
-                            bundle.balance["totalDebt"] = net_debt
-                            bundle.balance["cashAndCashEquivalents"] = 0.0
+                            if not bundle.balance.get("totalDebt"):
+                                bundle.balance["totalDebt"] = net_debt
+                            if not bundle.balance.get("cashAndCashEquivalents"):
+                                bundle.balance["cashAndCashEquivalents"] = 0.0
                         else:
-                            # Net cash position
-                            bundle.balance["totalDebt"] = 0.0
-                            bundle.balance["cashAndCashEquivalents"] = abs(net_debt)
+                            if not bundle.balance.get("totalDebt"):
+                                bundle.balance["totalDebt"] = 0.0
+                            if not bundle.balance.get("cashAndCashEquivalents"):
+                                bundle.balance["cashAndCashEquivalents"] = abs(net_debt)
+
+                # Supplement cashflow with FCFF if cash_flow statement was sparse
+                fcff = _safe_float(bundle.key_metrics_ttm.get("freeCashFlowToFirmTTM"))
+                if fcff is not None and fcff > 0 and not bundle.cashflow.get("freeCashFlow"):
+                    capex_to_rev = _safe_float(bundle.key_metrics_ttm.get("capexToRevenueTTM"))
+                    revenue = _safe_float(bundle.income.get("revenue")) if bundle.income else None
+                    capex_abs = (capex_to_rev * revenue) if (capex_to_rev and revenue) else 0.0
+                    bundle.cashflow["freeCashFlowToFirm"] = fcff
+                    if not bundle.cashflow.get("operatingCashFlow"):
+                        bundle.cashflow["operatingCashFlow"] = fcff + abs(capex_abs)
+                    if not bundle.cashflow.get("capitalExpenditure"):
+                        bundle.cashflow["capitalExpenditure"] = -abs(capex_abs)
+
+                # EBIT margin overlay
+                ebit   = _safe_float(bundle.income.get("ebit")) if bundle.income else None
+                rev    = _safe_float(bundle.income.get("revenue")) if bundle.income else None
+                if ebit and rev:
+                    bundle.income["ebitMargin"] = round(ebit / rev, 6)
         except Exception as exc:
             logger.warning("key_metrics_ttm fetch failed for %s: %s", ticker, exc)
 
-        # ── ratios_ttm ─────────────────────────────────────────────────────────
+        # ── ratios_ttm (FMP) ──────────────────────────────────────────────────
         try:
             bundle.ratios_ttm = self._latest_payload(ticker, "ratios_ttm")
-            # Pull payout ratio and effective tax rate into income
             if bundle.ratios_ttm and bundle.income:
                 bundle.income["effectiveTaxRate"] = bundle.ratios_ttm.get("effectiveTaxRateTTM")
         except Exception as exc:
             logger.warning("ratios_ttm fetch failed for %s: %s", ticker, exc)
 
-        # ── Earnings history: use analyst_estimates_eodhd for EPS data ────────
-        # The "earnings_history" data_name only contains stub metadata.
-        # Real EPS data is in analyst_estimates_eodhd (same flat shape as fundamentals).
+        # ── Analyst estimates (FMP primary → EODHD fallback) ─────────────────
         try:
-            est_payload = self._latest_payload(ticker, "analyst_estimates_eodhd")
-            if est_payload:
-                # Build synthetic EPS entry from available highlights
-                eps_est = _safe_float(est_payload.get("Highlights_EPSEstimateCurrentYear"))
-                eps_actual = None
-                # No historical actual EPS in the DB — leave as empty list
-                # but populate analyst_estimates for forward P/E
-                bundle.analyst_estimates = [est_payload] if est_payload else []
+            est_rows = self._latest_payload_list(ticker, "analyst_estimates", limit=8)
+            if not est_rows:
+                # EODHD fallback: analyst_estimates_eodhd (same raw_fundamentals table)
+                est_rows = self._latest_payload_list(ticker, "analyst_estimates_eodhd", limit=8)
+                if est_rows:
+                    logger.info(
+                        "[FM] analyst_estimates: FMP empty for %s — using EODHD analyst_estimates_eodhd fallback",
+                        ticker,
+                    )
+            bundle.analyst_estimates = est_rows
         except Exception as exc:
-            logger.warning("analyst_estimates_eodhd fetch failed for %s: %s", ticker, exc)
+            logger.warning("analyst_estimates fetch failed for %s: %s", ticker, exc)
 
-        # ── Dividend history from raw_timeseries ──────────────────────────────
-        # "dividends_history" lives in raw_timeseries with payload keys:
-        # value, unadjustedValue, period, paymentDate, recordDate, declarationDate
+        # ── As-reported GAAP financials (FMP) ─────────────────────────────────
+        try:
+            as_rep_inc = self._latest_payload_list(ticker, "income_statement_as_reported", limit=3)
+            as_rep_bal = self._latest_payload_list(ticker, "balance_sheet_as_reported", limit=3)
+            as_rep_cf  = self._latest_payload_list(ticker, "cash_flow_as_reported", limit=3)
+            # Overlay as-reported values only if reported financials have missing fields
+            if as_rep_inc and bundle.income:
+                ar = as_rep_inc[0]
+                for field in ("netIncome", "incomeTaxExpense", "interestExpense"):
+                    if bundle.income.get(field) is None and ar.get(field) is not None:
+                        bundle.income[field] = ar[field]
+            if as_rep_bal and bundle.balance:
+                ar = as_rep_bal[0]
+                for field in ("retainedEarnings", "totalDebt", "cashAndCashEquivalents"):
+                    if bundle.balance.get(field) is None and ar.get(field) is not None:
+                        bundle.balance[field] = ar[field]
+            if as_rep_cf and bundle.cashflow:
+                ar = as_rep_cf[0]
+                for field in ("operatingCashFlow", "capitalExpenditure", "freeCashFlow"):
+                    if bundle.cashflow.get(field) is None and ar.get(field) is not None:
+                        bundle.cashflow[field] = ar[field]
+        except Exception as exc:
+            logger.warning("as_reported financials fetch failed for %s: %s", ticker, exc)
+
+        # ── Revenue segmentation (FMP primary → EODHD raw_timeseries fallback) ─
+        try:
+            prod_segs  = self._latest_payload_list(ticker, "revenue_product_segmentation", limit=5)
+            geo_segs   = self._latest_payload_list(ticker, "revenue_geographic_segmentation", limit=5)
+
+            # EODHD stores revenue segmentation in raw_timeseries, not raw_fundamentals
+            if not prod_segs:
+                prod_ts = self.pg.fetch_timeseries(ticker, "revenue_product_segmentation", limit=10)
+                prod_segs = self._merge_ts_date(prod_ts)
+                if prod_segs:
+                    logger.info(
+                        "[FM] revenue_product_segmentation: FMP empty for %s — using EODHD timeseries fallback (%d rows)",
+                        ticker, len(prod_segs),
+                    )
+            if not geo_segs:
+                geo_ts = self.pg.fetch_timeseries(ticker, "revenue_geographic_segmentation", limit=10)
+                geo_segs = self._merge_ts_date(geo_ts)
+                if geo_segs:
+                    logger.info(
+                        "[FM] revenue_geographic_segmentation: FMP empty for %s — using EODHD timeseries fallback (%d rows)",
+                        ticker, len(geo_segs),
+                    )
+            bundle.revenue_segments = {
+                "product":    prod_segs,
+                "geographic": geo_segs,
+            }
+        except Exception as exc:
+            logger.warning("revenue_segmentation fetch failed for %s: %s", ticker, exc)
+
+        # ── Dividend history from raw_timeseries (EODHD) ─────────────────────
         try:
             div_ts_rows = self.pg.fetch_timeseries(ticker, "dividends_history", limit=30)
+            if not div_ts_rows:
+                # FMP fallback: historical_dividends in raw_fundamentals
+                fmp_div = self.pg.fetch_latest_fundamental(ticker, "historical_dividends", limit=1)
+                if fmp_div:
+                    payload = fmp_div[0]["payload"]
+                    if isinstance(payload, list):
+                        div_ts_rows = [{"payload": r, "ts_date": r.get("date", "")} for r in payload[:30]]
+                    elif isinstance(payload, dict) and "historical" in payload:
+                        div_ts_rows = [
+                            {"payload": r, "ts_date": r.get("date", "")}
+                            for r in payload["historical"][:30]
+                        ]
             if div_ts_rows:
-                # Normalise: rename "value" → "dividend" so _compute_dividends can find it
                 merged = self._merge_ts_date(div_ts_rows)
                 for row in merged:
                     if "value" in row and "dividend" not in row:
@@ -492,37 +599,42 @@ class FMDataFetcher:
         except Exception as exc:
             logger.warning("dividend_history fetch failed for %s: %s", ticker, exc)
 
-        # ── EOD price history (weekly preferred for indicator depth) ──────────
-        # Daily: ~23 rows (only ~1 month) — insufficient for SMA 50/200.
-        # Weekly: ~54 rows (>1 year) — sufficient for SMA 20/50, EMA 26, RSI, MACD, HV30.
-        # We use weekly as primary; fall back to daily if weekly missing.
+        # ── EOD price history (EODHD weekly preferred) ────────────────────────
         try:
             ts_rows = self.pg.fetch_timeseries(ticker, "historical_prices_weekly", limit=300)
             if not ts_rows:
                 ts_rows = self.pg.fetch_timeseries(ticker, "historical_prices_eod", limit=400)
-            if not ts_rows:
-                ts_rows = self.pg.fetch_timeseries(ticker, "historical_price", limit=400)
             bundle.price_history = self._merge_ts_date(ts_rows)
         except Exception as exc:
             logger.warning("price_history fetch failed for %s: %s", ticker, exc)
 
-        # ── Treasury rates ─────────────────────────────────────────────────────
+        # ── Treasury rates (FMP, stored per-ticker) ───────────────────────────
         try:
-            tr_rows = self.pg.fetch_timeseries("TREASURY", "treasury_rates", limit=5)
+            tr_rows = self.pg.fetch_timeseries(ticker, "treasury_rates", limit=5)
+            if not tr_rows:
+                tr_fund = self.pg.fetch_latest_fundamental(ticker, "treasury_rates", limit=5)
+                if tr_fund:
+                    tr_rows = [
+                        {"payload": r["payload"], "ts_date": r.get("as_of_date", "")}
+                        for r in tr_fund
+                    ]
+            if not tr_rows:
+                # Legacy fallback keys
+                tr_rows = self.pg.fetch_timeseries("TREASURY", "treasury_rates", limit=5)
             if not tr_rows:
                 tr_rows = self.pg.fetch_timeseries("TNX", "treasury_rates", limit=5)
             bundle.treasury_rates = self._merge_ts_date(tr_rows)
         except Exception as exc:
             logger.warning("treasury_rates fetch failed: %s", exc)
 
-        # ── Benchmark (S&P 500) history from market_eod_us ───────────────────
+        # ── Benchmark (S&P 500) history from market_eod_us ────────────────────
         try:
             mkt_rows = self.pg.fetch_market_eod(limit=400)
             bundle.benchmark_history = self._merge_ts_date(mkt_rows)
         except Exception as exc:
             logger.warning("benchmark_history fetch failed: %s", exc)
 
-        # ── Peer group: static fallback (Neo4j has no COMPETES_WITH edges) ────
+        # ── Peer group ────────────────────────────────────────────────────────
         peers = self._resolve_peers(ticker)
 
         # Peer price histories
@@ -536,30 +648,30 @@ class FMDataFetcher:
             except Exception as exc:
                 logger.debug("peer price history fetch failed for %s: %s", peer, exc)
 
-        # Peer fundamentals for Comps multiples
+        # Peer fundamentals for Comps multiples (all FMP data_names)
         for peer in peers:
             try:
-                peer_km_ttm = self._latest_payload(peer, "key_metrics_ttm")
+                peer_km_ttm    = self._latest_payload(peer, "key_metrics_ttm")
                 peer_ratios_ttm = self._latest_payload(peer, "ratios_ttm")
-                peer_scores = self._latest_payload(peer, "financial_scores")
-                peer_income = {}
-                if peer_scores:
-                    peer_income = {
-                        "revenue": peer_scores.get("revenue"),
-                        "ebit": peer_scores.get("ebit"),
-                        "ebitda": None,
-                    }
+                peer_scores    = self._latest_payload(peer, "financial_scores")
+                peer_inc_rows  = self._latest_payload_list(peer, "income_statement", limit=3)
+                peer_inc       = peer_inc_rows[0] if peer_inc_rows else {}
+                peer_income = {
+                    "revenue": peer_inc.get("revenue") or (peer_scores.get("revenue") if peer_scores else None),
+                    "ebit":    peer_inc.get("operatingIncome") or (peer_scores.get("ebit") if peer_scores else None),
+                    "ebitda":  peer_inc.get("ebitda"),
+                }
                 peer_ent = {}
                 if peer_km_ttm:
                     peer_ent = {
-                        "enterpriseValueTTM": peer_km_ttm.get("enterpriseValueTTM"),
+                        "enterpriseValueTTM":   peer_km_ttm.get("enterpriseValueTTM"),
                         "marketCapitalization": peer_km_ttm.get("marketCap"),
                     }
                 bundle.peer_fundamentals[peer] = {
                     "key_metrics_ttm": peer_km_ttm,
-                    "ratios_ttm": peer_ratios_ttm,
-                    "enterprise": peer_ent,
-                    "income": peer_income,
+                    "ratios_ttm":      peer_ratios_ttm,
+                    "enterprise":      peer_ent,
+                    "income":          peer_income,
                 }
             except Exception as exc:
                 logger.debug("peer fundamentals fetch failed for %s: %s", peer, exc)
@@ -590,11 +702,11 @@ class FMDataFetcher:
         if len(peers) >= n:
             return peers[:n]
 
-        # 3. Same-sector PG fallback
+        # 3. Same-sector PG fallback using FMP company_core_info
         sector = ""
         try:
-            fund = self._latest_payload(ticker, "fundamentals")
-            sector = fund.get("Sector", "") or fund.get("sector", "")
+            core = self._latest_payload(ticker, "company_core_info")
+            sector = core.get("sector", "") or core.get("Sector", "")
         except Exception:
             pass
         if sector:

@@ -39,7 +39,7 @@ class FinancialModellingConfig:
         default_factory=lambda: os.getenv("NEO4J_USER", "neo4j")
     )
     neo4j_password: str = field(
-        default_factory=lambda: os.getenv("NEO4J_PASSWORD", "changeme_neo4j_password")
+        default_factory=lambda: os.getenv("NEO4J_PASSWORD", "SecureNeo4jPass2025!")
     )
 
     # LLM — used ONLY for the quantitative_summary narrative.

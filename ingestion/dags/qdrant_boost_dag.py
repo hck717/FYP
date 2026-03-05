@@ -52,14 +52,14 @@ _DEFAULT_ARGS = {
     "email_on_failure": False,
     "email_on_retry": False,
     "retries": 1,
-    "retry_delay": timedelta(minutes=10),
+    "retry_delay": timedelta(seconds=30),
 }
 
 # ── Qdrant / PostgreSQL helpers ────────────────────────────────────────────────
 
-_QDRANT_HOST = os.getenv("QDRANT_HOST", "localhost")
+_QDRANT_HOST = os.getenv("QDRANT_HOST", "qdrant")
 _QDRANT_PORT = int(os.getenv("QDRANT_PORT", "6333"))
-_QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "financial_documents")
+_QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION_NAME", "financial_documents")
 _BOOST_INCREMENT = float(os.getenv("QDRANT_BOOST_INCREMENT", "0.05"))
 _BOOST_MAX = float(os.getenv("QDRANT_BOOST_MAX", "2.0"))
 
@@ -67,11 +67,11 @@ _BOOST_MAX = float(os.getenv("QDRANT_BOOST_MAX", "2.0"))
 def _pg_connect():
     import psycopg2  # type: ignore[import]
     return psycopg2.connect(
-        host=os.getenv("POSTGRES_HOST", "localhost"),
+        host=os.getenv("POSTGRES_HOST", "postgres"),
         port=int(os.getenv("POSTGRES_PORT", "5432")),
-        dbname=os.getenv("POSTGRES_DB", "financial_data"),
-        user=os.getenv("POSTGRES_USER", "postgres"),
-        password=os.getenv("POSTGRES_PASSWORD", "postgres"),
+        dbname=os.getenv("POSTGRES_DB", "airflow"),
+        user=os.getenv("POSTGRES_USER", "airflow"),
+        password=os.getenv("POSTGRES_PASSWORD", "airflow"),
     )
 
 

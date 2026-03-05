@@ -27,7 +27,28 @@ Your ONLY task is to write 10–15 plain-English sentences that interpret what t
 for a portfolio manager making a sizing decision. Depth, precision, sector context, and
 analytical synthesis are mandatory. Shallow observations are a critical failure.
 
-RULES — violating any of these is a critical failure:
+=== DATA AVAILABILITY CONTEXT ===
+
+The database currently reflects EODHD ingestion only. FMP financial statements
+(income_statement, balance_sheet, cash_flow, financial_ratios, enterprise_values) are
+PENDING ingestion (FMP DAG paused). This means:
+- Value factors (P/E, EV/EBITDA, P/FCF) may be null or derived from EODHD key_metrics_ttm.
+- Margin metrics (gross margin, EBIT margin) may be null or derived from EODHD ratios_ttm.
+- Quality scores (Piotroski F-Score, Altman Z-Score) ARE available from EODHD financial_scores.
+- Price momentum, Beta, Sharpe ratio ARE available from EODHD price history.
+- ROE, ROIC, current ratio ARE available from EODHD key_metrics_ttm.
+
+When FMP-dependent fields are null, do NOT skip the entire analysis. Instead:
+- Lead with what IS available: Piotroski score, Altman Z-Score, ROE, ROIC, momentum,
+  Beta, Sharpe, and any TTM ratios from EODHD.
+- For null value-factor fields (P/E, EV/EBITDA, P/FCF): state once, clearly:
+  "P/E, EV/EBITDA, and P/FCF multiples are unavailable pending FMP financial statement
+  ingestion; valuation analysis is deferred until those data streams are active."
+  Then pivot entirely to factor scores, capital efficiency, and momentum.
+- Do NOT repeat "data unavailable" for each missing metric — group the acknowledgment
+  into a single sentence and move on to substantive analysis of available data.
+
+=== RULES — violating any of these is a critical failure ===
 1. Use ONLY the numbers explicitly present in the factor table. Never invent, approximate,
    or extrapolate values that are not shown.
 2. Never recalculate, re-derive, or adjust any value — the Python pipeline is authoritative.
@@ -65,8 +86,10 @@ COVERAGE REQUIREMENTS (address each in order; skip gracefully only if data is nu
    of the ROE signal as a capital efficiency metric.
 
 3. VALUATION — P/E, EV/EBITDA, P/FCF (read these together, not in isolation):
-   State whether the valuation is elevated, fair, or compressed on EACH metric relative to
-   large-cap sector norms (large-cap tech: P/E typically 22–38x; EV/EBITDA 16–28x; P/FCF 20–35x).
+   If these fields are null (FMP ingestion pending), acknowledge in one sentence and skip this
+   section — do NOT repeat the null status per field. If available: state whether the valuation
+   is elevated, fair, or compressed on EACH metric relative to large-cap sector norms
+   (large-cap tech: P/E typically 22–38x; EV/EBITDA 16–28x; P/FCF 20–35x).
    For P/E: state the implied earnings growth rate the current multiple embeds
    (e.g. "at 33x TTM P/E, the market is pricing in approximately 12–15% annual EPS growth
    for the next 5 years — a bar that requires sustained execution"). Assess whether the P/FCF
@@ -74,7 +97,9 @@ COVERAGE REQUIREMENTS (address each in order; skip gracefully only if data is nu
    yield is relatively attractive and may indicate high non-cash charges.
 
 4. PROFITABILITY — Gross Margin, EBIT Margin, and Operating Leverage:
-   Contextualise margins against sector benchmarks with precision:
+   If gross margin and EBIT margin are available from EODHD ratios_ttm, use them.
+   If null, skip this section. When available: contextualise margins against sector benchmarks
+   with precision:
    Software/cloud: gross margin >65% = exceptional; 50–65% = solid; <50% = potential mix issues.
    EBIT margin >25% = high-quality operator; 15–25% = solid; <15% = margin improvement needed.
    State the FCF conversion rate if available: >1.0 = cash earnings exceed reported earnings
@@ -121,13 +146,14 @@ COVERAGE REQUIREMENTS (address each in order; skip gracefully only if data is nu
    they represent the most important cross-factor analytical signals in the output.
 
 10. SYNTHESIS — Quantitative Risk/Reward Characterisation:
-   Close with 2 sentences that synthesise the quality, valuation, momentum, and trend signals
-   into a single coherent characterisation of the current quantitative risk/reward profile.
-   Integrate any CoT validation tensions into this synthesis.
-   Example: "The combination of a 9/9 Piotroski score, 51% ROIC materially above WACC, and
-   a Sharpe ratio of 0.69 presents the profile of a high-quality compounder; the 33x trailing
-   P/E compresses the margin of safety but is arguably justified by the earnings quality and
-   consistent QoQ revenue acceleration."
+    Close with 2 sentences that synthesise the quality, valuation, momentum, and trend signals
+    into a single coherent characterisation of the current quantitative risk/reward profile.
+    If FMP valuation multiples are unavailable, synthesise from factor scores + momentum alone.
+    Integrate any CoT validation tensions into this synthesis.
+    Example (FMP unavailable): "The 9/9 Piotroski score and ROIC materially above WACC signal
+    a high-quality compounder; with valuation multiples pending FMP ingestion, the near-term
+    risk/reward assessment rests on the momentum and factor score evidence alone, which is
+    constructive."
 
 Respond with the narrative text ONLY. No preamble. No headers. No postamble.
 """.strip()

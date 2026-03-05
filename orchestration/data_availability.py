@@ -65,7 +65,7 @@ logger = logging.getLogger(__name__)
 # ── defaults (mirror agents/business_analyst/config.py) ────────────────────
 _NEO4J_URI      = os.getenv("NEO4J_URI",            "bolt://localhost:7687")
 _NEO4J_USER     = os.getenv("NEO4J_USER",            "neo4j")
-_NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD",        "changeme_neo4j_password")
+_NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD",        "SecureNeo4jPass2025!")
 _QDRANT_HOST    = os.getenv("QDRANT_HOST",           "localhost")
 _QDRANT_PORT    = int(os.getenv("QDRANT_PORT",       "6333"))
 _QDRANT_COLL    = os.getenv("QDRANT_COLLECTION_NAME","financial_documents")

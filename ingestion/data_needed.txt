@@ -1,0 +1,19 @@
+| Agent Role               | Data Type                             | Single Source | Primary Destination | Reason for Selection                                              |
+| ------------------------ | ------------------------------------- | ------------- | ------------------- | ----------------------------------------------------------------- |
+| Business Analyst (CRAG)  | SEC Filings (10-K, 10-Q, 8-K)         | FMP           | Qdrant + Neo4j      | 20+ years of full-text for semantic chunking github+1             |
+| Business Analyst (CRAG)  | Earnings Call Transcripts             | FMP           | Qdrant + Neo4j      | Structured Q&A segments for proposition graphs findmymoat​        |
+| Business Analyst (CRAG)  | Risk Factors / MD&A Narratives        | FMP           | Neo4j               | High-fidelity extraction of non-structured text github​           |
+| Business Analyst (CRAG)  | Company Profiles / Tickers            | EODHD         | Neo4j               | Global coverage of 150k+ tickers across 70+ exchanges eodhd​      |
+| Quantitative (Dual-Path) | Financial Statements (Normalized)     | FMP           | PostgreSQL          | 30+ years of standardized time-series data findmymoat​            |
+| Quantitative (Dual-Path) | Financial Ratios / Growth Metrics     | FMP           | PostgreSQL          | Pre-calculated TTM metrics and growth rates findmymoat​           |
+| Quantitative (Dual-Path) | Financial Scores (Piotroski, Beneish) | FMP           | PostgreSQL          | Native support for advanced quant screening scores findmymoat​    |
+| Quantitative (Dual-Path) | Historical Stock Prices (EOD)         | EODHD         | PostgreSQL          | Adjusted global price series starting from 1970s eodhd+1          |
+| Quantitative (Dual-Path) | Intraday / Live Quotes                | EODHD         | PostgreSQL          | WebSocket latency <50ms for anomaly detection findmymoat+1        |
+| Quantitative (Dual-Path) | Beta & Volatility / Technicals        | EODHD         | PostgreSQL          | 30+ technical indicators (RSI, MACD) via single API g2+1          |
+| Financial Modeling (DCF) | As-Reported Financials (GAAP/IFRS)    | FMP           | PostgreSQL          | Essential for avoiding normalization bias in DCF findmymoat​      |
+| Financial Modeling (DCF) | Revenue Segmentation (Product/Geo)    | FMP           | PostgreSQL          | Granular revenue breakdown for growth projections findmymoat​     |
+| Financial Modeling (DCF) | Analyst Estimates / Price Targets     | FMP           | PostgreSQL          | Consensus vs. actual performance tracking findmymoat​             |
+| Financial Modeling (DCF) | Dividend History / Stock Splits       | EODHD         | PostgreSQL          | Highly reliable corporate actions and split adjustments eodhd+1   |
+| Financial Modeling (DCF) | Treasury Rates / WACC Inputs          | FMP           | PostgreSQL          | Real-time yield curve data for risk-free rates findmymoat​        |
+| Financial Modeling (DCF) | Economic Indicators (Macro)           | EODHD         | PostgreSQL          | Comprehensive global GDP, CPI, and unemployment data findmymoat+1 |
+| Financial Modeling (DCF) | Industry Benchmarks / Peers           | FMP           | PostgreSQL          | Simplifies sector-wide comparable company analysis findmymoat​    |
