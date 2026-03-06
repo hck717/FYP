@@ -195,6 +195,81 @@ class PostgresConnector:
             )
             return None
 
+    def fetch_short_interest(self, ticker: str) -> Optional[Dict]:
+        """Fetch latest short interest data for the ticker."""
+        sql = """
+        SELECT ticker, short_interest_pct, days_to_cover, shares_short, as_of_date
+        FROM short_interest
+        WHERE ticker = %s
+        ORDER BY as_of_date DESC
+        LIMIT 1
+        """
+        conn = self._connect()
+        with closing(conn), conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, (ticker,))
+            row = cur.fetchone()
+            if not row:
+                return None
+            return dict(row)
+
+    def fetch_options_chain(self, ticker: str, limit: int = 50) -> List[Dict]:
+        """Fetch recent options chain data for the ticker."""
+        sql = """
+        SELECT ticker, expiry_date, strike, call_put, implied_vol, open_interest, ts_date
+        FROM options_chain
+        WHERE ticker = %s
+        ORDER BY ts_date DESC
+        LIMIT %s
+        """
+        conn = self._connect()
+        with closing(conn), conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, (ticker, limit))
+            rows = cur.fetchall()
+            return [dict(r) for r in rows]
+
+    def fetch_earnings_surprises(self, ticker: str, limit: int = 8) -> List[Dict]:
+        """Fetch recent earnings surprises for the ticker."""
+        sql = """
+        SELECT payload, as_of_date
+        FROM raw_fundamentals
+        WHERE ticker_symbol = %s
+          AND data_name = 'earnings_surprises'
+        ORDER BY as_of_date DESC
+        LIMIT %s
+        """
+        conn = self._connect()
+        with closing(conn), conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, (ticker, limit))
+            rows = cur.fetchall()
+        results = []
+        for row in rows:
+            payload = row["payload"]
+            if isinstance(payload, str):
+                try:
+                    payload = json.loads(payload)
+                except json.JSONDecodeError:
+                    pass
+            results.append({
+                "payload": payload,
+                "as_of_date": str(row["as_of_date"])
+            })
+        return results
+
+    def fetch_senate_trades(self, ticker: str, limit: int = 20) -> List[Dict]:
+        """Fetch recent senate/congress trading activity for the ticker."""
+        sql = """
+        SELECT ticker, politician, transaction_type, amount_range, trade_date, disclosed_date
+        FROM senate_congress_trading
+        WHERE ticker = %s
+        ORDER BY trade_date DESC
+        LIMIT %s
+        """
+        conn = self._connect()
+        with closing(conn), conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, (ticker, limit))
+            rows = cur.fetchall()
+            return [dict(r) for r in rows]
+
     def healthcheck(self) -> bool:
         try:
             conn = self._connect()
@@ -805,6 +880,22 @@ class QuantFundamentalToolkit:
 
     def healthcheck(self) -> Dict[str, bool]:
         return {"postgres": self.pg.healthcheck()}
+
+    def fetch_short_interest(self, ticker: str) -> Optional[Dict]:
+        """Fetch latest short interest data for the ticker."""
+        return self.pg.fetch_short_interest(ticker)
+
+    def fetch_options_chain(self, ticker: str, limit: int = 50) -> List[Dict]:
+        """Fetch recent options chain data for the ticker."""
+        return self.pg.fetch_options_chain(ticker, limit)
+
+    def fetch_earnings_surprises(self, ticker: str, limit: int = 8) -> List[Dict]:
+        """Fetch recent earnings surprises for the ticker."""
+        return self.pg.fetch_earnings_surprises(ticker, limit)
+
+    def fetch_senate_trades(self, ticker: str, limit: int = 20) -> List[Dict]:
+        """Fetch recent senate/congress trading activity for the ticker."""
+        return self.pg.fetch_senate_trades(ticker, limit)
 
     def close(self) -> None:
         pass  # psycopg2 connections are opened/closed per-query

@@ -301,6 +301,189 @@ DATA_SPEC: list[dict] = [
         "dag": "eodhd",
         "ticker": "_MACRO",  # stored under _MACRO pseudo-ticker
     },
+    # ── NEW DATA TYPES (FMP - Business Analyst) ────────────────────────────────
+    {
+        "row": "3c", "agent": "Business Analyst",
+        "description": "Social Sentiment",
+        "source": "FMP", "dest": "qdrant,postgresql",
+        "data_names": ["social_sentiment"],
+        "dag": "fmp",
+    },
+    {
+        "row": "3d", "agent": "Business Analyst",
+        "description": "ESG Scores",
+        "source": "FMP", "dest": "neo4j,postgresql",
+        "data_names": ["esg_scores"],
+        "dag": "fmp",
+    },
+    {
+        "row": "3e", "agent": "Business Analyst",
+        "description": "Institutional Ownership (13F)",
+        "source": "FMP", "dest": "neo4j,postgresql",
+        "data_names": ["institutional_ownership_13f"],
+        "dag": "fmp",
+    },
+    {
+        "row": "3f", "agent": "Business Analyst",
+        "description": "Insider Trading",
+        "source": "FMP", "dest": "neo4j",
+        "data_names": ["insider_trading"],
+        "dag": "fmp",
+    },
+    {
+        "row": "3g", "agent": "Business Analyst",
+        "description": "M&A Activity",
+        "source": "FMP", "dest": "neo4j",
+        "data_names": ["ma_activity"],
+        "dag": "fmp",
+    },
+    # ── NEW DATA TYPES (FMP - Quantitative) ────────────────────────────────────
+    {
+        "row": "7b", "agent": "Quantitative",
+        "description": "Earnings Surprises",
+        "source": "FMP", "dest": "postgresql",
+        "data_names": ["earnings_surprises"],
+        "dag": "fmp",
+    },
+    {
+        "row": "7c", "agent": "Quantitative",
+        "description": "Institutional Ownership Delta",
+        "source": "FMP", "dest": "postgresql",
+        "data_names": ["institutional_ownership_delta"],
+        "dag": "fmp",
+    },
+    {
+        "row": "7d", "agent": "Quantitative",
+        "description": "Insider Transactions (Net)",
+        "source": "FMP", "dest": "postgresql",
+        "data_names": ["insider_transactions_net"],
+        "dag": "fmp",
+    },
+    {
+        "row": "7e", "agent": "Quantitative",
+        "description": "Options Chain",
+        "source": "FMP", "dest": "postgresql",
+        "data_names": ["options_chain"],
+        "dag": "fmp",
+    },
+    {
+        "row": "7f", "agent": "Quantitative",
+        "description": "Senate/Congress Trading",
+        "source": "FMP", "dest": "postgresql",
+        "data_names": ["senate_congress_trading"],
+        "dag": "fmp",
+    },
+    {
+        "row": "7g", "agent": "Quantitative",
+        "description": "Revenue Segment Growth",
+        "source": "FMP", "dest": "postgresql",
+        "data_names": ["revenue_segment_growth"],
+        "dag": "fmp",
+    },
+    # ── NEW DATA TYPES (FMP - Financial Modeling) ──────────────────────────────
+    {
+        "row": "13b", "agent": "Financial Modeling",
+        "description": "Forward EPS/Revenue Estimates",
+        "source": "FMP", "dest": "postgresql",
+        "data_names": ["forward_eps_revenue_estimates"],
+        "dag": "fmp",
+    },
+    {
+        "row": "13c", "agent": "Financial Modeling",
+        "description": "Share Buyback History",
+        "source": "FMP", "dest": "postgresql",
+        "data_names": ["share_buyback_history"],
+        "dag": "fmp",
+    },
+    {
+        "row": "13d", "agent": "Financial Modeling",
+        "description": "Executive Compensation",
+        "source": "FMP", "dest": "postgresql",
+        "data_names": ["executive_compensation"],
+        "dag": "fmp",
+    },
+    {
+        "row": "13e", "agent": "Financial Modeling",
+        "description": "Implied Volatility",
+        "source": "FMP", "dest": "postgresql",
+        "data_names": ["implied_volatility"],
+        "dag": "fmp",
+    },
+    {
+        "row": "13f", "agent": "Financial Modeling",
+        "description": "Sector/Industry Multiples",
+        "source": "FMP", "dest": "postgresql",
+        "data_names": ["sector_industry_multiples"],
+        "dag": "fmp",
+    },
+    {
+        "row": "13g", "agent": "Financial Modeling",
+        "description": "Financial Calendar (FMP)",
+        "source": "FMP", "dest": "postgresql",
+        "data_names": ["financial_calendar"],
+        "dag": "fmp",
+    },
+    {
+        "row": "13h", "agent": "Financial Modeling",
+        "description": "Earnings Surprises History",
+        "source": "FMP", "dest": "postgresql",
+        "data_names": ["earnings_surprises_history"],
+        "dag": "fmp",
+    },
+    # ── NEW DATA TYPES (EODHD - Quantitative) ──────────────────────────────────
+    {
+        "row": "10b", "agent": "Quantitative",
+        "description": "Short Interest",
+        "source": "EODHD", "dest": "postgresql",
+        "data_names": ["short_interest"],
+        "dag": "eodhd",
+    },
+    {
+        "row": "10c", "agent": "Quantitative",
+        "description": "Screener (Bulk)",
+        "source": "EODHD", "dest": "postgresql",
+        "data_names": ["screener_bulk"],
+        "dag": "eodhd",
+        "ticker": "_MACRO",
+    },
+    # ── NEW DATA TYPES (EODHD - Financial Modeling) ────────────────────────────
+    {
+        "row": "14b", "agent": "Financial Modeling",
+        "description": "Corporate Bond Yields",
+        "source": "EODHD", "dest": "postgresql",
+        "data_names": ["corporate_bond_yields"],
+        "dag": "eodhd",
+    },
+    {
+        "row": "14c", "agent": "Financial Modeling",
+        "description": "Forex Historical Rates",
+        "source": "EODHD", "dest": "postgresql",
+        "data_names": ["forex_historical_rates"],
+        "dag": "eodhd",
+    },
+    {
+        "row": "14d", "agent": "Financial Modeling",
+        "description": "ETF/Index Constituents",
+        "source": "EODHD", "dest": "neo4j",
+        "data_names": ["etf_index_constituents"],
+        "dag": "eodhd",
+    },
+    # ── NEW DATA TYPES (EODHD - Business Analyst) ──────────────────────────────
+    {
+        "row": "4d", "agent": "Business Analyst",
+        "description": "Financial Calendar (EODHD)",
+        "source": "EODHD", "dest": "postgresql",
+        "data_names": ["financial_calendar"],
+        "dag": "eodhd",
+        "ticker": "_MACRO",
+    },
+    {
+        "row": "4e", "agent": "Business Analyst",
+        "description": "Realtime News Feed",
+        "source": "EODHD", "dest": "qdrant",
+        "data_names": ["realtime_news_feed"],
+        "dag": "eodhd",
+    },
 ]
 
 # ── Airflow system tables to skip ─────────────────────────────────────────────
@@ -346,6 +529,10 @@ _TIMESERIES_DATA_NAMES = {
     "owner_earnings",
     # macro
     "economic_indicators_gdp", "economic_indicators_cpi", "economic_indicators_unemployment",
+    # NEW timeseries data types
+    "short_interest", "options_chain", "corporate_bond_yields", "forex_historical_rates",
+    "financial_calendar", "realtime_news_feed", "senate_congress_trading",
+    "earnings_surprises", "implied_volatility", "social_sentiment",
 }
 
 
@@ -435,6 +622,12 @@ def inspect_postgres(ticker_filter: str | None = None) -> None:
             ("global_economic_calendar", "EODHD macro event calendar"),
             ("global_ipo_calendar",      "EODHD IPO calendar"),
             ("global_macro_indicators",  "EODHD GDP / CPI / unemployment (stored under _MACRO)"),
+            ("social_sentiment",         "FMP social sentiment (platform-specific)"),
+            ("esg_scores",               "FMP ESG scores (environmental/social/governance)"),
+            ("short_interest",           "EODHD short interest data"),
+            ("options_chain",            "FMP options chain data"),
+            ("senate_congress_trading",  "FMP senate/congress trading activity"),
+            ("financial_calendar",       "Earnings calendar (FMP + EODHD)"),
         ]:
             try:
                 cur.execute(f"SELECT COUNT(*) FROM {tname}")
@@ -1288,6 +1481,8 @@ def inspect_coverage(ticker_filter: str | None = None) -> None:
         "technical_sma", "technical_ema", "options_data",
         "dividends_history", "splits_history",
         "sentiment_trends",
+        "short_interest", "screener_bulk", "corporate_bond_yields",
+        "forex_historical_rates", "financial_calendar", "realtime_news_feed",
     ]
     fmp_ts_dns = [
         "income_statement", "balance_sheet", "cash_flow",
@@ -1298,6 +1493,11 @@ def inspect_coverage(ticker_filter: str | None = None) -> None:
         "analyst_estimates", "price_target", "revenue_product_segmentation",
         "revenue_geographic_segmentation", "treasury_rates",
         "dcf", "owner_earnings", "stock_peers",
+        "social_sentiment", "esg_scores", "institutional_ownership_13f",
+        "insider_trading", "ma_activity", "earnings_surprises",
+        "options_chain", "senate_congress_trading", "forward_eps_revenue_estimates",
+        "share_buyback_history", "executive_compensation", "implied_volatility",
+        "sector_industry_multiples", "financial_calendar", "earnings_surprises_history",
     ]
 
     for label, dns in [("EODHD", eodhd_dns), ("FMP", fmp_ts_dns)]:

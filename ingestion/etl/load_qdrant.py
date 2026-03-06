@@ -3,7 +3,7 @@ import re
 import json
 import time
 from pathlib import Path
-import uuid
+import hashlib
 import pandas as pd
 from qdrant_client import QdrantClient
 from qdrant_client.http import models as qmodels
@@ -30,6 +30,35 @@ OLLAMA_WARMUP_TIMEOUT = int(os.getenv("OLLAMA_WARMUP_TIMEOUT", "600"))
 OLLAMA_WARMUP_INTERVAL = 5   # seconds between probes
 
 _NULL_SENTINELS = {"", "nan", "none", "null", "n/a", "na", "undefined"}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+def generate_deterministic_id(agent_name: str, ticker_symbol: str, data_name: str, 
+                              chunk_id: str, section: str, text: str) -> str:
+    """
+    Generate deterministic point ID based on content for incremental upserts.
+    
+    Strategy:
+    - Use (agent_name, ticker, data_name, chunk_id, section) as primary key
+    - Include text hash to detect content changes
+    - Same content → same ID → upsert replaces old point (incremental)
+    - Changed content → new ID → old point kept (versioned history)
+    
+    Returns: Deterministic UUID string based on content hash
+    """
+    # Primary key components (stable identifiers)
+    key_parts = [agent_name, ticker_symbol, data_name, chunk_id, section]
+    key_str = "|".join(str(p) for p in key_parts)
+    
+    # Content hash (detect changes)
+    text_hash = hashlib.md5(text.encode('utf-8')).hexdigest()[:8]
+    
+    # Combine into deterministic ID
+    combined = f"{key_str}|{text_hash}"
+    id_hash = hashlib.sha256(combined.encode('utf-8')).hexdigest()
+    
+    # Format as UUID (Qdrant accepts string IDs)
+    return f"{id_hash[:8]}-{id_hash[8:12]}-{id_hash[12:16]}-{id_hash[16:20]}-{id_hash[20:32]}"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -365,7 +394,18 @@ def load_qdrant_for_agent_ticker(agent_name: str, ticker_symbol: str) -> int:
                 "section":       _section,
                 "filing_date":   _filing_date,
             })
-            all_ids.append(str(uuid.uuid4()))
+            
+            # Generate deterministic ID for incremental upserts (prevents duplicates)
+            point_id = generate_deterministic_id(
+                agent_name=agent_name,
+                ticker_symbol=ticker_symbol,
+                data_name=data_name,
+                chunk_id=_chunk_id,
+                section=_section,
+                text=raw_text
+            )
+            
+            all_ids.append(point_id)
             all_texts.append(raw_text)
             all_payloads.append(payload)
 

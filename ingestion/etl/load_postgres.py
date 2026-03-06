@@ -185,6 +185,86 @@ def ensure_tables():
     ALTER TABLE agent_run_telemetry ADD COLUMN IF NOT EXISTS duration_sec  NUMERIC;
     CREATE INDEX IF NOT EXISTS idx_agent_run_telemetry_run_id
         ON agent_run_telemetry (run_id, recorded_at DESC);
+
+    CREATE TABLE IF NOT EXISTS social_sentiment (
+        id             SERIAL PRIMARY KEY,
+        ticker         TEXT         NOT NULL,
+        platform       TEXT,
+        score          NUMERIC,
+        sentiment_label TEXT,
+        date           DATE         NOT NULL,
+        ingested_at    TIMESTAMP    DEFAULT NOW(),
+        UNIQUE (ticker, platform, date)
+    );
+    CREATE INDEX IF NOT EXISTS idx_social_sentiment_ticker_date
+        ON social_sentiment (ticker, date DESC);
+
+    CREATE TABLE IF NOT EXISTS esg_scores (
+        id           SERIAL PRIMARY KEY,
+        ticker       TEXT      NOT NULL,
+        env_score    NUMERIC,
+        social_score NUMERIC,
+        gov_score    NUMERIC,
+        esg_total    NUMERIC,
+        as_of_date   DATE      NOT NULL,
+        ingested_at  TIMESTAMP DEFAULT NOW(),
+        UNIQUE (ticker, as_of_date)
+    );
+    CREATE INDEX IF NOT EXISTS idx_esg_scores_ticker_date
+        ON esg_scores (ticker, as_of_date DESC);
+
+    CREATE TABLE IF NOT EXISTS short_interest (
+        id                SERIAL PRIMARY KEY,
+        ticker            TEXT      NOT NULL,
+        short_interest_pct NUMERIC,
+        days_to_cover     NUMERIC,
+        shares_short      BIGINT,
+        as_of_date        DATE      NOT NULL,
+        ingested_at       TIMESTAMP DEFAULT NOW(),
+        UNIQUE (ticker, as_of_date)
+    );
+    CREATE INDEX IF NOT EXISTS idx_short_interest_ticker_date
+        ON short_interest (ticker, as_of_date DESC);
+
+    CREATE TABLE IF NOT EXISTS options_chain (
+        id            SERIAL PRIMARY KEY,
+        ticker        TEXT      NOT NULL,
+        expiry_date   DATE,
+        strike        NUMERIC,
+        call_put      TEXT,
+        implied_vol   NUMERIC,
+        open_interest INT,
+        ts_date       TIMESTAMP NOT NULL,
+        ingested_at   TIMESTAMP DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_options_chain_ticker_date
+        ON options_chain (ticker, ts_date DESC);
+
+    CREATE TABLE IF NOT EXISTS senate_congress_trading (
+        id               SERIAL PRIMARY KEY,
+        ticker           TEXT      NOT NULL,
+        politician       TEXT,
+        transaction_type TEXT,
+        amount_range     TEXT,
+        trade_date       DATE,
+        disclosed_date   DATE,
+        ingested_at      TIMESTAMP DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_senate_trading_ticker_date
+        ON senate_congress_trading (ticker, trade_date DESC);
+
+    CREATE TABLE IF NOT EXISTS financial_calendar (
+        id              SERIAL PRIMARY KEY,
+        ticker          TEXT      NOT NULL,
+        event_type      TEXT      NOT NULL,
+        event_date      DATE      NOT NULL,
+        eps_estimate    NUMERIC,
+        revenue_estimate NUMERIC,
+        ingested_at     TIMESTAMP DEFAULT NOW(),
+        UNIQUE (ticker, event_type, event_date)
+    );
+    CREATE INDEX IF NOT EXISTS idx_financial_calendar_ticker_date
+        ON financial_calendar (ticker, event_date DESC);
     """
     with get_pg_conn() as conn:
         with conn.cursor() as cur:
@@ -477,6 +557,244 @@ def _insert_sentiment(ticker_symbol: str, df: pd.DataFrame) -> int:
     return len(rows)
 
 
+def _insert_social_sentiment(ticker_symbol: str, df: pd.DataFrame) -> int:
+    """Insert social sentiment data into dedicated social_sentiment table."""
+    if df.empty:
+        return 0
+
+    rows = []
+    today = date.today().isoformat()
+
+    for _, row in df.iterrows():
+        row_dict = row.to_dict()
+        platform = row_dict.get("platform") or row_dict.get("source") or "unknown"
+        score = row_dict.get("score") or row_dict.get("sentiment_score") or 0.0
+        sentiment_label = row_dict.get("sentiment") or row_dict.get("label") or "neutral"
+        row_date = row_dict.get("date") or row_dict.get("timestamp") or today
+
+        try:
+            row_date = str(row_date)[:10]
+        except Exception:
+            row_date = today
+
+        rows.append((ticker_symbol, platform, score, sentiment_label, row_date))
+
+    if not rows:
+        return 0
+
+    with get_pg_conn() as conn:
+        with conn.cursor() as cur:
+            sql = """
+                INSERT INTO social_sentiment
+                    (ticker, platform, score, sentiment_label, date)
+                VALUES %s
+                ON CONFLICT (ticker, platform, date)
+                DO UPDATE SET
+                    score = EXCLUDED.score,
+                    sentiment_label = EXCLUDED.sentiment_label,
+                    ingested_at = NOW();
+            """
+            execute_values(cur, sql, rows)
+        conn.commit()
+
+    return len(rows)
+
+
+def _insert_esg_scores(ticker_symbol: str, df: pd.DataFrame) -> int:
+    """Insert ESG scores into dedicated esg_scores table."""
+    if df.empty:
+        return 0
+
+    rows = []
+    today = date.today().isoformat()
+
+    for _, row in df.iterrows():
+        row_dict = row.to_dict()
+        env_score = row_dict.get("environmentalScore") or row_dict.get("env_score") or 0.0
+        social_score = row_dict.get("socialScore") or row_dict.get("social_score") or 0.0
+        gov_score = row_dict.get("governanceScore") or row_dict.get("gov_score") or 0.0
+        esg_total = row_dict.get("ESGScore") or row_dict.get("esg_total") or (env_score + social_score + gov_score)
+        as_of_date = row_dict.get("date") or row_dict.get("as_of_date") or today
+
+        try:
+            as_of_date = str(as_of_date)[:10]
+        except Exception:
+            as_of_date = today
+
+        rows.append((ticker_symbol, env_score, social_score, gov_score, esg_total, as_of_date))
+
+    if not rows:
+        return 0
+
+    with get_pg_conn() as conn:
+        with conn.cursor() as cur:
+            sql = """
+                INSERT INTO esg_scores
+                    (ticker, env_score, social_score, gov_score, esg_total, as_of_date)
+                VALUES %s
+                ON CONFLICT (ticker, as_of_date)
+                DO UPDATE SET
+                    env_score = EXCLUDED.env_score,
+                    social_score = EXCLUDED.social_score,
+                    gov_score = EXCLUDED.gov_score,
+                    esg_total = EXCLUDED.esg_total,
+                    ingested_at = NOW();
+            """
+            execute_values(cur, sql, rows)
+        conn.commit()
+
+    return len(rows)
+
+
+def _insert_short_interest(ticker_symbol: str, df: pd.DataFrame) -> int:
+    """Insert short interest data into dedicated short_interest table."""
+    if df.empty:
+        return 0
+
+    rows = []
+    today = date.today().isoformat()
+
+    for _, row in df.iterrows():
+        row_dict = row.to_dict()
+        short_interest_pct = row_dict.get("ShortInterest") or row_dict.get("short_interest_pct") or 0.0
+        days_to_cover = row_dict.get("DaysToCover") or row_dict.get("days_to_cover") or 0.0
+        shares_short = row_dict.get("SharesShort") or row_dict.get("shares_short") or 0
+        as_of_date = row_dict.get("Date") or row_dict.get("as_of_date") or today
+
+        try:
+            as_of_date = str(as_of_date)[:10]
+        except Exception:
+            as_of_date = today
+
+        rows.append((ticker_symbol, short_interest_pct, days_to_cover, shares_short, as_of_date))
+
+    if not rows:
+        return 0
+
+    with get_pg_conn() as conn:
+        with conn.cursor() as cur:
+            sql = """
+                INSERT INTO short_interest
+                    (ticker, short_interest_pct, days_to_cover, shares_short, as_of_date)
+                VALUES %s
+                ON CONFLICT (ticker, as_of_date)
+                DO UPDATE SET
+                    short_interest_pct = EXCLUDED.short_interest_pct,
+                    days_to_cover = EXCLUDED.days_to_cover,
+                    shares_short = EXCLUDED.shares_short,
+                    ingested_at = NOW();
+            """
+            execute_values(cur, sql, rows)
+        conn.commit()
+
+    return len(rows)
+
+
+def _insert_options_chain(ticker_symbol: str, df: pd.DataFrame) -> int:
+    """Insert options chain data into dedicated options_chain table."""
+    if df.empty:
+        return 0
+
+    rows = []
+    now = datetime.utcnow()
+
+    for _, row in df.iterrows():
+        row_dict = row.to_dict()
+        expiry_date = row_dict.get("expiration") or row_dict.get("expiryDate")
+        strike = row_dict.get("strike") or 0.0
+        call_put = row_dict.get("type") or row_dict.get("call_put") or "call"
+        implied_vol = row_dict.get("impliedVolatility") or row_dict.get("implied_vol") or 0.0
+        open_interest = row_dict.get("openInterest") or row_dict.get("open_interest") or 0
+        ts_date = row_dict.get("lastTradeDate") or row_dict.get("ts_date") or now
+
+        rows.append((ticker_symbol, expiry_date, strike, call_put, implied_vol, open_interest, ts_date))
+
+    if not rows:
+        return 0
+
+    with get_pg_conn() as conn:
+        with conn.cursor() as cur:
+            sql = """
+                INSERT INTO options_chain
+                    (ticker, expiry_date, strike, call_put, implied_vol, open_interest, ts_date)
+                VALUES %s;
+            """
+            execute_values(cur, sql, rows)
+        conn.commit()
+
+    return len(rows)
+
+
+def _insert_senate_trading(ticker_symbol: str, df: pd.DataFrame) -> int:
+    """Insert senate/congress trading data into dedicated senate_congress_trading table."""
+    if df.empty:
+        return 0
+
+    rows = []
+
+    for _, row in df.iterrows():
+        row_dict = row.to_dict()
+        politician = row_dict.get("representative") or row_dict.get("politician") or "unknown"
+        transaction_type = row_dict.get("transactionType") or row_dict.get("transaction_type") or "unknown"
+        amount_range = row_dict.get("amount") or row_dict.get("amount_range") or "unknown"
+        trade_date = row_dict.get("transactionDate") or row_dict.get("trade_date")
+        disclosed_date = row_dict.get("disclosureDate") or row_dict.get("disclosed_date")
+
+        rows.append((ticker_symbol, politician, transaction_type, amount_range, trade_date, disclosed_date))
+
+    if not rows:
+        return 0
+
+    with get_pg_conn() as conn:
+        with conn.cursor() as cur:
+            sql = """
+                INSERT INTO senate_congress_trading
+                    (ticker, politician, transaction_type, amount_range, trade_date, disclosed_date)
+                VALUES %s;
+            """
+            execute_values(cur, sql, rows)
+        conn.commit()
+
+    return len(rows)
+
+
+def _insert_financial_calendar(ticker_symbol: str, df: pd.DataFrame) -> int:
+    """Insert financial calendar events into dedicated financial_calendar table."""
+    if df.empty:
+        return 0
+
+    rows = []
+
+    for _, row in df.iterrows():
+        row_dict = row.to_dict()
+        event_type = row_dict.get("type") or row_dict.get("event_type") or "earnings"
+        event_date = row_dict.get("date") or row_dict.get("event_date")
+        eps_estimate = row_dict.get("epsEstimate") or row_dict.get("eps_estimate")
+        revenue_estimate = row_dict.get("revenueEstimate") or row_dict.get("revenue_estimate")
+
+        rows.append((ticker_symbol, event_type, event_date, eps_estimate, revenue_estimate))
+
+    if not rows:
+        return 0
+
+    with get_pg_conn() as conn:
+        with conn.cursor() as cur:
+            sql = """
+                INSERT INTO financial_calendar
+                    (ticker, event_type, event_date, eps_estimate, revenue_estimate)
+                VALUES %s
+                ON CONFLICT (ticker, event_type, event_date)
+                DO UPDATE SET
+                    eps_estimate = EXCLUDED.eps_estimate,
+                    revenue_estimate = EXCLUDED.revenue_estimate,
+                    ingested_at = NOW();
+            """
+            execute_values(cur, sql, rows)
+        conn.commit()
+
+    return len(rows)
+
+
 def _insert_dataframe(df, agent_name, ticker_symbol, data_name, source):
     if df.empty:
         return 0
@@ -573,6 +891,24 @@ def load_postgres_for_agent_ticker(agent_name: str, ticker_symbol: str) -> int:
         #         with correct bullish_pct/bearish_pct/neutral_pct column names
         if data_name == "sentiment_trends":
             rows_inserted = _insert_sentiment(ticker_symbol, df)
+
+        elif data_name == "social_sentiment":
+            rows_inserted = _insert_social_sentiment(ticker_symbol, df)
+
+        elif data_name == "esg_scores":
+            rows_inserted = _insert_esg_scores(ticker_symbol, df)
+
+        elif data_name == "short_interest":
+            rows_inserted = _insert_short_interest(ticker_symbol, df)
+
+        elif data_name == "options_chain":
+            rows_inserted = _insert_options_chain(ticker_symbol, df)
+
+        elif data_name == "senate_congress_trading":
+            rows_inserted = _insert_senate_trading(ticker_symbol, df)
+
+        elif data_name == "financial_calendar":
+            rows_inserted = _insert_financial_calendar(ticker_symbol, df)
 
         elif data_name in GLOBAL_ONCE_PER_DAY:
             rows_inserted = _insert_global(df, data_name, source)

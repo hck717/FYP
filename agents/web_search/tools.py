@@ -4,6 +4,9 @@ import json
 import logging
 import re
 import requests
+import psycopg2
+from psycopg2.extras import RealDictCursor
+from contextlib import closing
 from typing import Dict, List, Optional
 from pathlib import Path
 from dotenv import load_dotenv
@@ -12,6 +15,77 @@ from dotenv import load_dotenv
 load_dotenv(dotenv_path=Path(__file__).resolve().parents[2] / ".env")
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# PostgreSQL connector for web_search agent
+# ---------------------------------------------------------------------------
+class PostgresConnector:
+    """Thin wrapper over psycopg2 for fetching financial calendar and earnings data."""
+
+    def __init__(self) -> None:
+        self.postgres_host = os.getenv("POSTGRES_HOST", "localhost")
+        self.postgres_port = int(os.getenv("POSTGRES_PORT", "5432"))
+        self.postgres_db = os.getenv("POSTGRES_DB", "financial_db")
+        self.postgres_user = os.getenv("POSTGRES_USER", "postgres")
+        self.postgres_password = os.getenv("POSTGRES_PASSWORD", "")
+
+    def _connect(self):
+        return psycopg2.connect(
+            host=self.postgres_host,
+            port=self.postgres_port,
+            dbname=self.postgres_db,
+            user=self.postgres_user,
+            password=self.postgres_password,
+        )
+
+    def fetch_financial_calendar(self, ticker: str, limit: int = 10) -> List[Dict]:
+        """Fetch upcoming financial calendar events for the ticker."""
+        sql = """
+        SELECT ticker, event_type, event_date, eps_estimate, revenue_estimate
+        FROM financial_calendar
+        WHERE ticker = %s
+        ORDER BY event_date DESC
+        LIMIT %s
+        """
+        conn = self._connect()
+        with closing(conn), conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, (ticker, limit))
+            rows = cur.fetchall()
+            return [dict(r) for r in rows]
+
+    def fetch_earnings_surprises_context(self, ticker: str, limit: int = 5) -> List[Dict]:
+        """Fetch recent earnings surprises for context in web search."""
+        sql = """
+        SELECT payload, as_of_date
+        FROM raw_fundamentals
+        WHERE ticker_symbol = %s
+          AND data_name = 'earnings_surprises_history'
+        ORDER BY as_of_date DESC
+        LIMIT %s
+        """
+        conn = self._connect()
+        with closing(conn), conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, (ticker, limit))
+            rows = cur.fetchall()
+        results = []
+        for row in rows:
+            payload = row["payload"]
+            if isinstance(payload, str):
+                try:
+                    payload = json.loads(payload)
+                except json.JSONDecodeError:
+                    pass
+            results.append({
+                "payload": payload,
+                "as_of_date": str(row["as_of_date"])
+            })
+        return results
+
+
+# ---------------------------------------------------------------------------
+# Perplexity API integration
+# ---------------------------------------------------------------------------
 
 # Perplexity endpoint is fixed — no env var needed for URL
 PERPLEXITY_API_URL = "https://api.perplexity.ai/chat/completions"

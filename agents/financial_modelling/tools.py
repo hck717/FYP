@@ -190,6 +190,118 @@ class PostgresConnector:
             logger.warning("fetch_peer_fundamentals_by_sector failed: %s", exc)
             return []
 
+    def fetch_buyback_history(self, ticker: str, limit: int = 10) -> List[Dict]:
+        """Fetch share buyback history for the ticker."""
+        sql = """
+        SELECT payload, as_of_date
+        FROM raw_fundamentals
+        WHERE ticker_symbol = %s
+          AND data_name = 'share_buyback_history'
+        ORDER BY as_of_date DESC
+        LIMIT %s
+        """
+        conn = self._connect()
+        with closing(conn), conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, (ticker, limit))
+            rows = cur.fetchall()
+        results = []
+        for row in rows:
+            payload = row["payload"]
+            if isinstance(payload, str):
+                try:
+                    payload = json.loads(payload)
+                except json.JSONDecodeError:
+                    pass
+            results.append({
+                "payload": payload,
+                "as_of_date": str(row["as_of_date"])
+            })
+        return results
+
+    def fetch_exec_compensation(self, ticker: str, limit: int = 5) -> List[Dict]:
+        """Fetch executive compensation data for the ticker."""
+        sql = """
+        SELECT payload, as_of_date
+        FROM raw_fundamentals
+        WHERE ticker_symbol = %s
+          AND data_name = 'executive_compensation'
+        ORDER BY as_of_date DESC
+        LIMIT %s
+        """
+        conn = self._connect()
+        with closing(conn), conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, (ticker, limit))
+            rows = cur.fetchall()
+        results = []
+        for row in rows:
+            payload = row["payload"]
+            if isinstance(payload, str):
+                try:
+                    payload = json.loads(payload)
+                except json.JSONDecodeError:
+                    pass
+            results.append({
+                "payload": payload,
+                "as_of_date": str(row["as_of_date"])
+            })
+        return results
+
+    def fetch_forex_rates(self, ticker: str, limit: int = 365) -> List[Dict]:
+        """Fetch forex historical rates for the ticker."""
+        sql = """
+        SELECT payload, ts_date
+        FROM raw_timeseries
+        WHERE ticker_symbol = %s
+          AND data_name = 'forex_historical_rates'
+        ORDER BY ts_date DESC
+        LIMIT %s
+        """
+        conn = self._connect()
+        with closing(conn), conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, (ticker, limit))
+            rows = cur.fetchall()
+        results = []
+        for row in rows:
+            payload = row["payload"]
+            if isinstance(payload, str):
+                try:
+                    payload = json.loads(payload)
+                except json.JSONDecodeError:
+                    pass
+            results.append({
+                "payload": payload,
+                "ts_date": str(row["ts_date"])
+            })
+        return results
+
+    def fetch_sector_multiples(self, ticker: str, limit: int = 1) -> List[Dict]:
+        """Fetch sector/industry multiples for the ticker."""
+        sql = """
+        SELECT payload, as_of_date
+        FROM raw_fundamentals
+        WHERE ticker_symbol = %s
+          AND data_name = 'sector_industry_multiples'
+        ORDER BY as_of_date DESC
+        LIMIT %s
+        """
+        conn = self._connect()
+        with closing(conn), conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, (ticker, limit))
+            rows = cur.fetchall()
+        results = []
+        for row in rows:
+            payload = row["payload"]
+            if isinstance(payload, str):
+                try:
+                    payload = json.loads(payload)
+                except json.JSONDecodeError:
+                    pass
+            results.append({
+                "payload": payload,
+                "as_of_date": str(row["as_of_date"])
+            })
+        return results
+
     def healthcheck(self) -> bool:
         try:
             conn = self._connect()
@@ -737,6 +849,22 @@ class FMToolkit:
 
     def healthcheck(self) -> Dict[str, bool]:
         return {"postgres": self.pg.healthcheck()}
+
+    def fetch_buyback_history(self, ticker: str, limit: int = 10) -> List[Dict]:
+        """Fetch share buyback history for the ticker."""
+        return self.pg.fetch_buyback_history(ticker, limit)
+
+    def fetch_exec_compensation(self, ticker: str, limit: int = 5) -> List[Dict]:
+        """Fetch executive compensation data for the ticker."""
+        return self.pg.fetch_exec_compensation(ticker, limit)
+
+    def fetch_forex_rates(self, ticker: str, limit: int = 365) -> List[Dict]:
+        """Fetch forex historical rates for the ticker."""
+        return self.pg.fetch_forex_rates(ticker, limit)
+
+    def fetch_sector_multiples(self, ticker: str, limit: int = 1) -> List[Dict]:
+        """Fetch sector/industry multiples for the ticker."""
+        return self.pg.fetch_sector_multiples(ticker, limit)
 
     def close(self) -> None:
         self.neo4j.close()

@@ -80,12 +80,16 @@ AGENT_CONFIGS = {
             ("sentiment_trends", "sentiments",            {"s": "{ticker_symbol}"},               "postgresql"),
             # company_profile → Neo4j (Company node with 40+ properties)
             ("company_profile",  "fundamentals/{ticker}", {},                                     "neo4j"),
+            # financial_calendar → PostgreSQL (earnings dates, estimates)
+            ("financial_calendar", "calendar/earnings",   {},                                     "postgresql"),
+            # realtime_news_feed → Qdrant (news embeddings for RAG)
+            ("realtime_news_feed", "news",                {"s": "{ticker_symbol}", "limit": 100}, "qdrant_prep"),
         ]
     },
     "quantitative_fundamental": {
         "endpoints": [
-            ("realtime_quote",        "real-time/{ticker}",  {},                                                                   "postgresql"),
-            ("historical_prices_eod", "eod/{ticker}",        {"from": (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')}, "postgresql"),
+            ("realtime_quote",        "real-time/{ticker}",  {},                                                                     "postgresql"),
+            ("historical_prices_eod", "eod/{ticker}",        {"from": (datetime.now() - timedelta(days=1825)).strftime('%Y-%m-%d')}, "postgresql"),  # 5 years = ~1825 days
             ("intraday_1m",           "intraday/{ticker}",   {"interval": "1m",  "to": int(time.time())},                         "postgresql"),
             ("intraday_5m",           "intraday/{ticker}",   {"interval": "5m",  "to": int(time.time())},                         "postgresql"),
             ("intraday_15m",          "intraday/{ticker}",   {"interval": "15m", "to": int(time.time())},                         "postgresql"),
@@ -94,6 +98,8 @@ AGENT_CONFIGS = {
             ("technical_sma",         "technical/{ticker}",  {"function": "sma", "period": 50},                                   "postgresql"),
             ("technical_ema",         "technical/{ticker}",  {"function": "ema", "period": 20},                                   "postgresql"),
             ("live_stock_price",      "real-time/{ticker}",  {},                                                                   "postgresql"),
+            ("short_interest",        "short-interest/{ticker}", {},                                                            "postgresql"),
+            ("screener_bulk",         "screener",            {"filters": "[\"market_cap_basic\",\">\",1000000000]"},           "postgresql"),
         ]
     },
     "financial_modeling": {
@@ -109,6 +115,9 @@ AGENT_CONFIGS = {
             ("economic_indicators_gdp",          "macro-indicator/USA", {"indicator": "gdp_growth_rate"},         "postgresql"),
             ("economic_indicators_cpi",          "macro-indicator/USA", {"indicator": "inflation_cpi_or_adcp"},   "postgresql"),
             ("economic_indicators_unemployment", "macro-indicator/USA", {"indicator": "unemployment_rate"},       "postgresql"),
+            ("corporate_bond_yields",            "bond/{ticker}",       {"from": (datetime.now() - timedelta(days=365)).strftime('%Y-%m-%d')}, "postgresql"),
+            ("forex_historical_rates",           "forex/{ticker}",      {"from": (datetime.now() - timedelta(days=365)).strftime('%Y-%m-%d')}, "postgresql"),
+            ("etf_index_constituents",           "etf/{ticker}",        {},                                                                    "neo4j"),
         ]
     }
 }
@@ -141,7 +150,7 @@ def fetch_data(endpoint, params=None):
     params['fmt'] = 'json'
 
     try:
-        response = requests.get(url, params=params, timeout=None)
+        response = requests.get(url, params=params, timeout=60)  # 60s timeout for API requests
         print(f"  URL: {endpoint}")
         print(f"  Status: {response.status_code}")
 
@@ -250,6 +259,8 @@ _MACRO_DATA_NAMES = {
     "economic_indicators_gdp",
     "economic_indicators_cpi",
     "economic_indicators_unemployment",
+    "screener_bulk",
+    "financial_calendar",
 }
 
 
@@ -370,24 +381,30 @@ with DAG(
         for ticker, ticker_symbol in zip(TICKERS, TICKER_SYMBOLS):
             key = f'{agent_name}_{ticker_symbol}'
 
+            # Scrape timeout varies by agent (based on endpoint count)
+            if agent_name == "quantitative_fundamental":
+                scrape_timeout = timedelta(minutes=3)  # 12 endpoints
+            else:
+                scrape_timeout = timedelta(minutes=2)  # 5-10 endpoints
+
             scrape_tasks[key] = PythonOperator(
                 task_id=f'eodhd_scrape_{agent_name}_{ticker_symbol}',
                 python_callable=scrape_agent_ticker,
                 op_kwargs={'agent_name': agent_name, 'ticker': ticker, 'ticker_symbol': ticker_symbol},
                 provide_context=True,
-                execution_timeout=None,
+                execution_timeout=scrape_timeout,
             )
             load_pg_tasks[key] = PythonOperator(
                 task_id=f'eodhd_load_postgres_{agent_name}_{ticker_symbol}',
                 python_callable=load_postgres_for_agent_ticker,
                 op_kwargs={'agent_name': agent_name, 'ticker_symbol': ticker_symbol},
-                execution_timeout=None,
+                execution_timeout=timedelta(minutes=5),
             )
             load_neo4j_tasks[key] = PythonOperator(
                 task_id=f'eodhd_load_neo4j_{agent_name}_{ticker_symbol}',
                 python_callable=load_neo4j_for_agent_ticker,
                 op_kwargs={'agent_name': agent_name, 'ticker_symbol': ticker_symbol},
-                execution_timeout=None,
+                execution_timeout=timedelta(minutes=5),
             )
             load_qdrant_tasks[key] = PythonOperator(
                 task_id=f'eodhd_load_qdrant_{agent_name}_{ticker_symbol}',
@@ -396,7 +413,7 @@ with DAG(
                 # Qdrant tasks get extra retries since Ollama may need warm-up time
                 retries=3,
                 retry_delay=timedelta(seconds=30),
-                execution_timeout=None,
+                execution_timeout=timedelta(minutes=10),  # Ollama embedding generation
             )
 
             # Only business_analyst needs Neo4j chunk synthesis
@@ -406,14 +423,14 @@ with DAG(
                     python_callable=ingest_neo4j_chunks_for_ticker,
                     op_kwargs={'ticker': ticker_symbol},
                     provide_context=True,
-                    execution_timeout=None,  # LLM synthesis can take several minutes
+                    execution_timeout=timedelta(minutes=15),  # LLM synthesis + embedding
                 )
 
     summary_task = PythonOperator(
         task_id='eodhd_generate_summary',
         python_callable=report_summary,
         provide_context=True,
-        execution_timeout=None,
+        execution_timeout=timedelta(minutes=1),
     )
 
     # scrape → [postgres ∥ neo4j ∥ qdrant] → summary

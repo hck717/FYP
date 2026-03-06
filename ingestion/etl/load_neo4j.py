@@ -114,6 +114,110 @@ def _load_fact(tx, ticker_symbol, data_name, row):
     )
 
 
+def _load_esg_score(tx, ticker_symbol: str, row_dict: dict):
+    """Create (Company)-[:HAS_ESG]->(ESGScore) node."""
+    props = {k: (None if pd.isna(v) else v) for k, v in row_dict.items()}
+    esg_id = hashlib.md5(
+        json.dumps({"ticker": ticker_symbol, **props}, sort_keys=True).encode()
+    ).hexdigest()
+    props["esg_id"] = esg_id
+    tx.run(
+        """
+        MERGE (c:Company {ticker: $ticker})
+        MERGE (e:ESGScore {esg_id: $esg_id})
+        SET e += $props
+        MERGE (c)-[:HAS_ESG]->(e)
+        """,
+        ticker=ticker_symbol,
+        esg_id=esg_id,
+        props=props,
+    )
+
+
+def _load_institutional_owner(tx, ticker_symbol: str, row_dict: dict):
+    """Create (Company)-[:HAS_INSTITUTIONAL_OWNER]->(Institutional) node."""
+    props = {k: (None if pd.isna(v) else v) for k, v in row_dict.items()}
+    inst_id = hashlib.md5(
+        json.dumps({"ticker": ticker_symbol, **props}, sort_keys=True).encode()
+    ).hexdigest()
+    props["inst_id"] = inst_id
+    tx.run(
+        """
+        MERGE (c:Company {ticker: $ticker})
+        MERGE (i:Institutional {inst_id: $inst_id})
+        SET i += $props
+        MERGE (c)-[:HAS_INSTITUTIONAL_OWNER]->(i)
+        """,
+        ticker=ticker_symbol,
+        inst_id=inst_id,
+        props=props,
+    )
+
+
+def _load_insider_trade(tx, ticker_symbol: str, row_dict: dict):
+    """Create (Company)-[:HAS_INSIDER_TRADE]->(Insider) node."""
+    props = {k: (None if pd.isna(v) else v) for k, v in row_dict.items()}
+    insider_id = hashlib.md5(
+        json.dumps({"ticker": ticker_symbol, **props}, sort_keys=True).encode()
+    ).hexdigest()
+    props["insider_id"] = insider_id
+    tx.run(
+        """
+        MERGE (c:Company {ticker: $ticker})
+        MERGE (i:Insider {insider_id: $insider_id})
+        SET i += $props
+        MERGE (c)-[:HAS_INSIDER_TRADE]->(i)
+        """,
+        ticker=ticker_symbol,
+        insider_id=insider_id,
+        props=props,
+    )
+
+
+def _load_ma_deal(tx, ticker_symbol: str, row_dict: dict):
+    """Create (Company)-[:HAS_MA_DEAL]->(MADeal) node."""
+    props = {k: (None if pd.isna(v) else v) for k, v in row_dict.items()}
+    deal_id = hashlib.md5(
+        json.dumps({"ticker": ticker_symbol, **props}, sort_keys=True).encode()
+    ).hexdigest()
+    props["deal_id"] = deal_id
+    tx.run(
+        """
+        MERGE (c:Company {ticker: $ticker})
+        MERGE (m:MADeal {deal_id: $deal_id})
+        SET m += $props
+        MERGE (c)-[:HAS_MA_DEAL]->(m)
+        """,
+        ticker=ticker_symbol,
+        deal_id=deal_id,
+        props=props,
+    )
+
+
+def _load_etf_constituent(tx, ticker_symbol: str, row_dict: dict):
+    """Create (ETF)-[:CONTAINS]->(Company) relationship."""
+    # ticker_symbol is the ETF ticker (e.g., SPY)
+    # row_dict should contain 'Code' or 'ticker' for the constituent company
+    constituent = row_dict.get("Code") or row_dict.get("ticker") or row_dict.get("symbol")
+    if not constituent:
+        return
+    
+    weight = row_dict.get("Weight") or row_dict.get("weight") or 0.0
+    
+    tx.run(
+        """
+        MERGE (etf:Company {ticker: $etf_ticker})
+        SET etf.is_etf = true
+        MERGE (c:Company {ticker: $constituent})
+        MERGE (etf)-[r:CONTAINS]->(c)
+        SET r.weight = $weight
+        """,
+        etf_ticker=ticker_symbol,
+        constituent=constituent,
+        weight=weight,
+    )
+
+
 def _load_peer_relationships(session, ticker_symbol: str, peers_csv_path: Path) -> int:
     """Create (Company)-[:COMPETES_WITH]->(Company) edges from stock_peers CSV.
 
@@ -230,6 +334,31 @@ def load_neo4j_for_agent_ticker(agent_name: str, ticker_symbol: str) -> int:
                         row.to_dict(),
                         label="Strategy",
                     )
+                    count += 1
+
+            elif data_name == "esg_scores":
+                for _, row in df.iterrows():
+                    session.execute_write(_load_esg_score, ticker_symbol, row.to_dict())
+                    count += 1
+
+            elif data_name == "institutional_ownership_13f":
+                for _, row in df.iterrows():
+                    session.execute_write(_load_institutional_owner, ticker_symbol, row.to_dict())
+                    count += 1
+
+            elif data_name == "insider_trading":
+                for _, row in df.iterrows():
+                    session.execute_write(_load_insider_trade, ticker_symbol, row.to_dict())
+                    count += 1
+
+            elif data_name == "ma_activity":
+                for _, row in df.iterrows():
+                    session.execute_write(_load_ma_deal, ticker_symbol, row.to_dict())
+                    count += 1
+
+            elif data_name == "etf_index_constituents":
+                for _, row in df.iterrows():
+                    session.execute_write(_load_etf_constituent, ticker_symbol, row.to_dict())
                     count += 1
 
             else:

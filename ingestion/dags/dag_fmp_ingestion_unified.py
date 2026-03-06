@@ -71,6 +71,11 @@ AGENT_CONFIGS = {
             ("company_notes",             "company-notes",         {"symbol": "{ticker}"},                                   "neo4j"),
             ("press_releases",            "press-releases",        {"symbol": "{ticker}", "limit": 50},                      "qdrant_prep"),
             ("stock_news",                "news/stock",            {"symbols": "{ticker}", "limit": 100},                    "qdrant_prep"),
+            ("social_sentiment",          "social-sentiment",      {"symbol": "{ticker}", "page": "0"},                      "qdrant_prep"),  # Last 30 days rolling (API default)
+            ("esg_scores",                "esg-environmental-social-governance-data", {"symbol": "{ticker}"},                "neo4j"),
+            ("institutional_ownership_13f", "institutional-ownership", {"symbol": "{ticker}"},                              "neo4j"),
+            ("insider_trading",           "insider-trading",       {"symbol": "{ticker}", "limit": 50},                      "neo4j"),
+            ("ma_activity",               "mergers-acquisitions-rss-feed", {"symbol": "{ticker}", "page": "0"},            "neo4j"),  # RSS feed typically covers 5-10 years
         ]
     },
     "quantitative_fundamental": {
@@ -78,9 +83,9 @@ AGENT_CONFIGS = {
             ("income_statement",              "income-statement",               {"symbol": "{ticker}", "limit": 40}, "postgresql"),
             ("balance_sheet",                 "balance-sheet-statement",        {"symbol": "{ticker}", "limit": 40}, "postgresql"),
             ("cash_flow",                     "cash-flow-statement",            {"symbol": "{ticker}", "limit": 40}, "postgresql"),
-            ("income_statement_as_reported",  "income-statement-as-reported",   {"symbol": "{ticker}", "limit": 10}, "postgresql"),
-            ("balance_sheet_as_reported",     "balance-sheet-as-reported",      {"symbol": "{ticker}", "limit": 10}, "postgresql"),
-            ("cash_flow_as_reported",         "cash-flow-statement-as-reported",{"symbol": "{ticker}", "limit": 10}, "postgresql"),
+            ("income_statement_as_reported",  "income-statement-as-reported",   {"symbol": "{ticker}", "limit": 20}, "postgresql"),  # 5 years = 20 quarters
+            ("balance_sheet_as_reported",     "balance-sheet-as-reported",      {"symbol": "{ticker}", "limit": 20}, "postgresql"),  # 5 years = 20 quarters
+            ("cash_flow_as_reported",         "cash-flow-statement-as-reported",{"symbol": "{ticker}", "limit": 20}, "postgresql"),  # 5 years = 20 quarters
             ("financial_ratios",              "ratios",                         {"symbol": "{ticker}", "limit": 40}, "postgresql"),
             ("ratios_ttm",                    "ratios-ttm",                     {"symbol": "{ticker}"},              "postgresql"),
             ("key_metrics",                   "key-metrics",                    {"symbol": "{ticker}", "limit": 40}, "postgresql"),
@@ -92,6 +97,12 @@ AGENT_CONFIGS = {
             ("historical_market_cap",         "historical-market-capitalization",{"symbol": "{ticker}", "limit": 365},"postgresql"),
             ("company_core_info",             "company-core-information",       {"symbol": "{ticker}"},              "postgresql"),
             ("rating",                        "rating",                         {"symbol": "{ticker}"},              "postgresql"),
+            ("earnings_surprises",            "historical/earning_calendar",    {"symbol": "{ticker}", "limit": 40}, "postgresql"),
+            ("institutional_ownership_delta", "institutional-ownership",        {"symbol": "{ticker}"},              "postgresql"),
+            ("insider_transactions_net",      "insider-trading",                {"symbol": "{ticker}", "limit": 100},"postgresql"),
+            ("options_chain",                 "options",                        {"symbol": "{ticker}"},              "postgresql"),
+            ("senate_congress_trading",       "senate-trading",                 {"symbol": "{ticker}"},              "postgresql"),
+            ("revenue_segment_growth",        "revenue-product-segmentation",   {"symbol": "{ticker}"},              "postgresql"),
         ]
     },
     "financial_modeling": {
@@ -122,6 +133,13 @@ AGENT_CONFIGS = {
             ("company_outlook",                    "company-outlook",                                      {"symbol": "{ticker}"},                                                                                                        "postgresql"),
             ("enterprise_values",                  "enterprise-values",                                    {"symbol": "{ticker}", "limit": 40},                                                                                           "postgresql"),
             ("market_cap_history",                 "historical-market-capitalization",                     {"symbol": "{ticker}", "limit": 365},                                                                                          "postgresql"),
+            ("forward_eps_revenue_estimates",      "analyst-estimates",                                    {"symbol": "{ticker}"},                                                                                                        "postgresql"),
+            ("share_buyback_history",              "share_buyback",                                        {"symbol": "{ticker}"},                                                                                                        "postgresql"),
+            ("executive_compensation",             "governance/executive_compensation",                    {"symbol": "{ticker}"},                                                                                                        "postgresql"),
+            ("implied_volatility",                 "implied-volatility",                                   {"symbol": "{ticker}"},                                                                                                        "postgresql"),
+            ("sector_industry_multiples",          "sector_price_earning_ratio",                           {"date": datetime.now().strftime('%Y-%m-%d')},                                                                                 "postgresql"),
+            ("financial_calendar",                 "earning-calendar",                                     {"symbol": "{ticker}"},                                                                                                        "postgresql"),
+            ("earnings_surprises_history",         "upgrades-downgrades",                                  {"symbol": "{ticker}"},                                                                                                        "postgresql"),
         ]
     }
 }
@@ -153,7 +171,7 @@ def fetch_data(endpoint, params=None):
     params['apikey'] = FMP_API_KEY
 
     try:
-        response = requests.get(url, params=params, timeout=None)
+        response = requests.get(url, params=params, timeout=60)  # 60s timeout for API requests
         print(f"  URL: {endpoint}")
         print(f"  Status: {response.status_code}")
 
@@ -308,30 +326,38 @@ with DAG(
         for ticker in TICKERS:
             key = f'{agent_name}_{ticker}'
 
+            # Scrape timeout varies by agent (based on endpoint count)
+            if agent_name == "business_analyst":
+                scrape_timeout = timedelta(minutes=2)  # 15 endpoints
+            elif agent_name == "quantitative_fundamental":
+                scrape_timeout = timedelta(minutes=3)  # 23 endpoints
+            else:  # financial_modeling
+                scrape_timeout = timedelta(minutes=3)  # 30 endpoints
+
             scrape_tasks[key] = PythonOperator(
                 task_id=f'fmp_scrape_{agent_name}_{ticker}',
                 python_callable=scrape_agent_ticker,
                 op_kwargs={'agent_name': agent_name, 'ticker': ticker},
                 provide_context=True,
-                execution_timeout=None,
+                execution_timeout=scrape_timeout,
             )
             load_pg_tasks[key] = PythonOperator(
                 task_id=f'fmp_load_postgres_{agent_name}_{ticker}',
                 python_callable=load_postgres_for_agent_ticker,
                 op_kwargs={'agent_name': agent_name, 'ticker_symbol': ticker},
-                execution_timeout=None,
+                execution_timeout=timedelta(minutes=5),
             )
             load_neo4j_tasks[key] = PythonOperator(
                 task_id=f'fmp_load_neo4j_{agent_name}_{ticker}',
                 python_callable=load_neo4j_for_agent_ticker,
                 op_kwargs={'agent_name': agent_name, 'ticker_symbol': ticker},
-                execution_timeout=None,
+                execution_timeout=timedelta(minutes=5),
             )
             load_qdrant_tasks[key] = PythonOperator(
                 task_id=f'fmp_load_qdrant_{agent_name}_{ticker}',
                 python_callable=load_qdrant_for_agent_ticker,
                 op_kwargs={'agent_name': agent_name, 'ticker_symbol': ticker},
-                execution_timeout=None,
+                execution_timeout=timedelta(minutes=10),  # Ollama embedding generation
             )
 
             # Only business_analyst needs Neo4j chunk synthesis
@@ -341,14 +367,14 @@ with DAG(
                     python_callable=ingest_neo4j_chunks_for_ticker,
                     op_kwargs={'ticker': ticker},
                     provide_context=True,
-                    execution_timeout=None,  # LLM synthesis can take several minutes
+                    execution_timeout=timedelta(minutes=15),  # LLM synthesis + embedding
                 )
 
     summary_task = PythonOperator(
         task_id='fmp_generate_summary',
         python_callable=report_summary,
         provide_context=True,
-        execution_timeout=None,
+        execution_timeout=timedelta(minutes=1),
     )
 
     # ── Wire dependencies ───────────────────────────────────────────────────────

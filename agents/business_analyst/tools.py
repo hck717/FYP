@@ -412,6 +412,18 @@ class Neo4jConnector:
             f"Top connected entities: {sample_str}"
         )
 
+    def fetch_insider_signals(self, ticker: str, limit: int = 20) -> List[Dict]:
+        """Fetch insider trading signals from Neo4j."""
+        cypher = """
+        MATCH (c:Company {ticker: $ticker})-[:HAS_INSIDER_TRADE]->(i:Insider)
+        RETURN properties(i) AS insider
+        ORDER BY i.transactionDate DESC
+        LIMIT $limit
+        """
+        with self.driver.session(database=None) as session:
+            result = session.run(cypher, ticker=ticker, limit=limit)
+            return [dict(row["insider"]) for row in result]
+
     def close(self) -> None:
         self.driver.close()
 
@@ -453,6 +465,50 @@ class PostgresConnector:
                 neutral_pct=float(row.get("neutral_pct", 0.0)),
                 trend=row.get("trend", "unknown"),
             )
+
+    def fetch_esg(self, ticker: str) -> Optional[Dict]:
+        """Fetch latest ESG scores for the ticker."""
+        sql = """
+            SELECT ticker, env_score, social_score, gov_score, esg_total, as_of_date
+            FROM esg_scores
+            WHERE ticker = %s
+            ORDER BY as_of_date DESC
+            LIMIT 1
+        """
+        conn = psycopg2.connect(
+            host=self.config.postgres_host,
+            port=self.config.postgres_port,
+            dbname=self.config.postgres_db,
+            user=self.config.postgres_user,
+            password=self.config.postgres_password,
+        )
+        with closing(conn), conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, (ticker,))
+            row = cur.fetchone()
+            if not row:
+                return None
+            return dict(row)
+
+    def fetch_social_sentiment(self, ticker: str, limit: int = 10) -> List[Dict]:
+        """Fetch recent social sentiment data for the ticker."""
+        sql = """
+            SELECT ticker, platform, score, sentiment_label, date
+            FROM social_sentiment
+            WHERE ticker = %s
+            ORDER BY date DESC
+            LIMIT %s
+        """
+        conn = psycopg2.connect(
+            host=self.config.postgres_host,
+            port=self.config.postgres_port,
+            dbname=self.config.postgres_db,
+            user=self.config.postgres_user,
+            password=self.config.postgres_password,
+        )
+        with closing(conn), conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, (ticker, limit))
+            rows = cur.fetchall()
+            return [dict(r) for r in rows]
 
 
 # ----------------------------------------------------------------------------
@@ -959,6 +1015,30 @@ class BusinessAnalystToolkit:
         except Exception as exc:
             logger.warning("Postgres sentiment fetch failed: %s", exc)
             return None
+
+    def fetch_esg(self, ticker: str) -> Optional[Dict]:
+        """Fetch latest ESG scores for the ticker."""
+        try:
+            return self.pg.fetch_esg(ticker)
+        except Exception as exc:
+            logger.warning("ESG fetch failed for %s: %s", ticker, exc)
+            return None
+
+    def fetch_social_sentiment(self, ticker: str, limit: int = 10) -> List[Dict]:
+        """Fetch recent social sentiment data for the ticker."""
+        try:
+            return self.pg.fetch_social_sentiment(ticker, limit)
+        except Exception as exc:
+            logger.warning("Social sentiment fetch failed for %s: %s", ticker, exc)
+            return []
+
+    def fetch_insider_signals(self, ticker: str, limit: int = 20) -> List[Dict]:
+        """Fetch insider trading signals from Neo4j."""
+        try:
+            return self.neo4j.fetch_insider_signals(ticker, limit)
+        except Exception as exc:
+            logger.warning("Insider signals fetch failed for %s: %s", ticker, exc)
+            return []
 
     def retrieve(self, query: str, ticker: Optional[str]) -> RetrievalResult:
         try:
