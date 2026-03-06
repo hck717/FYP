@@ -311,6 +311,221 @@ class PostgresConnector:
             logger.warning("PostgreSQL healthcheck failed: %s", exc)
             return False
 
+    def fetch_economic_events(self, limit: int = 50) -> List[Dict]:
+        """Fetch recent economic events (Row 12: Economic Events Data API)."""
+        sql = """
+        SELECT event_date, country, event_name, actual, forecast, previous, impact, currency
+        FROM economic_events
+        ORDER BY event_date DESC
+        LIMIT %s
+        """
+        conn = self._connect()
+        with closing(conn), conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, (limit,))
+            rows = cur.fetchall()
+        return [dict(r) for r in rows]
+
+    def fetch_bond_yields(self, limit: int = 10) -> List[Dict]:
+        """Fetch recent corporate bond yield rows (Row 13: Bonds Data)."""
+        sql = """
+        SELECT isin, ticker, issuer_name, coupon_rate, maturity_date,
+               yield_to_maturity, current_price, currency, ts_date
+        FROM corporate_bond_yields
+        ORDER BY ts_date DESC
+        LIMIT %s
+        """
+        conn = self._connect()
+        with closing(conn), conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, (limit,))
+            rows = cur.fetchall()
+        return [dict(r) for r in rows]
+
+    def fetch_treasury_rates_dedicated(self, indicator: str = "US10Y", limit: int = 5) -> List[Dict]:
+        """Fetch rows from the dedicated treasury_rates table (Row 11).
+
+        The dedicated table stores pre-extracted rate rows with columns:
+        indicator, rate, ts_date.
+        """
+        sql = """
+        SELECT indicator, rate, ts_date
+        FROM treasury_rates
+        WHERE indicator = %s
+        ORDER BY ts_date DESC
+        LIMIT %s
+        """
+        conn = self._connect()
+        with closing(conn), conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, (indicator, limit))
+            rows = cur.fetchall()
+        return [dict(r) for r in rows]
+
+    def fetch_financial_statements(
+        self,
+        ticker: str,
+        statement_type: Optional[str] = None,
+        limit: int = 4,
+    ) -> Dict[str, List[Dict]]:
+        """Fetch rows from the financial_statements table (Row 18).
+
+        Returns a dict keyed by statement_type:
+          {"Income_Statement": [...], "Balance_Sheet": [...], "Cash_Flow": [...]}
+
+        If statement_type is specified, only that type is fetched.
+        """
+        if statement_type:
+            sql = """
+            SELECT ticker, statement_type, period_type, report_date, payload
+            FROM financial_statements
+            WHERE ticker = %s AND statement_type = %s
+            ORDER BY report_date DESC
+            LIMIT %s
+            """
+            conn = self._connect()
+            with closing(conn), conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(sql, (ticker, statement_type, limit))
+                rows = cur.fetchall()
+            result = {}
+            for row in rows:
+                st = row["statement_type"]
+                payload = row["payload"]
+                if isinstance(payload, str):
+                    try:
+                        payload = json.loads(payload)
+                    except json.JSONDecodeError:
+                        pass
+                entry = {"report_date": str(row["report_date"]), "period_type": row["period_type"],
+                         "payload": payload}
+                result.setdefault(st, []).append(entry)
+            return result
+        else:
+            sql = """
+            SELECT ticker, statement_type, period_type, report_date, payload
+            FROM financial_statements
+            WHERE ticker = %s
+            ORDER BY statement_type, report_date DESC
+            """
+            conn = self._connect()
+            with closing(conn), conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(sql, (ticker,))
+                rows = cur.fetchall()
+            result: Dict[str, List[Dict]] = {}
+            counts: Dict[str, int] = {}
+            for row in rows:
+                st = row["statement_type"]
+                if counts.get(st, 0) >= limit:
+                    continue
+                payload = row["payload"]
+                if isinstance(payload, str):
+                    try:
+                        payload = json.loads(payload)
+                    except json.JSONDecodeError:
+                        pass
+                entry = {"report_date": str(row["report_date"]), "period_type": row["period_type"],
+                         "payload": payload}
+                result.setdefault(st, []).append(entry)
+                counts[st] = counts.get(st, 0) + 1
+            return result
+
+    def fetch_valuation_metrics(self, ticker: str) -> Optional[Dict]:
+        """Fetch latest valuation metrics for the ticker (Row 19)."""
+        sql = """
+        SELECT *
+        FROM valuation_metrics
+        WHERE ticker = %s
+        ORDER BY as_of_date DESC
+        LIMIT 1
+        """
+        conn = self._connect()
+        with closing(conn), conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, (ticker,))
+            row = cur.fetchone()
+            if not row:
+                return None
+            return {k: (float(v) if isinstance(v, (int, float)) and k not in ("ticker", "id") else
+                        str(v) if v is not None else None)
+                    for k, v in dict(row).items()}
+
+    def fetch_outstanding_shares(self, ticker: str, limit: int = 10) -> List[Dict]:
+        """Fetch outstanding shares history for the ticker (Row 22)."""
+        sql = """
+        SELECT ticker, period_type, shares_date, shares_outstanding
+        FROM outstanding_shares
+        WHERE ticker = %s
+        ORDER BY shares_date DESC
+        LIMIT %s
+        """
+        conn = self._connect()
+        with closing(conn), conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, (ticker, limit))
+            rows = cur.fetchall()
+        return [dict(r) for r in rows]
+
+    def fetch_splits_history(self, ticker: str, limit: int = 10) -> List[Dict]:
+        """Fetch stock split history for the ticker (Row 10: splits part)."""
+        sql = """
+        SELECT ticker, split_ratio, announce_date, ex_date
+        FROM splits_history
+        WHERE ticker = %s
+        ORDER BY ex_date DESC
+        LIMIT %s
+        """
+        conn = self._connect()
+        with closing(conn), conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, (ticker, limit))
+            rows = cur.fetchall()
+        return [dict(r) for r in rows]
+
+    def fetch_macro_indicators(self, indicator: str, limit: int = 5) -> List[Dict]:
+        """Fetch global macro indicator rows (Row 11: Treasury Rates / Macro Indicators).
+
+        Queries the global_macro_indicators table.
+        Common indicator values: 'GDP', 'CPI', 'UNEMPLOYMENT', 'US10Y', etc.
+        """
+        sql = """
+        SELECT indicator, ts_date, payload, source
+        FROM global_macro_indicators
+        WHERE indicator = %s
+        ORDER BY ts_date DESC
+        LIMIT %s
+        """
+        conn = self._connect()
+        with closing(conn), conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, (indicator, limit))
+            rows = cur.fetchall()
+        results = []
+        for row in rows:
+            payload = row["payload"]
+            if isinstance(payload, str):
+                try:
+                    payload = json.loads(payload)
+                except json.JSONDecodeError:
+                    pass
+            results.append({
+                "indicator": row["indicator"],
+                "ts_date": str(row["ts_date"]),
+                "payload": payload,
+                "source": row["source"],
+            })
+        return results
+
+    def fetch_forex_rates_dedicated(self, forex_pair: str, limit: int = 5) -> List[Dict]:
+        """Fetch rows from the dedicated forex_rates table (Row 14: Forex Historical Rates).
+
+        The forex_rates table has columns: forex_pair, rate, ts_date.
+        """
+        sql = """
+        SELECT forex_pair, rate, ts_date
+        FROM forex_rates
+        WHERE forex_pair = %s
+        ORDER BY ts_date DESC
+        LIMIT %s
+        """
+        conn = self._connect()
+        with closing(conn), conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, (forex_pair, limit))
+            rows = cur.fetchall()
+        return [dict(r) for r in rows]
+
 
 # ---------------------------------------------------------------------------
 # Neo4j peer selector
@@ -405,6 +620,35 @@ class FMDataFetcher:
                 results.append(payload)
         return results
 
+    def _financial_stmt_payload(
+        self,
+        ticker: str,
+        statement_type: str,
+        period_type: str = "yearly",
+    ) -> Dict[str, Any]:
+        """Fetch the most recent payload from the financial_statements specialty table.
+
+        Used as a last-resort fallback when raw_fundamentals is empty (i.e. FMP and
+        EODHD raw_fundamentals data_names are both absent).
+
+        Args:
+            statement_type: 'Income_Statement' | 'Balance_Sheet' | 'Cash_Flow'
+            period_type: 'yearly' (default) | 'quarterly'
+        """
+        try:
+            stmts = self.pg.fetch_financial_statements(
+                ticker, statement_type=statement_type, limit=1
+            )
+            rows = stmts.get(statement_type, [])
+            if rows and rows[0].get("payload"):
+                return rows[0]["payload"]
+        except Exception as exc:
+            logger.debug(
+                "[FM] financial_statements fallback failed for %s/%s: %s",
+                ticker, statement_type, exc,
+            )
+        return {}
+
     def _merge_ts_date(
         self, rows: List[Dict[str, Any]]
     ) -> List[Dict[str, Any]]:
@@ -455,17 +699,29 @@ class FMDataFetcher:
         """
         bundle = FMDataBundle(ticker=ticker)
 
-        # ── Income statement (FMP primary → EODHD fallback) ───────────────────
+        # ── Income statement (FMP primary → EODHD raw_fundamentals → financial_statements) ──
         try:
             rows = self._latest_payload_list(ticker, "income_statement", limit=5)
             inc = rows[0] if rows else {}
             if not inc:
                 # EODHD fallback: financial_scores has revenue, ebit, netIncome etc.
                 inc = self._latest_payload(ticker, "financial_scores")
-                logger.info(
-                    "[FM] income_statement: FMP empty for %s — using EODHD financial_scores fallback",
-                    ticker,
-                )
+                if inc:
+                    logger.info(
+                        "[FM] income_statement: FMP empty for %s — using EODHD financial_scores fallback",
+                        ticker,
+                    )
+            if not inc:
+                # Final fallback: financial_statements specialty table (EODHD-sourced)
+                inc = self._financial_stmt_payload(ticker, "Income_Statement")
+                if inc:
+                    # EODHD stores revenue as 'totalRevenue'; normalise to 'revenue'
+                    if not inc.get("revenue") and inc.get("totalRevenue"):
+                        inc["revenue"] = inc["totalRevenue"]
+                    logger.info(
+                        "[FM] income_statement: using financial_statements table fallback for %s",
+                        ticker,
+                    )
             # EBITDA overlay from EODHD fundamentals if still missing
             ebitda_val = inc.get("ebitda")
             if ebitda_val is None:
@@ -486,7 +742,7 @@ class FMDataFetcher:
         except Exception as exc:
             logger.warning("income_statement fetch failed for %s: %s", ticker, exc)
 
-        # ── Balance sheet (FMP primary → EODHD fallback) ──────────────────────
+        # ── Balance sheet (FMP primary → EODHD raw_fundamentals → financial_statements) ──
         try:
             rows = self._latest_payload_list(ticker, "balance_sheet", limit=5)
             bal = rows[0] if rows else {}
@@ -494,16 +750,25 @@ class FMDataFetcher:
                 # EODHD fallback: financial_scores has totalAssets, totalLiabilities,
                 # workingCapital, retainedEarnings
                 bal = self._latest_payload(ticker, "financial_scores")
-                logger.info(
-                    "[FM] balance_sheet: FMP empty for %s — using EODHD financial_scores fallback",
-                    ticker,
-                )
+                if bal:
+                    logger.info(
+                        "[FM] balance_sheet: FMP empty for %s — using EODHD financial_scores fallback",
+                        ticker,
+                    )
+            if not bal:
+                # Final fallback: financial_statements specialty table (EODHD-sourced)
+                bal = self._financial_stmt_payload(ticker, "Balance_Sheet")
+                if bal:
+                    logger.info(
+                        "[FM] balance_sheet: using financial_statements table fallback for %s",
+                        ticker,
+                    )
             bundle.balance = {
                 "totalAssets":              bal.get("totalAssets"),
-                "totalLiabilities":         bal.get("totalLiabilities"),
+                "totalLiabilities":         bal.get("totalLiabilities") or bal.get("totalLiab"),
                 "totalDebt":                bal.get("totalDebt") or bal.get("longTermDebt"),
                 "longTermDebt":             bal.get("longTermDebt"),
-                "cashAndCashEquivalents":   bal.get("cashAndCashEquivalents"),
+                "cashAndCashEquivalents":   bal.get("cashAndCashEquivalents") or bal.get("cash"),
                 "workingCapital":           bal.get("totalCurrentAssets", 0)
                                             - bal.get("totalCurrentLiabilities", 0)
                                             if (bal.get("totalCurrentAssets") and bal.get("totalCurrentLiabilities"))
@@ -517,7 +782,7 @@ class FMDataFetcher:
         except Exception as exc:
             logger.warning("balance_sheet fetch failed for %s: %s", ticker, exc)
 
-        # ── Cash flow statement (FMP primary → EODHD key_metrics_ttm fallback) ─
+        # ── Cash flow statement (FMP primary → EODHD key_metrics_ttm → financial_statements) ──
         try:
             rows = self._latest_payload_list(ticker, "cash_flow", limit=5)
             cf = rows[0] if rows else {}
@@ -554,6 +819,21 @@ class FMDataFetcher:
                         "netIncome":                bundle.income.get("netIncome") if bundle.income else None,
                         "depreciationAmortization": None,
                     }
+                else:
+                    # Final fallback: financial_statements specialty table (EODHD-sourced)
+                    cf_stmt = self._financial_stmt_payload(ticker, "Cash_Flow")
+                    if cf_stmt:
+                        logger.info(
+                            "[FM] cash_flow: using financial_statements table fallback for %s",
+                            ticker,
+                        )
+                        bundle.cashflow = {
+                            "operatingCashFlow":        cf_stmt.get("totalCashFromOperatingActivities") or cf_stmt.get("operatingCashFlow"),
+                            "capitalExpenditure":       cf_stmt.get("capitalExpenditures") or cf_stmt.get("capitalExpenditure"),
+                            "freeCashFlow":             cf_stmt.get("freeCashFlow"),
+                            "netIncome":                cf_stmt.get("netIncome"),
+                            "depreciationAmortization": cf_stmt.get("depreciation"),
+                        }
         except Exception as exc:
             logger.warning("cash_flow fetch failed for %s: %s", ticker, exc)
 
@@ -788,6 +1068,66 @@ class FMDataFetcher:
             except Exception as exc:
                 logger.debug("peer fundamentals fetch failed for %s: %s", peer, exc)
 
+        # ── Economic events (Row 12) ──────────────────────────────────────────
+        try:
+            bundle.economic_events = self.pg.fetch_economic_events(limit=50)
+        except Exception as exc:
+            logger.warning("economic_events fetch failed: %s", exc)
+
+        # ── Corporate bond yields (Row 13) ────────────────────────────────────
+        try:
+            bundle.bond_yields = self.pg.fetch_bond_yields(limit=10)
+        except Exception as exc:
+            logger.warning("bond_yields fetch failed: %s", exc)
+
+        # ── Forex rates from dedicated table (Row 14) ─────────────────────────
+        try:
+            # Fetch EURUSD and USDJPY as representative pairs
+            for pair in ("EURUSD", "USDJPY", "GBPUSD"):
+                rows = self.pg.fetch_forex_rates_dedicated(pair, limit=5)
+                bundle.forex_rates.extend(rows)
+        except Exception as exc:
+            logger.warning("forex_rates_dedicated fetch failed: %s", exc)
+
+        # ── Financial statements from dedicated table (Row 18) ────────────────
+        try:
+            stmts = self.pg.fetch_financial_statements(ticker, limit=4)
+            if stmts:
+                bundle.financial_statements = stmts
+        except Exception as exc:
+            logger.warning("financial_statements fetch failed for %s: %s", ticker, exc)
+
+        # ── Valuation metrics from dedicated table (Row 19) ───────────────────
+        try:
+            vm = self.pg.fetch_valuation_metrics(ticker)
+            if vm:
+                bundle.valuation_metrics = vm
+        except Exception as exc:
+            logger.warning("valuation_metrics fetch failed for %s: %s", ticker, exc)
+
+        # ── Outstanding shares history (Row 22) ───────────────────────────────
+        try:
+            bundle.outstanding_shares = self.pg.fetch_outstanding_shares(ticker, limit=10)
+        except Exception as exc:
+            logger.warning("outstanding_shares fetch failed for %s: %s", ticker, exc)
+
+        # ── Splits history (Row 10: splits part) ──────────────────────────────
+        try:
+            bundle.splits_history = self.pg.fetch_splits_history(ticker, limit=10)
+        except Exception as exc:
+            logger.warning("splits_history fetch failed for %s: %s", ticker, exc)
+
+        # ── Macro indicators (Row 11: dedicated treasury_rates + global_macro) ─
+        try:
+            # Dedicated treasury_rates table (US10Y as primary WACC input)
+            bundle.treasury_rates_dedicated = self.pg.fetch_treasury_rates_dedicated("US10Y", limit=5)
+            # Global macro indicators: GDP, CPI, Unemployment
+            for indicator in ("GDP", "CPI", "UNEMPLOYMENT"):
+                rows = self.pg.fetch_macro_indicators(indicator, limit=5)
+                bundle.macro_indicators.extend(rows)
+        except Exception as exc:
+            logger.warning("macro_indicators fetch failed: %s", exc)
+
         return bundle
 
     # Static peer map: Neo4j has no COMPETES_WITH/BELONGS_TO edges in this deployment.
@@ -865,6 +1205,47 @@ class FMToolkit:
     def fetch_sector_multiples(self, ticker: str, limit: int = 1) -> List[Dict]:
         """Fetch sector/industry multiples for the ticker."""
         return self.pg.fetch_sector_multiples(ticker, limit)
+
+    def fetch_economic_events(self, limit: int = 50) -> List[Dict]:
+        """Fetch recent economic events (Row 12)."""
+        return self.pg.fetch_economic_events(limit)
+
+    def fetch_bond_yields(self, limit: int = 10) -> List[Dict]:
+        """Fetch recent corporate bond yield rows (Row 13)."""
+        return self.pg.fetch_bond_yields(limit)
+
+    def fetch_treasury_rates_dedicated(self, indicator: str = "US10Y", limit: int = 5) -> List[Dict]:
+        """Fetch rows from the dedicated treasury_rates table (Row 11)."""
+        return self.pg.fetch_treasury_rates_dedicated(indicator, limit)
+
+    def fetch_financial_statements(
+        self,
+        ticker: str,
+        statement_type: Optional[str] = None,
+        limit: int = 4,
+    ) -> Dict[str, List[Dict]]:
+        """Fetch rows from the financial_statements table (Row 18)."""
+        return self.pg.fetch_financial_statements(ticker, statement_type, limit)
+
+    def fetch_valuation_metrics(self, ticker: str) -> Optional[Dict]:
+        """Fetch latest valuation metrics for the ticker (Row 19)."""
+        return self.pg.fetch_valuation_metrics(ticker)
+
+    def fetch_outstanding_shares(self, ticker: str, limit: int = 10) -> List[Dict]:
+        """Fetch outstanding shares history for the ticker (Row 22)."""
+        return self.pg.fetch_outstanding_shares(ticker, limit)
+
+    def fetch_splits_history(self, ticker: str, limit: int = 10) -> List[Dict]:
+        """Fetch stock split history for the ticker (Row 10: splits)."""
+        return self.pg.fetch_splits_history(ticker, limit)
+
+    def fetch_macro_indicators(self, indicator: str, limit: int = 5) -> List[Dict]:
+        """Fetch global macro indicator rows (Row 11)."""
+        return self.pg.fetch_macro_indicators(indicator, limit)
+
+    def fetch_forex_rates_dedicated(self, forex_pair: str, limit: int = 5) -> List[Dict]:
+        """Fetch rows from the dedicated forex_rates table (Row 14)."""
+        return self.pg.fetch_forex_rates_dedicated(forex_pair, limit)
 
     def close(self) -> None:
         self.neo4j.close()

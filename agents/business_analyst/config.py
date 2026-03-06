@@ -38,10 +38,6 @@ class BusinessAnalystConfig:
     postgres_user: str = field(default_factory=lambda: _env("POSTGRES_USER", "airflow"))
     postgres_password: str = field(default_factory=lambda: _env("POSTGRES_PASSWORD", "airflow"))
 
-    qdrant_host: str = field(default_factory=lambda: _env("QDRANT_HOST", "localhost"))
-    qdrant_port: int = field(default_factory=lambda: int(_env("QDRANT_PORT", "6333")))
-    qdrant_collection: str = field(default_factory=lambda: _env("QDRANT_COLLECTION_NAME", "financial_documents"))
-
     # Models
     llm_provider: str = field(default_factory=lambda: os.getenv("BUSINESS_ANALYST_LLM_PROVIDER", "ollama"))
     llm_model: str = field(default_factory=lambda: os.getenv("BUSINESS_ANALYST_MODEL", os.getenv("LLM_MODEL_BUSINESS_ANALYST", "deepseek-r1:8b")))
@@ -49,16 +45,9 @@ class BusinessAnalystConfig:
     llm_max_tokens: int = field(default_factory=lambda: int(os.getenv("BUSINESS_ANALYST_MAX_TOKENS", "6000")))
     ollama_base_url: str = field(default_factory=lambda: os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"))
 
-    # Neo4j chunk ingestion embedding model.
-    # NOTE: Neo4j has no Chunk nodes yet (only bare Company nodes). These fields are
-    # reserved for future filing ingestion via ingestion.py. They are NOT used for
-    # Qdrant query-time embeddings — see qdrant_embedding_model / qdrant_embedding_dimension below.
-    embedding_model: str = field(default_factory=lambda: os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2"))
-    embedding_dimension: int = field(default_factory=lambda: int(os.getenv("EMBEDDING_DIMENSION", "384")))
-
-    # Qdrant embedding model (768-dim nomic-embed-text — matches how load_qdrant.py indexes news)
-    qdrant_embedding_model: str = field(default_factory=lambda: os.getenv("QDRANT_EMBEDDING_MODEL", "nomic-embed-text"))
-    qdrant_embedding_dimension: int = field(default_factory=lambda: int(os.getenv("QDRANT_EMBEDDING_DIMENSION", "768")))
+    # Embedding model — all vectors use Ollama nomic-embed-text (768-dim).
+    embedding_model: str = field(default_factory=lambda: os.getenv("EMBEDDING_MODEL", "nomic-embed-text"))
+    embedding_dimension: int = field(default_factory=lambda: int(os.getenv("EMBEDDING_DIMENSION", "768")))
 
     reranker_model: str = field(default_factory=lambda: os.getenv("RERANKER_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2"))
 

@@ -8,7 +8,7 @@ Architecture (mirrors README.md diagram):
     fetch_sentiment_data      ←  PostgreSQL: bullish/bearish/neutral %
         │
         ▼
-    hybrid_retrieval          ←  Qdrant vector search (768-dim, nomic-embed-text)
+    hybrid_retrieval          ←  Neo4j vector index (chunk_embedding, when Chunk nodes exist)
                               ←  Neo4j Cypher graph traversal (Company nodes only)
                               ←  BM25 sparse keyword scoring
         │
@@ -113,8 +113,8 @@ def _node_hybrid_retrieval(state: AgentState, toolkit: BusinessAnalystToolkit) -
     """Dense (Neo4j vector) + sparse (BM25) + graph (Cypher) retrieval.
 
     Short-circuits immediately with an empty retrieval when the availability
-    profile indicates that neither Neo4j chunks nor Qdrant vectors exist for
-    this ticker — avoids noisy failed vector searches against empty stores.
+    profile indicates that Neo4j has no chunk nodes for this ticker — avoids
+    noisy failed vector searches against empty stores.
     """
     query = state.get("task", "")
     ticker = state.get("ticker")
@@ -122,9 +122,9 @@ def _node_hybrid_retrieval(state: AgentState, toolkit: BusinessAnalystToolkit) -
 
     # NOTE: We intentionally do NOT short-circuit retrieval based on the availability
     # profile's has_any_qualitative flag.  The profile is derived from a fast
-    # data_availability check that queries Neo4j and Qdrant with strict ticker-match
-    # filters — if those checks fail or return stale results (e.g. the Qdrant scroll
-    # finds no AAPL vector but Neo4j has 20+ chunks), we would incorrectly skip a
+    # data_availability check that queries Neo4j with strict ticker-match
+    # filters — if those checks fail or return stale results (e.g. the check
+    # finds no AAPL chunk but Neo4j has 20+), we would incorrectly skip a
     # retrieval that would otherwise succeed.  The retriever itself gracefully handles
     # empty results and the CRAG evaluator will route to web_search_fallback if truly
     # nothing is found.  We only honour the profile to log a warning.
@@ -328,11 +328,11 @@ def _check_citation_grounding(
 
     output_text = json.dumps(llm_output, ensure_ascii=False)
     # Strip trailing punctuation (], ]., ],) that the LLM appends when citing inside arrays/sentences
-    _RAW_CITED = re.findall(r'qdrant::[A-Z]+::[^\s",\]]+', output_text)
+    _RAW_CITED = re.findall(r'neo4j::[A-Z]+::[^\s",\]]+', output_text)
     _RAW_CITED += re.findall(r'neo4j::[^\s",\]]+', output_text)
     cited_ids = {cid.rstrip("].,;") for cid in _RAW_CITED}
     # Use prefix matching with Unicode normalization: a cited ID is "grounded" if it
-    # matches any real ID after normalising Unicode (LLM uses curly quotes, Qdrant uses ASCII).
+    # matches any real ID after normalising Unicode.
     def _norm(s: str) -> str:
         return unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii")
 
@@ -347,8 +347,8 @@ def _check_citation_grounding(
         return False
 
     ungrounded = {cid for cid in cited_ids if not _is_grounded(cid, real_ids)}
-    # Exclude PostgreSQL-sourced citations like "qdrant::TSLA::sentiment_trends" —
-    # these are the LLM citing the sentiment source, not a Qdrant chunk ID.
+    # Exclude PostgreSQL-sourced citations like "neo4j::TSLA::sentiment_trends" —
+    # these are the LLM citing the sentiment source, not a chunk ID.
     ungrounded = {cid for cid in ungrounded if "sentiment_trends" not in cid and "postgresql" not in cid}
     if ungrounded:
         logger.warning(
@@ -371,7 +371,7 @@ def _strip_ungrounded_inline_citations(
 ) -> Any:
     """Recursively scan obj and replace ungrounded inline citations in string values.
 
-    Any ``[qdrant::TICKER::slug]`` or ``[neo4j::...]`` token embedded in a string
+    Any ``[neo4j::...]`` token embedded in a string
     that does not prefix-match a real retrieved chunk_id is replaced with
     ``[source unavailable]``.  This is the last-resort backstop after the prompt
     instructions that tell the LLM not to invent IDs.
@@ -388,7 +388,7 @@ def _strip_ungrounded_inline_citations(
 
     def _is_grounded(cited: str) -> bool:
         # Normalise Unicode: the LLM sometimes uses curly quotes/apostrophes
-        # (e.g. \u2019 RIGHT SINGLE QUOTATION MARK) while the actual Qdrant
+        # (e.g. \u2019 RIGHT SINGLE QUOTATION MARK) while the actual Neo4j
         # chunk_id was built from the ASCII-slugified article title (straight
         # apostrophe ' or underscore).  NFKD + ASCII encode normalises them.
         def _norm(s: str) -> str:
@@ -406,7 +406,7 @@ def _strip_ungrounded_inline_citations(
     def _sanitise_str(s: str) -> str:
         def _replace_match(m: re.Match) -> str:
             cid = m.group(1).rstrip("].,;")
-            # Preserve PostgreSQL / sentiment citations — they aren't Qdrant chunks
+            # Preserve PostgreSQL / sentiment citations — they aren't Neo4j chunks
             if "sentiment_trends" in cid or "postgresql" in cid:
                 return m.group(0)
             if _is_grounded(cid):
@@ -414,7 +414,7 @@ def _strip_ungrounded_inline_citations(
             logger.debug("Stripping ungrounded inline citation from prose: %s", cid)
             return ""
 
-        return re.sub(r'\[(qdrant::[A-Z]+::[^\]]+|neo4j::[^\]]+)\]', _replace_match, s)
+        return re.sub(r'\[(neo4j::[^\]]+)\]', _replace_match, s)
 
     if isinstance(obj, str):
         # Also clean up any literal "[source unavailable]" the LLM wrote directly
@@ -544,7 +544,7 @@ def _node_format_json_output(state: AgentState) -> AgentState:
 
     # Sanitise competitive_moat.sources — plain chunk_id strings (not inline tokens)
     # that the LLM hallucinated must be removed here; _strip_ungrounded_inline_citations
-    # only handles the [qdrant::...] inline-token format, not bare string arrays.
+    # only handles the [neo4j::...] inline-token format, not bare string arrays.
     competitive_moat = llm_output.get("competitive_moat")
     if competitive_moat and isinstance(competitive_moat, dict) and real_chunk_ids:
         raw_sources = competitive_moat.get("sources") or []

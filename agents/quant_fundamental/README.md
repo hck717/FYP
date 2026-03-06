@@ -154,7 +154,6 @@ for metric in ["gross_margin", "ebit_margin", "roe"]:
 |---|---|---|---|
 | PostgreSQL | `fyp-postgres` | Yes — primary data source | `raw_fundamentals`, `raw_timeseries`, `market_eod_us` |
 | Ollama | local | Yes — narrative summary only | `llama3.2:latest` default; `deepseek-r1:8b` supported |
-| Qdrant | `fyp-qdrant` | No | Not used by this agent |
 | Neo4j | `fyp-neo4j` | No | Not used by this agent |
 | DuckDB | — | **Removed** | Replaced by PostgreSQL-based data quality check |
 

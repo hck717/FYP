@@ -15,8 +15,6 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 import psycopg2
 from neo4j import GraphDatabase, basic_auth
 from psycopg2.extras import RealDictCursor
-from qdrant_client import QdrantClient
-from qdrant_client.http import models as qmodels
 import requests
 
 from .config import BusinessAnalystConfig
@@ -24,8 +22,6 @@ from .schema import Chunk, CRAGStatus, RetrievalResult, SentimentSnapshot
 
 # Cross-encoder reranker — loaded lazily so import never hard-fails.
 _CrossEncoder = None  # type: ignore[assignment]
-# sentence-transformers SentenceTransformer — loaded lazily for the same reason.
-_SentenceTransformer = None  # type: ignore[assignment]
 
 def _get_cross_encoder_class():
     global _CrossEncoder
@@ -36,16 +32,6 @@ def _get_cross_encoder_class():
         except ImportError:
             pass
     return _CrossEncoder
-
-def _get_sentence_transformer_class():
-    global _SentenceTransformer
-    if _SentenceTransformer is None:
-        try:
-            from sentence_transformers import SentenceTransformer as _ST  # type: ignore[import]
-            _SentenceTransformer = _ST
-        except ImportError:
-            pass
-    return _SentenceTransformer
 
 logger = logging.getLogger(__name__)
 
@@ -124,79 +110,6 @@ class EmbeddingClient:
                         f"`ollama pull {self.model}`"
                     ) from primary_exc
             raise
-
-
-# ----------------------------------------------------------------------------
-# Local sentence-transformers embedding client (for models NOT served via Ollama,
-# e.g. all-MiniLM-L6-v2 used for Neo4j chunk ingestion vectors).
-# ----------------------------------------------------------------------------
-class LocalEmbeddingClient:
-    """Embedding client that runs sentence-transformers locally (no Ollama required).
-
-    Used for the Neo4j vector index, which was built with all-MiniLM-L6-v2
-    (384-dim) via sentence_transformers, not via Ollama.  Falls back to the
-    Ollama-backed EmbeddingClient if sentence_transformers is not installed.
-    """
-
-    _model_cache: dict = {}  # class-level cache so the model is loaded once per process
-
-    def __init__(self, model: str, fallback: Optional["EmbeddingClient"] = None) -> None:
-        self.model_name = model
-        self.fallback = fallback
-        self._st_model = None
-        self._load_attempted = False
-
-    def _load(self):
-        if self._load_attempted:
-            return
-        self._load_attempted = True
-        ST = _get_sentence_transformer_class()
-        if ST is None:
-            logger.warning(
-                "sentence_transformers not installed — LocalEmbeddingClient will use fallback."
-            )
-            return
-        if self.model_name in self.__class__._model_cache:
-            self._st_model = self.__class__._model_cache[self.model_name]
-            return
-        import os as _os
-        _old_tqdm = _os.environ.get("TQDM_DISABLE")
-        _old_hf_offline = _os.environ.get("HF_HUB_OFFLINE")
-        _os.environ["TQDM_DISABLE"] = "1"
-        _os.environ["HF_HUB_OFFLINE"] = "1"
-        try:
-            self._st_model = ST(self.model_name)
-            self.__class__._model_cache[self.model_name] = self._st_model
-            logger.info("LocalEmbeddingClient loaded model: %s", self.model_name)
-        except Exception as exc:
-            logger.warning(
-                "LocalEmbeddingClient failed to load '%s' (%s) — will use fallback.",
-                self.model_name, exc,
-            )
-        finally:
-            if _old_tqdm is None:
-                _os.environ.pop("TQDM_DISABLE", None)
-            else:
-                _os.environ["TQDM_DISABLE"] = _old_tqdm
-            if _old_hf_offline is None:
-                _os.environ.pop("HF_HUB_OFFLINE", None)
-            else:
-                _os.environ["HF_HUB_OFFLINE"] = _old_hf_offline
-
-    def embed(self, text: str) -> List[float]:
-        self._load()
-        if self._st_model is not None:
-            try:
-                vec = self._st_model.encode(text, normalize_embeddings=True)
-                return vec.tolist()
-            except Exception as exc:
-                logger.warning("LocalEmbeddingClient encode failed (%s) — trying fallback.", exc)
-        if self.fallback is not None:
-            return self.fallback.embed(text)
-        raise RuntimeError(
-            f"LocalEmbeddingClient: sentence_transformers model '{self.model_name}' unavailable "
-            "and no fallback configured."
-        )
 
 
 # ----------------------------------------------------------------------------
@@ -424,6 +337,35 @@ class Neo4jConnector:
             result = session.run(cypher, ticker=ticker, limit=limit)
             return [dict(row["insider"]) for row in result]
 
+    def fetch_etf_constituents(self, ticker: str, limit: int = 50) -> List[Dict]:
+        """Fetch ETF/index constituent holdings for the given ETF ticker (Row 15).
+
+        Queries Neo4j for ETF_HOLDS_CONSTITUENT relationships from the ETF node.
+        Returns a list of constituent dicts with keys: constituent_ticker, weight,
+        shares, name (where available).
+        """
+        cypher = """
+        MATCH (etf:ETF {ticker: $ticker})-[r:ETF_HOLDS_CONSTITUENT]->(c)
+        RETURN properties(c) AS constituent, properties(r) AS holding
+        ORDER BY r.weight DESC
+        LIMIT $limit
+        """
+        try:
+            with self.driver.session(database=None) as session:
+                result = session.run(cypher, ticker=ticker, limit=limit)
+                rows = []
+                for row in result:
+                    entry = {}
+                    holding = row.get("holding") or {}
+                    constituent = row.get("constituent") or {}
+                    entry.update({k: v for k, v in constituent.items() if k not in ("embedding",)})
+                    entry.update({k: v for k, v in holding.items()})
+                    rows.append(entry)
+                return rows
+        except Exception as exc:
+            logger.warning("fetch_etf_constituents failed for %s: %s", ticker, exc)
+            return []
+
     def close(self) -> None:
         self.driver.close()
 
@@ -510,83 +452,216 @@ class PostgresConnector:
             rows = cur.fetchall()
             return [dict(r) for r in rows]
 
+    def _pg_connect(self):
+        return psycopg2.connect(
+            host=self.config.postgres_host,
+            port=self.config.postgres_port,
+            dbname=self.config.postgres_db,
+            user=self.config.postgres_user,
+            password=self.config.postgres_password,
+        )
+
+    def fetch_company_profile(self, ticker: str) -> Optional[Dict]:
+        """Fetch latest company profile for the ticker (Row 3: Company Profiles).
+
+        Queries raw_fundamentals WHERE data_name = 'company_profile'.
+        """
+        sql = """
+        SELECT payload, as_of_date
+        FROM raw_fundamentals
+        WHERE ticker_symbol = %s
+          AND data_name = 'company_profile'
+        ORDER BY as_of_date DESC
+        LIMIT 1
+        """
+        conn = self._pg_connect()
+        with closing(conn), conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, (ticker,))
+            row = cur.fetchone()
+        if not row:
+            return None
+        payload = row["payload"]
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except json.JSONDecodeError:
+                pass
+        return payload if isinstance(payload, dict) else {}
+
+    def fetch_news(self, ticker: str, limit: int = 20) -> List[Dict]:
+        """Fetch recent news items for the ticker (Rows 4/17: Financial News).
+
+        Queries raw_fundamentals WHERE data_name = 'news'.
+        """
+        sql = """
+        SELECT payload, as_of_date
+        FROM raw_fundamentals
+        WHERE ticker_symbol = %s
+          AND data_name = 'news'
+        ORDER BY as_of_date DESC
+        LIMIT %s
+        """
+        conn = self._pg_connect()
+        with closing(conn), conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, (ticker, limit))
+            rows = cur.fetchall()
+        results = []
+        for row in rows:
+            payload = row["payload"]
+            if isinstance(payload, str):
+                try:
+                    payload = json.loads(payload)
+                except json.JSONDecodeError:
+                    pass
+            # News payload is typically a list of articles; flatten it
+            if isinstance(payload, list):
+                results.extend(payload)
+            elif isinstance(payload, dict):
+                results.append(payload)
+        return results[:limit]
+
+    def fetch_insider_transactions(self, ticker: str, limit: int = 20) -> List[Dict]:
+        """Fetch insider transactions for the ticker (Row 5: Insider Transactions)."""
+        sql = """
+        SELECT ticker, insider_name, transaction_type, shares, price, transaction_date
+        FROM insider_transactions
+        WHERE ticker = %s
+        ORDER BY transaction_date DESC
+        LIMIT %s
+        """
+        conn = self._pg_connect()
+        with closing(conn), conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, (ticker, limit))
+            rows = cur.fetchall()
+        return [dict(r) for r in rows]
+
+    def fetch_institutional_holders(self, ticker: str, limit: int = 20) -> List[Dict]:
+        """Fetch major institutional/mutual fund holders (Row 6)."""
+        sql = """
+        SELECT ticker, holder_name, shares, shares_change, ownership_pct, as_of_date
+        FROM institutional_holders
+        WHERE ticker = %s
+        ORDER BY as_of_date DESC, shares DESC
+        LIMIT %s
+        """
+        conn = self._pg_connect()
+        with closing(conn), conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, (ticker, limit))
+            rows = cur.fetchall()
+        return [dict(r) for r in rows]
+
+    def fetch_financial_calendar(self, ticker: str, limit: int = 10) -> List[Dict]:
+        """Fetch financial calendar events for the ticker (Row 16: Financial Calendar)."""
+        sql = """
+        SELECT ticker, event_type, event_date, eps_estimate, revenue_estimate
+        FROM financial_calendar
+        WHERE ticker = %s
+        ORDER BY event_date DESC
+        LIMIT %s
+        """
+        conn = self._pg_connect()
+        with closing(conn), conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, (ticker, limit))
+            rows = cur.fetchall()
+        return [dict(r) for r in rows]
+
+    def fetch_textual_documents(self, ticker: str, limit: int = 20) -> List[Dict]:
+        """Fetch textual document metadata for the ticker (Row 24: Textual Documents Metadata)."""
+        sql = """
+        SELECT ticker, doc_type, filename, filepath, institution, date_approx,
+               file_size_bytes, md5_hash
+        FROM textual_documents
+        WHERE ticker = %s
+        ORDER BY date_approx DESC
+        LIMIT %s
+        """
+        conn = self._pg_connect()
+        with closing(conn), conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, (ticker, limit))
+            rows = cur.fetchall()
+        return [dict(r) for r in rows]
+
 
 # ----------------------------------------------------------------------------
-# Qdrant (news fallback)
+# pgvector connector — semantic search over text_chunks in PostgreSQL
 # ----------------------------------------------------------------------------
-class QdrantConnector:
+class PgVectorConnector:
+    """Semantic search over the text_chunks table using pgvector cosine similarity.
+
+    Requires the pgvector extension and the text_chunks table (created by
+    load_postgres.py / docker/init-db.sql).  Gracefully returns [] if the
+    table or extension is not available.
+    """
+
     def __init__(self, config: BusinessAnalystConfig) -> None:
         self.config = config
-        self.client = QdrantClient(host=config.qdrant_host, port=config.qdrant_port)
+
+    def _pg_connect(self):
+        return psycopg2.connect(
+            host=self.config.postgres_host,
+            port=self.config.postgres_port,
+            dbname=self.config.postgres_db,
+            user=self.config.postgres_user,
+            password=self.config.postgres_password,
+        )
 
     def vector_search(
         self,
-        vector: Sequence[float],
+        vector: List[float],
         ticker: Optional[str],
-        top_k: int,
+        top_k: int = 10,
     ) -> List[Chunk]:
-        qdrant_filter: Optional[qmodels.Filter] = None
+        """Return the *top_k* most similar chunks from text_chunks for *ticker*."""
+        # Build the query embedding as a Postgres vector literal
+        emb_str = "[" + ",".join(f"{x:.8f}" for x in vector) + "]"
+        ticker_filter = "AND ticker = %s" if ticker else ""
+        # params order must match placeholder order in SQL:
+        # 1) emb_str  → score calc  (SELECT)
+        # 2) ticker   → ticker filter (WHERE, only if present)
+        # 3) emb_str  → ORDER BY
+        # 4) top_k    → LIMIT
+        params: list = [emb_str]
         if ticker:
-            qdrant_filter = qmodels.Filter(
-                must=[qmodels.FieldCondition(
-                    key="ticker_symbol",
-                    match=qmodels.MatchValue(value=ticker),
-                )]
-            )
-        response = self.client.query_points(
-            collection_name=self.config.qdrant_collection,
-            query=list(vector),
-            limit=top_k * 6,  # Over-fetch heavily to get top_k *unique* articles after dedup
-            with_payload=True,
-            query_filter=qdrant_filter,
-        )
-        hits = response.points
+            params.append(ticker)
+        params.extend([emb_str, top_k])
+
+        sql = f"""
+        SELECT chunk_id, text, section, filing_date, ticker,
+               1 - (embedding <=> %s::vector) AS score
+        FROM text_chunks
+        WHERE embedding IS NOT NULL
+          {ticker_filter}
+        ORDER BY embedding <=> %s::vector
+        LIMIT %s
+        """
+        try:
+            conn = self._pg_connect()
+            with closing(conn), conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(sql, params)
+                rows = cur.fetchall()
+        except Exception as exc:
+            logger.warning("[PgVector] vector_search failed: %s", exc)
+            return []
+
         chunks: List[Chunk] = []
-        seen_ids: set = set()
-        seen_title_keys: set = set()  # normalised title key for near-duplicate suppression
-        for hit in hits:
-            payload = hit.payload or {}
-            # Build a human-readable chunk_id from ticker + title slug when no stored chunk_id
-            if payload.get("chunk_id"):
-                chunk_id = payload["chunk_id"]
-            else:
-                ticker_sym = payload.get("ticker_symbol", "")
-                title_raw = payload.get("title") or ""
-                title_slug = title_raw[:40].replace(" ", "_").replace("/", "-")
-                chunk_id = f"qdrant::{ticker_sym}::{title_slug}" if title_slug else f"qdrant::{hit.id}"
-            # Primary dedup: exact chunk_id
-            if chunk_id in seen_ids:
-                continue
-            seen_ids.add(chunk_id)
-            # Secondary dedup: normalised title key (strips punctuation, lowercases) so
-            # near-identical articles like "Tesla Suing California..." vs
-            # "Tesla Is Suing California..." collapse to one entry.
-            title_raw = payload.get("title") or ""
-            import re as _re
-            title_key = _re.sub(r"[^a-z0-9]", "", title_raw.lower())[:60]
-            if title_key and title_key in seen_title_keys:
-                continue
-            if title_key:
-                seen_title_keys.add(title_key)
-            text = payload.get("content") or payload.get("text") or payload.get("summary") or ""
+        for row in rows:
             metadata = {
-                k: payload.get(k)
-                for k in ["ticker_symbol", "data_name", "source", "section", "filing_date"]
-                if payload.get(k) is not None
+                "section": row.get("section"),
+                "filing_date": row.get("filing_date"),
+                "ticker": row.get("ticker"),
             }
-            score = hit.score or 0.0
-            score = score if 0 <= score <= 1 else max(0.0, 1.0 - score)
+            chunk_id = row.get("chunk_id") or f"pgvec::{row.get('ticker')}::{len(chunks)}"
+            score = float(row.get("score") or 0.0)
+            score = max(0.0, min(1.0, score))
             chunks.append(
                 Chunk(
                     chunk_id=chunk_id,
-                    text=text,
+                    text=row.get("text", ""),
                     score=score,
-                    source="qdrant",
+                    source="pgvector",
                     metadata=metadata,
                 )
             )
-            if len(chunks) >= top_k:
-                break
         return chunks
 
 
@@ -621,9 +696,8 @@ def _chunk_ticker_matches(chunk: "Chunk", ticker: str) -> bool:
 
     Checks (in priority order):
     1. ``chunk.metadata["ticker"]``       — set by Neo4jConnector
-    2. ``chunk.metadata["ticker_symbol"]`` — set by QdrantConnector
-    3. ``chunk.chunk_id`` prefix heuristic — e.g. ``qdrant::AAPL::…`` or
-       ``neo4j::AAPL::…``
+    2. ``chunk.metadata["ticker_symbol"]`` — set by source connector
+    3. ``chunk.chunk_id`` prefix heuristic — e.g. ``neo4j::AAPL::…``
 
     Returns True when the ticker is *unknown* (missing from all three
     sources) to avoid silently discarding potentially valid chunks.
@@ -656,6 +730,11 @@ class HybridRetriever:
 
     If sentence-transformers is unavailable or the model fails to load,
     the reranker silently degrades to BM25-only scoring with a warning.
+
+    Retrieval sources:
+      1. Neo4j vector index (chunk_embedding, 768-dim cosine)
+      2. pgvector text_chunks table (768-dim cosine)
+    Results are merged and deduplicated by chunk_id before reranking.
     """
 
     BM25_WEIGHT: float = 0.30
@@ -666,15 +745,12 @@ class HybridRetriever:
         config: BusinessAnalystConfig,
         embedding_client: Any,
         neo4j: Neo4jConnector,
-        qdrant: QdrantConnector,
-        qdrant_embedding_client: Optional[Any] = None,
+        pgvector: Optional["PgVectorConnector"] = None,
     ) -> None:
         self.config = config
         self.embedding_client = embedding_client
         self.neo4j = neo4j
-        self.qdrant = qdrant
-        # Use a separate embedder for Qdrant if dimensions differ (e.g. nomic-embed-text 768-dim)
-        self.qdrant_embedding_client = qdrant_embedding_client or embedding_client
+        self.pgvector = pgvector
         # Deferred — loaded on first call to _cross_encoder_scores() to avoid
         # the sentence_transformers / torch / sympy / mpmath import chain at startup
         # (hangs on Python 3.14 during mpmath ctx_mp.py:init_builtins()).
@@ -736,16 +812,29 @@ class HybridRetriever:
     # ------------------------------------------------------------------
 
     def retrieve(self, query: str, ticker: Optional[str]) -> RetrievalResult:
-        neo4j_vector = self.embedding_client.embed(query)
-        chunks = self.neo4j.vector_search(neo4j_vector, ticker, self.config.top_k)
-        if len(chunks) < max(1, self.config.top_k // 2):
-            qdrant_vector = self.qdrant_embedding_client.embed(query)
-            chunks.extend(self.qdrant.vector_search(qdrant_vector, ticker, self.config.top_k))
+        query_vector = self.embedding_client.embed(query)
 
-        # Post-merge ticker guard: drop any chunk that belongs to a different company.
-        # This catches (a) Neo4j chunks that slipped through the post-hoc WHERE filter
-        # when the ANN window was dominated by other tickers, and (b) Qdrant chunks
-        # where the payload field name may have differed from the expected key.
+        # Source 1: Neo4j vector index
+        neo4j_chunks = self.neo4j.vector_search(query_vector, ticker, self.config.top_k)
+
+        # Source 2: pgvector text_chunks table (if available)
+        pgvec_chunks: List[Chunk] = []
+        if self.pgvector is not None:
+            try:
+                pgvec_chunks = self.pgvector.vector_search(
+                    query_vector, ticker, top_k=self.config.top_k
+                )
+            except Exception as exc:
+                logger.warning("[HybridRetriever] pgvector search failed: %s", exc)
+
+        # Merge: deduplicate by chunk_id, prefer higher score
+        seen: Dict[str, Chunk] = {}
+        for c in neo4j_chunks + pgvec_chunks:
+            if c.chunk_id not in seen or c.score > seen[c.chunk_id].score:
+                seen[c.chunk_id] = c
+        chunks = list(seen.values())
+
+        # Post-merge ticker guard
         if ticker:
             before = len(chunks)
             chunks = [c for c in chunks if _chunk_ticker_matches(c, ticker)]
@@ -967,34 +1056,20 @@ class CRAGEvaluator:
 class BusinessAnalystToolkit:
     def __init__(self, config: Optional[BusinessAnalystConfig] = None) -> None:
         self.config = config or BusinessAnalystConfig()
-        # Neo4j chunk-ingestion embedder: all-MiniLM-L6-v2 (384-dim), run locally via
-        # sentence_transformers — this model is NOT served through Ollama.
-        # A fallback to the Ollama EmbeddingClient is wired in so the toolkit still
-        # initialises if sentence_transformers is unavailable.
-        _neo4j_ollama_fallback = EmbeddingClient(
+        # All embeddings use Ollama nomic-embed-text (768-dim).
+        self.embedding = EmbeddingClient(
             self.config.ollama_base_url,
             self.config.embedding_model,
-            self.config.request_timeout,
-        )
-        self.embedding = LocalEmbeddingClient(
-            self.config.embedding_model,
-            fallback=_neo4j_ollama_fallback,
-        )
-        # Qdrant embedder: nomic-embed-text, 768-dim (matches how load_qdrant.py indexes)
-        self.qdrant_embedding = EmbeddingClient(
-            self.config.ollama_base_url,
-            self.config.qdrant_embedding_model,
             self.config.request_timeout,
         )
         self.neo4j = Neo4jConnector(self.config)
         self.pg = PostgresConnector(self.config)
-        self.qdrant = QdrantConnector(self.config)
+        self.pgvector = PgVectorConnector(self.config)
         self.retriever = HybridRetriever(
             self.config,
             self.embedding,
             self.neo4j,
-            self.qdrant,
-            qdrant_embedding_client=self.qdrant_embedding,
+            self.pgvector,
         )
         self.evaluator = CRAGEvaluator(self.config)
 
@@ -1040,6 +1115,62 @@ class BusinessAnalystToolkit:
             logger.warning("Insider signals fetch failed for %s: %s", ticker, exc)
             return []
 
+    def fetch_company_profile(self, ticker: str) -> Optional[Dict]:
+        """Fetch latest company profile for the ticker (Row 3)."""
+        try:
+            return self.pg.fetch_company_profile(ticker)
+        except Exception as exc:
+            logger.warning("Company profile fetch failed for %s: %s", ticker, exc)
+            return None
+
+    def fetch_news(self, ticker: str, limit: int = 20) -> List[Dict]:
+        """Fetch recent news items for the ticker (Rows 4/17)."""
+        try:
+            return self.pg.fetch_news(ticker, limit)
+        except Exception as exc:
+            logger.warning("News fetch failed for %s: %s", ticker, exc)
+            return []
+
+    def fetch_insider_transactions(self, ticker: str, limit: int = 20) -> List[Dict]:
+        """Fetch insider transactions for the ticker from PostgreSQL (Row 5)."""
+        try:
+            return self.pg.fetch_insider_transactions(ticker, limit)
+        except Exception as exc:
+            logger.warning("Insider transactions fetch failed for %s: %s", ticker, exc)
+            return []
+
+    def fetch_institutional_holders(self, ticker: str, limit: int = 20) -> List[Dict]:
+        """Fetch major institutional/mutual fund holders (Row 6)."""
+        try:
+            return self.pg.fetch_institutional_holders(ticker, limit)
+        except Exception as exc:
+            logger.warning("Institutional holders fetch failed for %s: %s", ticker, exc)
+            return []
+
+    def fetch_financial_calendar(self, ticker: str, limit: int = 10) -> List[Dict]:
+        """Fetch financial calendar events for the ticker (Row 16)."""
+        try:
+            return self.pg.fetch_financial_calendar(ticker, limit)
+        except Exception as exc:
+            logger.warning("Financial calendar fetch failed for %s: %s", ticker, exc)
+            return []
+
+    def fetch_etf_constituents(self, ticker: str, limit: int = 50) -> List[Dict]:
+        """Fetch ETF/index constituent holdings from Neo4j (Row 15)."""
+        try:
+            return self.neo4j.fetch_etf_constituents(ticker, limit)
+        except Exception as exc:
+            logger.warning("ETF constituents fetch failed for %s: %s", ticker, exc)
+            return []
+
+    def fetch_textual_documents(self, ticker: str, limit: int = 20) -> List[Dict]:
+        """Fetch textual document metadata for the ticker (Row 24)."""
+        try:
+            return self.pg.fetch_textual_documents(ticker, limit)
+        except Exception as exc:
+            logger.warning("Textual documents fetch failed for %s: %s", ticker, exc)
+            return []
+
     def retrieve(self, query: str, ticker: Optional[str]) -> RetrievalResult:
         try:
             return self.retriever.retrieve(query, ticker)
@@ -1051,7 +1182,7 @@ class BusinessAnalystToolkit:
         return self.evaluator.evaluate(chunks, ticker=ticker)
 
     def healthcheck(self) -> Dict[str, Any]:
-        health: Dict[str, Any] = {"neo4j": False, "postgres": False, "qdrant": False, "ollama": False}
+        health: Dict[str, Any] = {"neo4j": False, "postgres": False, "ollama": False}
         try:
             with self.neo4j.driver.session(database=None) as _session:
                 _session.run("RETURN 1")
@@ -1073,12 +1204,6 @@ class BusinessAnalystToolkit:
             health["postgres_error"] = str(exc)
 
         try:
-            self.qdrant.client.get_collections()
-            health["qdrant"] = True
-        except Exception as exc:
-            health["qdrant_error"] = str(exc)
-
-        try:
             self.embedding.embed("health check ping")
             health["ollama"] = True
         except Exception as exc:
@@ -1093,11 +1218,10 @@ class BusinessAnalystToolkit:
 __all__ = [
     "BusinessAnalystToolkit",
     "EmbeddingClient",
-    "LocalEmbeddingClient",
+    "PgVectorConnector",
     "HybridRetriever",
     "CRAGEvaluator",
     "CRAGEvaluation",
     "Neo4jConnector",
     "PostgresConnector",
-    "QdrantConnector",
 ]

@@ -36,8 +36,7 @@ Query + Ticker
 fetch_sentiment_data      ←  PostgreSQL: bullish/bearish/neutral %
     │
     ▼
-hybrid_retrieval          ←  Qdrant vector search (768-dim, nomic-embed-text) [primary]
-                          ←  Neo4j vector index (fallback — currently returns 0 results)
+hybrid_retrieval          ←  Neo4j vector index (chunk_embedding, when Chunk nodes exist)
                           ←  BM25 sparse keyword scoring
     │
     ▼
@@ -64,9 +63,8 @@ format_json_output        ←  Structured JSON for Supervisor
 | Service | Container | Status | Notes |
 |---|---|---|---|
 | PostgreSQL | `fyp-postgres` | healthy | `sentiment_trends` table: 5 rows (AAPL/TSLA/MSFT/NVDA/GOOGL) |
-| Neo4j | `fyp-neo4j` | healthy | 5 `Company` nodes with 85+ real financial properties each (marketCap, PE ratio, profit margin, sector, industry, etc.). No `Chunk` nodes, no relationship edges. Vector search returns 0 results; agent falls back to Qdrant automatically. Company node properties ARE used for `company_overview` fields. |
-| Qdrant | `fyp-qdrant` | operational | ~2,390 vectors total (AAPL: 407, TSLA: 419, NVDA: 423, MSFT: 422, GOOGL: 329), 768-dim, `financial_documents` collection. |
-| Ollama | local | running | Models: `nomic-embed-text:latest`, `deepseek-r1:8b`, `qwen2.5:7b`, `llama3.2:latest`. Version 0.14.2. |
+| Neo4j | `fyp-neo4j` | healthy | 5 `Company` nodes with 85+ real financial properties each (marketCap, PE ratio, profit margin, sector, industry, etc.). No `Chunk` nodes yet. Vector search returns 0 results; agent falls back to web search when retrieval is INCORRECT. Company node properties ARE used for `company_overview` fields. |
+| Ollama | local | running | Models: `all-MiniLM-L6-v2` (local via sentence-transformers), `deepseek-r1:8b`, `qwen2.5:7b`, `llama3.2:latest`. Version 0.14.2. |
 
 ---
 
@@ -74,9 +72,9 @@ format_json_output        ←  Structured JSON for Supervisor
 
 | Source | Content | Storage |
 |---|---|---|
-| `financial_documents` | News articles, earnings summaries, analyst reports | Qdrant (~2,390 vectors, 768-dim) |
 | `sentiment_trends` | Bullish / bearish / neutral % per ticker + trend direction | PostgreSQL |
-| `:Company` nodes | Company nodes with 85+ financial properties per ticker | Neo4j (properties used for `company_overview`; no chunk/document data) |
+| `:Company` nodes | Company nodes with 85+ financial properties per ticker | Neo4j (properties used for `company_overview`; no chunk/document data yet) |
+| Future: document chunks | News articles, earnings summaries, analyst reports | Neo4j `:Chunk` nodes (planned — not yet ingested) |
 
 **Sentiment data (live values):**
 
@@ -88,7 +86,7 @@ format_json_output        ←  Structured JSON for Supervisor
 | GOOGL | 61.8 | 22.4 | 15.8 | stable |
 | TSLA | 45.1 | 38.7 | 16.2 | deteriorating |
 
-**Note on Neo4j:** The graph currently has no `Chunk` nodes or knowledge-graph relationships (`FACES_RISK`, `HAS_STRATEGY`, `COMPETES_WITH`, `HAS_FACT`). All document retrieval goes through Qdrant. Neo4j warnings about missing properties are expected and harmless.
+**Note on Neo4j:** The graph currently has no `Chunk` nodes or knowledge-graph relationships (`FACES_RISK`, `HAS_STRATEGY`, `COMPETES_WITH`, `HAS_FACT`). Vector search returns 0 results; the CRAG evaluator scores retrieval as INCORRECT and the agent falls back to Web Search. Neo4j warnings about missing properties are expected and harmless.
 
 ---
 
@@ -101,16 +99,16 @@ temperature = 0.2                 # Low: factual grounding preferred
 num_predict = 8192                # Max tokens for generation (increased for detailed output)
 request_timeout = None            # No timeout — deepseek-r1 can be slow
 
-# Embedding model — must match Qdrant vector index dimensions
-embedder = "nomic-embed-text"     # via Ollama /api/embed, 768-dim
+# Embedding model — all-MiniLM-L6-v2 (384-dim), run locally via sentence-transformers
+embedder = "all-MiniLM-L6-v2"    # local CPU, no Ollama dependency
 
 # Reranker — Cross-Encoder for CRAG evaluation + final reranking
 reranker = "cross-encoder/ms-marco-MiniLM-L-6-v2"   # sentence-transformers, local CPU
 
 # Retrieval
-top_k = 15                        # Chunks retrieved from Qdrant (increased from 8)
-chunks_fed_to_llm = 10            # Top-N chunks passed in context (increased from 6)
-chars_per_chunk = 800             # Text per chunk fed to LLM (increased from 400)
+top_k = 15                        # Chunks retrieved from Neo4j vector index
+chunks_fed_to_llm = 10            # Top-N chunks passed in context
+chars_per_chunk = 800             # Text per chunk fed to LLM
 ```
 
 **deepseek-r1:8b behaviour notes:**
@@ -135,7 +133,7 @@ When the cross-encoder max score is < 0.4 across all candidates, the reranker fa
 
 The agent returns **structured JSON only** — no freeform Markdown prose. The Supervisor reads this directly.
 
-Every factual claim cites a `chunk_id` from Qdrant (`qdrant::{ticker}::{title_slug}`).
+Every factual claim cites a `chunk_id` from the retrieval source (`neo4j::{ticker}::{id}` format when Chunk nodes are populated).
 
 ```json
 {
@@ -160,12 +158,12 @@ Every factual claim cites a `chunk_id` from Qdrant (`qdrant::{ticker}::{title_sl
   "competitive_moat": {
     "rating": "wide",
     "key_strengths": [
-      "ecosystem lock-in [chunk_id: qdrant::AAPL::...]"
+      "ecosystem lock-in [chunk_id: neo4j::AAPL::...]"
     ],
     "vulnerabilities": [
-      "China market dependency [chunk_id: qdrant::AAPL::...]"
+      "China market dependency [chunk_id: neo4j::AAPL::...]"
     ],
-    "sources": ["qdrant::AAPL::..."]
+    "sources": ["neo4j::AAPL::..."]
   },
   "qualitative_analysis": {
     "narrative": "≥3 sentences directly answering the analyst question with [chunk_id] citations",
@@ -194,7 +192,7 @@ Every factual claim cites a `chunk_id` from Qdrant (`qdrant::{ticker}::{title_sl
 }
 ```
 
-**chunk_id format for Qdrant sources:** `qdrant::{TICKER}::{title_slug}` (generated from `ticker_symbol` and `title` fields in Qdrant payload). Slugs are truncated at ~50 characters and preserve Unicode characters from original article titles (e.g. curly apostrophes U+2019).
+**chunk_id format:** `neo4j::{TICKER}::{id}` (when Neo4j Chunk nodes are populated). Currently Neo4j has no Chunk nodes, so retrieval returns empty and the agent falls back to Web Search for qualitative data.
 
 ---
 
@@ -247,7 +245,7 @@ agents/business_analyst/
 ├── llm.py                 # Ollama LLM client (generate, rewrite_query, JSON extraction)
 ├── prompts.py             # System prompt + JSON schema prompt + query rewrite prompt
 ├── schema.py              # Dataclasses: Chunk, RetrievalResult, SentimentSnapshot, CRAGStatus
-├── tools.py               # Neo4j, Qdrant, PostgreSQL connectors + CRAG evaluator + reranker
+├── tools.py               # Neo4j, PostgreSQL connectors + CRAG evaluator + reranker
 ├── web_search_interface.py # Web Search Agent fallback stub
 └── tests/
     └── test_agent.py      # 39 unit + integration tests (all mocked, all passing)
@@ -262,21 +260,18 @@ agents/business_analyst/
 OLLAMA_BASE_URL=http://localhost:11434
 BUSINESS_ANALYST_MODEL=deepseek-r1:8b
 
-# Embedding (via Ollama — must match Qdrant vector dimensions)
-EMBEDDING_MODEL=nomic-embed-text
-EMBEDDING_DIMENSION=768
+# Embedding (local via sentence-transformers — no Ollama dependency)
+EMBEDDING_MODEL=all-MiniLM-L6-v2
+EMBEDDING_DIMENSION=384
 
 # Reranker (loaded locally via sentence-transformers)
 RERANKER_MODEL=cross-encoder/ms-marco-MiniLM-L-6-v2
 
-# Qdrant
-QDRANT_HOST=localhost
-QDRANT_PORT=6333
-QDRANT_COLLECTION_NAME=financial_documents
-RAG_TOP_K=8
+# Retrieval
+RAG_TOP_K=15
 RAG_SCORE_THRESHOLD=0.6
 
-# Neo4j (Company node properties used for company_overview; vector search returns 0 — Qdrant fallback activates automatically)
+# Neo4j (Company node properties used for company_overview; Chunk nodes not yet ingested)
 NEO4J_URI=bolt://localhost:7687
 NEO4J_USER=neo4j
 NEO4J_PASSWORD=changeme_neo4j_password
@@ -298,8 +293,8 @@ POSTGRES_PASSWORD=airflow
 ```bash
 cd /Users/brianho/FYP && \
 BUSINESS_ANALYST_MODEL=deepseek-r1:8b \
-EMBEDDING_MODEL=nomic-embed-text \
-EMBEDDING_DIMENSION=768 \
+EMBEDDING_MODEL=all-MiniLM-L6-v2 \
+EMBEDDING_DIMENSION=384 \
 .venv/bin/python -m agents.business_analyst.agent \
   --ticker AAPL \
   --task "What is Apple's main business model and revenue sources?" \
@@ -309,34 +304,34 @@ EMBEDDING_DIMENSION=768 \
 **5 suggested test commands:**
 
 ```bash
-# 1. AAPL — competitive moat (default task, well-grounded in Qdrant)
-BUSINESS_ANALYST_MODEL=deepseek-r1:8b EMBEDDING_MODEL=nomic-embed-text EMBEDDING_DIMENSION=768 \
+# 1. AAPL — competitive moat (falls back to web search — no Chunk nodes in Neo4j yet)
+BUSINESS_ANALYST_MODEL=deepseek-r1:8b EMBEDDING_MODEL=all-MiniLM-L6-v2 EMBEDDING_DIMENSION=384 \
 .venv/bin/python -m agents.business_analyst.agent \
   --ticker AAPL --log-level WARNING
 
 # 2. TSLA — risk factors (tests key_risks output block)
-BUSINESS_ANALYST_MODEL=deepseek-r1:8b EMBEDDING_MODEL=nomic-embed-text EMBEDDING_DIMENSION=768 \
+BUSINESS_ANALYST_MODEL=deepseek-r1:8b EMBEDDING_MODEL=all-MiniLM-L6-v2 EMBEDDING_DIMENSION=384 \
 .venv/bin/python -m agents.business_analyst.agent \
   --ticker TSLA \
   --task "What are Tesla's key business risks and competitive vulnerabilities?" \
   --log-level WARNING
 
 # 3. NVDA — strategic positioning (tests competitive_moat block)
-BUSINESS_ANALYST_MODEL=deepseek-r1:8b EMBEDDING_MODEL=nomic-embed-text EMBEDDING_DIMENSION=768 \
+BUSINESS_ANALYST_MODEL=deepseek-r1:8b EMBEDDING_MODEL=all-MiniLM-L6-v2 EMBEDDING_DIMENSION=384 \
 .venv/bin/python -m agents.business_analyst.agent \
   --ticker NVDA \
   --task "How defensible is NVIDIA's AI chip moat against in-house alternatives?" \
   --log-level WARNING
 
 # 4. MSFT — services & cloud strategy (tests qualitative_analysis narrative)
-BUSINESS_ANALYST_MODEL=deepseek-r1:8b EMBEDDING_MODEL=nomic-embed-text EMBEDDING_DIMENSION=768 \
+BUSINESS_ANALYST_MODEL=deepseek-r1:8b EMBEDDING_MODEL=all-MiniLM-L6-v2 EMBEDDING_DIMENSION=384 \
 .venv/bin/python -m agents.business_analyst.agent \
   --ticker MSFT \
   --task "Assess Microsoft's cloud and AI services strategy and revenue mix." \
   --log-level WARNING
 
-# 5. GOOGL — citation grounding check visible at INFO level
-BUSINESS_ANALYST_MODEL=deepseek-r1:8b EMBEDDING_MODEL=nomic-embed-text EMBEDDING_DIMENSION=768 \
+# 5. GOOGL — web search fallback path
+BUSINESS_ANALYST_MODEL=deepseek-r1:8b EMBEDDING_MODEL=all-MiniLM-L6-v2 EMBEDDING_DIMENSION=384 \
 .venv/bin/python -m agents.business_analyst.agent \
   --ticker GOOGL \
   --task "What is Alphabet's advertising dependency risk and diversification strategy?" \
@@ -347,37 +342,37 @@ BUSINESS_ANALYST_MODEL=deepseek-r1:8b EMBEDDING_MODEL=nomic-embed-text EMBEDDING
 
 ## Validated Live Results
 
-All 5 supported tickers have been validated end-to-end with real Qdrant, Neo4j, and PostgreSQL data.
+All 5 supported tickers have been validated end-to-end with Neo4j and PostgreSQL data. Since Neo4j has no Chunk nodes yet, the CRAG evaluator returns INCORRECT and the web search fallback is triggered for qualitative retrieval.
 
-| Ticker | CRAG Status | Confidence | Citations in output | Citation warnings | Fallback |
-|---|---|---|---|---|---|
-| AAPL | CORRECT | 0.72 | 9 | 0 | false |
-| TSLA | CORRECT | — | 9 | 0 | false |
-| MSFT | CORRECT | — | 5 | 1 (LLM typo, stripped by post-processor) | false |
-| NVDA | CORRECT | — | 9 | 0 | false |
-| GOOGL | CORRECT | — | 10 | 0 | false |
+| Ticker | CRAG Status | Confidence | Fallback |
+|---|---|---|---|
+| AAPL | INCORRECT → web fallback | — | true |
+| TSLA | INCORRECT → web fallback | — | true |
+| MSFT | INCORRECT → web fallback | — | true |
+| NVDA | INCORRECT → web fallback | — | true |
+| GOOGL | INCORRECT → web fallback | — | true |
 
 **Notes:**
-- MSFT: LLM generated `Quiety` instead of `Quietly` in one chunk slug. `_strip_ungrounded_inline_citations()` detected and stripped the typo; the correctly-spelled citation was retained.
-- GOOGL: Chunk IDs contain Unicode curly apostrophes (U+2019). `json.dumps(ensure_ascii=False)` + Unicode NFKD normalisation ensures these are matched correctly without false-alarm citation warnings.
-- Neo4j returns 0 chunks for all tickers (no `Chunk` nodes). Qdrant fallback activates automatically. All citations are `qdrant::` prefixed.
+- Neo4j returns 0 chunks for all tickers (no `Chunk` nodes ingested). Web search fallback activates for all qualitative queries.
+- Company node properties (marketCap, PE ratio, sector, etc.) are still fetched from Neo4j and populate the `company_overview` section of every output.
+- Sentiment data from PostgreSQL `sentiment_trends` is populated for all 5 tickers.
 
 ---
 
 ## Design Decisions
 
 - **CRAG over basic RAG:** Retrieval confidence is evaluated before generation — no silent low-quality answers.
-- **Web Search fallback is by design:** When context scores < 0.35, the agent calls the Web Search Agent — inter-agent collaboration, not a failure.
+- **Web Search fallback is by design:** When context scores < 0.35 (or when Neo4j has no Chunk nodes), the agent calls the Web Search Agent — inter-agent collaboration, not a failure.
 - **JSON output only:** All output is structured JSON consumed by the Supervisor — no freeform Markdown prose.
 - **Sentiment as context, not conclusion:** PostgreSQL sentiment % is injected as background context; the LLM interprets it against document evidence rather than inheriting the label.
 - **Citation enforcement (Rule 9):** Every claim in `key_risks`, `competitive_moat`, and `qualitative_analysis` must reference a real `chunk_id`. The system prompt explicitly forbids invented IDs.
-- **Inline citation post-processor:** `_strip_ungrounded_inline_citations()` recursively walks the output dict after LLM generation and replaces any `[qdrant::TICKER::slug]` token that does not match a retrieved chunk ID with `[source unavailable]`. This is a safety net for LLM hallucination of chunk IDs.
-- **Unicode normalisation for chunk IDs:** Qdrant chunk IDs can contain Unicode characters (e.g. U+2019 curly apostrophes) from article titles. Both cited IDs and real IDs are NFKD-normalised to ASCII before comparison to prevent false-alarm grounding failures.
+- **Inline citation post-processor:** `_strip_ungrounded_inline_citations()` recursively walks the output dict after LLM generation and replaces any `[chunk_id]` token that does not match a retrieved chunk ID with `[source unavailable]`. This is a safety net for LLM hallucination of chunk IDs.
+- **Unicode normalisation for chunk IDs:** Chunk IDs can contain Unicode characters from article titles. Both cited IDs and real IDs are NFKD-normalised to ASCII before comparison to prevent false-alarm grounding failures.
 - **`json.dumps(ensure_ascii=False)`:** LLM output containing Unicode characters is serialised without ASCII escaping to preserve the original characters for regex-based citation matching.
 - **No timeout:** `request_timeout = None` — deepseek-r1:8b can take several minutes on complex prompts; a hard timeout causes false `GENERATION_ERROR` failures.
 - **`"think": False` API param:** Passed in the Ollama request payload to suppress deepseek-r1 `<think>` blocks at the API level (Ollama ≥ 0.14.2). More reliable than the `/no_think` directive. Defensive `_strip_think_tags()` also runs as a fallback.
 - **`_strip_markdown_fences`:** deepseek-r1 occasionally wraps output in ` ```json ``` ` fences; these are stripped before JSON parsing in `llm.py`.
-- **Qdrant is the primary retrieval source:** Neo4j vector index is wired in but returns 0 results (no `Chunk` nodes ingested). The agent falls back to Qdrant automatically and all production citations are Qdrant-sourced.
+- **Neo4j is the primary retrieval target:** When Chunk nodes are ingested, Neo4j vector search will be the primary source. Until then, the CRAG evaluator returns INCORRECT and web search is the qualitative data source.
 
 ---
 
@@ -390,7 +385,7 @@ cd /Users/brianho/FYP && .venv/bin/python -m pytest agents/business_analyst/test
 # Expected: 39 passed
 ```
 
-All tests are unit/integration tests with mocked external services (Qdrant, Neo4j, PostgreSQL, Ollama). No live infrastructure required to run the test suite.
+All tests are unit/integration tests with mocked external services (Neo4j, PostgreSQL, Ollama). No live infrastructure required to run the test suite.
 
 ---
 

@@ -78,7 +78,6 @@ format_json_output          ←  Structured JSON for Supervisor
 |---|---|---|---|
 | PostgreSQL | `fyp-postgres` | healthy | `raw_timeseries`, `raw_fundamentals` tables populated by EODHD + FMP DAGs. Earnings, dividends, splits stored in `raw_fundamentals` payload JSONB. |
 | Neo4j | `fyp-neo4j` | healthy | 5 `Company` nodes available for peer selection via `COMPETES_WITH` / `BELONGS_TO` edges. Full peer graph populated once FMP DAG runs for all S&P 100 tickers. |
-| Qdrant | `fyp-qdrant` | operational | Vector DB (not directly used by this agent, but runs in the local network). |
 | Ollama | local | running | `deepseek-r1:8b` for narrative summary only; `temperature=0.1` (numeric analysis). Version 0.14.2. |
 
 ---

@@ -347,6 +347,36 @@ class FMDataBundle:
     # Revenue segmentation (FMP)
     revenue_segments: Dict[str, List[Dict[str, Any]]] = field(default_factory=dict)
 
+    # ── New EODHD-sourced fields ──────────────────────────────────────────────
+
+    # Row 10: Dividend History / Stock Splits — splits part
+    splits_history: List[Dict[str, Any]] = field(default_factory=list)
+
+    # Row 11: Treasury Rates / Macro Indicators — from global_macro_indicators table
+    macro_indicators: List[Dict[str, Any]] = field(default_factory=list)
+
+    # Row 12: Economic Events Data API — from economic_events table
+    economic_events: List[Dict[str, Any]] = field(default_factory=list)
+
+    # Row 13: Bonds Data (Yields, Pricing) — from corporate_bond_yields table
+    bond_yields: List[Dict[str, Any]] = field(default_factory=list)
+
+    # Row 14: Forex Historical Rates (EOD) — from forex_rates table
+    forex_rates: List[Dict[str, Any]] = field(default_factory=list)
+
+    # Row 18: Financial Statements (IS/BS/CF) — from financial_statements table
+    # Keyed by statement_type: "Income_Statement", "Balance_Sheet", "Cash_Flow"
+    financial_statements: Dict[str, List[Dict[str, Any]]] = field(default_factory=dict)
+
+    # Row 19: Valuation Metrics — from valuation_metrics table
+    valuation_metrics: Dict[str, Any] = field(default_factory=dict)
+
+    # Row 22: Outstanding Shares History — from outstanding_shares table
+    outstanding_shares: List[Dict[str, Any]] = field(default_factory=list)
+
+    # Row 11 (dedicated treasury_rates table) — supersedes raw_timeseries treasury_rates
+    treasury_rates_dedicated: List[Dict[str, Any]] = field(default_factory=list)
+
     def is_empty(self) -> bool:
         return not any([
             self.income, self.balance, self.cashflow,

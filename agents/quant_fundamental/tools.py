@@ -270,6 +270,191 @@ class PostgresConnector:
             rows = cur.fetchall()
             return [dict(r) for r in rows]
 
+    def fetch_intraday_quotes(self, ticker: str, limit: int = 390) -> List[Dict]:
+        """Fetch intraday 1-minute quotes for the ticker (Row 2: Intraday / Delayed Live Quotes)."""
+        sql = """
+        SELECT payload, ts_date, source
+        FROM raw_timeseries
+        WHERE ticker_symbol = %s
+          AND data_name = 'intraday_1m'
+        ORDER BY ts_date DESC
+        LIMIT %s
+        """
+        conn = self._connect()
+        with closing(conn), conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, (ticker, limit))
+            rows = cur.fetchall()
+        results = []
+        for row in rows:
+            payload = row["payload"]
+            if isinstance(payload, str):
+                try:
+                    payload = json.loads(payload)
+                except json.JSONDecodeError:
+                    pass
+            results.append({"payload": payload, "ts_date": str(row["ts_date"]), "source": row["source"]})
+        return results
+
+    def fetch_technicals(self, ticker: str, limit: int = 60) -> List[Dict]:
+        """Fetch technical indicator rows for the ticker (Row 7: Beta & Volatility / Technicals).
+
+        Returns rows from raw_timeseries where data_name matches any technical indicator
+        ingested by the EODHD pipeline (rsi, macd, sma, ema, bbands, atr, adx, cci,
+        roc, wma, beta, sar, stochrsi, slope, stddev).
+        """
+        sql = """
+        SELECT ticker_symbol, data_name, payload, ts_date, source
+        FROM raw_timeseries
+        WHERE ticker_symbol = %s
+          AND data_name LIKE 'technical_%%'
+        ORDER BY ts_date DESC, data_name
+        LIMIT %s
+        """
+        conn = self._connect()
+        with closing(conn), conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, (ticker, limit))
+            rows = cur.fetchall()
+        results = []
+        for row in rows:
+            payload = row["payload"]
+            if isinstance(payload, str):
+                try:
+                    payload = json.loads(payload)
+                except json.JSONDecodeError:
+                    pass
+            results.append({
+                "data_name": row["data_name"],
+                "payload": payload,
+                "ts_date": str(row["ts_date"]),
+                "source": row["source"],
+            })
+        return results
+
+    def fetch_screener_snapshot(self, limit: int = 100) -> List[Dict]:
+        """Fetch latest bulk screener snapshot rows (Row 8: Screener API / Bulk).
+
+        Returns the most recent rows from market_screener.
+        """
+        sql = """
+        SELECT ticker_code, payload, ts_date, source
+        FROM market_screener
+        ORDER BY ts_date DESC
+        LIMIT %s
+        """
+        conn = self._connect()
+        with closing(conn), conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, (limit,))
+            rows = cur.fetchall()
+        results = []
+        for row in rows:
+            payload = row["payload"]
+            if isinstance(payload, str):
+                try:
+                    payload = json.loads(payload)
+                except json.JSONDecodeError:
+                    pass
+            results.append({
+                "ticker_code": row["ticker_code"],
+                "payload": payload,
+                "ts_date": str(row["ts_date"]),
+                "source": row["source"],
+            })
+        return results
+
+    def fetch_valuation_metrics(self, ticker: str) -> Optional[Dict]:
+        """Fetch latest valuation metrics for the ticker from the dedicated table (Row 19).
+
+        Returns fields: trailing_pe, forward_pe, price_sales_ttm, price_book_mrq,
+        enterprise_value, ev_revenue, ev_ebitda, market_cap, ebitda, pe_ratio,
+        peg_ratio, eps, profit_margin, operating_margin, roa, roe, revenue_ttm, etc.
+        """
+        sql = """
+        SELECT *
+        FROM valuation_metrics
+        WHERE ticker = %s
+        ORDER BY as_of_date DESC
+        LIMIT 1
+        """
+        conn = self._connect()
+        with closing(conn), conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, (ticker,))
+            row = cur.fetchone()
+            if not row:
+                return None
+            return {k: (float(v) if isinstance(v, (int, float)) and k not in ("ticker", "id") else
+                        str(v) if v is not None else None)
+                    for k, v in dict(row).items()}
+
+    def fetch_financial_statements(
+        self,
+        ticker: str,
+        statement_type: Optional[str] = None,
+        limit: int = 4,
+    ) -> Dict[str, List[Dict]]:
+        """Fetch rows from the financial_statements specialty table (EODHD-sourced).
+
+        Returns a dict keyed by statement_type:
+          {"Income_Statement": [...], "Balance_Sheet": [...], "Cash_Flow": [...]}
+
+        Used as a last-resort fallback when raw_fundamentals is empty.
+        """
+        if statement_type:
+            sql = """
+            SELECT ticker, statement_type, period_type, report_date, payload
+            FROM financial_statements
+            WHERE ticker = %s AND statement_type = %s
+            ORDER BY report_date DESC
+            LIMIT %s
+            """
+            conn = self._connect()
+            with closing(conn), conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(sql, (ticker, statement_type, limit))
+                rows = cur.fetchall()
+        else:
+            sql = """
+            SELECT ticker, statement_type, period_type, report_date, payload
+            FROM financial_statements
+            WHERE ticker = %s
+            ORDER BY statement_type, report_date DESC
+            """
+            conn = self._connect()
+            with closing(conn), conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(sql, (ticker,))
+                rows = cur.fetchall()
+
+        result: Dict[str, List[Dict]] = {}
+        counts: Dict[str, int] = {}
+        for row in rows:
+            st = row["statement_type"]
+            if counts.get(st, 0) >= limit:
+                continue
+            payload = row["payload"]
+            if isinstance(payload, str):
+                try:
+                    payload = json.loads(payload)
+                except json.JSONDecodeError:
+                    pass
+            entry = {
+                "report_date": str(row["report_date"]),
+                "period_type": row["period_type"],
+                "payload": payload,
+            }
+            result.setdefault(st, []).append(entry)
+            counts[st] = counts.get(st, 0) + 1
+        return result
+
+    def fetch_basic_fundamentals(self, ticker: str) -> Dict:
+        """Fetch basic fundamentals snapshot for the ticker from raw_fundamentals.
+
+        Tries: fundamentals → company_profile → financial_scores (fallback chain).
+        Returns the most recent payload dict (Row 9: Basic Fundamentals).
+        """
+        for data_name in ("fundamentals", "company_profile", "financial_scores"):
+            rows = self.fetch_latest_fundamental(ticker, data_name, limit=1)
+            if rows and rows[0].get("payload"):
+                return rows[0]["payload"] if isinstance(rows[0]["payload"], dict) else {}
+        return {}
+
     def healthcheck(self) -> bool:
         try:
             conn = self._connect()
@@ -315,6 +500,32 @@ class FinancialDataFetcher:
                 results.append(payload)
         return results
 
+    def _financial_stmt_payload(
+        self,
+        ticker: str,
+        statement_type: str,
+    ) -> Dict[str, Any]:
+        """Fetch the most recent payload from the financial_statements specialty table.
+
+        Used as a last-resort fallback when raw_fundamentals is empty.
+
+        Args:
+            statement_type: 'Income_Statement' | 'Balance_Sheet' | 'Cash_Flow'
+        """
+        try:
+            stmts = self.pg.fetch_financial_statements(
+                ticker, statement_type=statement_type, limit=1
+            )
+            rows = stmts.get(statement_type, [])
+            if rows and rows[0].get("payload"):
+                return rows[0]["payload"]
+        except Exception as exc:
+            logger.debug(
+                "[QF] financial_statements fallback failed for %s/%s: %s",
+                ticker, statement_type, exc,
+            )
+        return {}
+
     def fetch(self, ticker: str) -> FinancialsBundle:
         """Fetch all data needed for factor computation for a single ticker.
 
@@ -335,10 +546,13 @@ class FinancialDataFetcher:
           - enterprise_values → derived from EODHD key_metrics_ttm
             (enterpriseValueTTM, marketCap)
           - financial_scores  → EODHD financial_scores (piotroskiScore, altmanZScore)
+
+        Last-resort fallback: financial_statements specialty table (EODHD-sourced,
+        always populated by the ingestion pipeline).
         """
         bundle = FinancialsBundle(ticker=ticker)
 
-        # Income statement — most recent period (FMP → EODHD financial_scores fallback)
+        # Income statement — most recent period (FMP → EODHD financial_scores → financial_statements)
         try:
             rows = self._latest_payload_list(ticker, "income_statement", limit=5)
             bundle.income = rows[0] if rows else {}
@@ -357,10 +571,30 @@ class FinancialDataFetcher:
                         "[QF] income_statement: FMP empty for %s — using EODHD financial_scores fallback",
                         ticker,
                     )
+            if not bundle.income:
+                # Last-resort: financial_statements specialty table (EODHD-sourced)
+                stmt = self._financial_stmt_payload(ticker, "Income_Statement")
+                if stmt:
+                    # EODHD stores revenue as 'totalRevenue'; normalise to 'revenue'
+                    if not stmt.get("revenue") and stmt.get("totalRevenue"):
+                        stmt["revenue"] = stmt["totalRevenue"]
+                    bundle.income = {
+                        "revenue":         stmt.get("revenue"),
+                        "operatingIncome": stmt.get("operatingIncome") or stmt.get("ebit"),
+                        "ebit":            stmt.get("ebit") or stmt.get("operatingIncome"),
+                        "ebitda":          stmt.get("ebitda"),
+                        "netIncome":       stmt.get("netIncome"),
+                        "grossProfit":     stmt.get("grossProfit"),
+                        "incomeTaxExpense": stmt.get("incomeTaxExpense") or stmt.get("taxProvision"),
+                    }
+                    logger.info(
+                        "[QF] income_statement: using financial_statements table fallback for %s",
+                        ticker,
+                    )
         except Exception as exc:
             logger.warning("Failed to fetch income_statement for %s: %s", ticker, exc)
 
-        # Balance sheet (FMP → EODHD financial_scores fallback)
+        # Balance sheet (FMP → EODHD financial_scores → financial_statements)
         try:
             rows = self._latest_payload_list(ticker, "balance_sheet", limit=5)
             bundle.balance = rows[0] if rows else {}
@@ -381,10 +615,33 @@ class FinancialDataFetcher:
                         "[QF] balance_sheet: FMP empty for %s — using EODHD financial_scores fallback",
                         ticker,
                     )
+            if not bundle.balance:
+                # Last-resort: financial_statements specialty table (EODHD-sourced)
+                stmt = self._financial_stmt_payload(ticker, "Balance_Sheet")
+                if stmt:
+                    bundle.balance = {
+                        "totalAssets":             stmt.get("totalAssets"),
+                        "totalLiabilities":        stmt.get("totalLiabilities") or stmt.get("totalLiab"),
+                        "totalDebt":               stmt.get("longTermDebt") or stmt.get("shortLongTermDebt"),
+                        "longTermDebt":            stmt.get("longTermDebt"),
+                        "cashAndCashEquivalents":  stmt.get("cashAndEquivalents") or stmt.get("cash"),
+                        "workingCapital":          stmt.get("netWorkingCapital"),
+                        "retainedEarnings":        stmt.get("retainedEarnings"),
+                        "totalCurrentAssets":      stmt.get("totalCurrentAssets"),
+                        "totalCurrentLiabilities": stmt.get("totalCurrentLiabilities") or stmt.get("otherCurrentLiab"),
+                        "totalStockholdersEquity": (
+                            (stmt.get("totalAssets") or 0)
+                            - (stmt.get("totalLiabilities") or stmt.get("totalLiab") or 0)
+                        ) or None,
+                    }
+                    logger.info(
+                        "[QF] balance_sheet: using financial_statements table fallback for %s",
+                        ticker,
+                    )
         except Exception as exc:
             logger.warning("Failed to fetch balance_sheet for %s: %s", ticker, exc)
 
-        # Cash flow (FMP → EODHD key_metrics_ttm fallback)
+        # Cash flow (FMP → EODHD key_metrics_ttm → financial_statements)
         try:
             rows = self._latest_payload_list(ticker, "cash_flow", limit=5)
             bundle.cashflow = rows[0] if rows else {}
@@ -406,6 +663,21 @@ class FinancialDataFetcher:
                     }
                     logger.info(
                         "[QF] cash_flow: FMP empty for %s — using EODHD key_metrics_ttm fallback",
+                        ticker,
+                    )
+            if not bundle.cashflow:
+                # Last-resort: financial_statements specialty table (EODHD-sourced)
+                stmt = self._financial_stmt_payload(ticker, "Cash_Flow")
+                if stmt:
+                    bundle.cashflow = {
+                        "operatingCashFlow":        stmt.get("totalCashFromOperatingActivities") or stmt.get("operatingCashFlow"),
+                        "capitalExpenditure":       stmt.get("capitalExpenditures") or stmt.get("capitalExpenditure"),
+                        "freeCashFlow":             stmt.get("freeCashFlow"),
+                        "netIncome":                stmt.get("netIncome"),
+                        "depreciationAmortization": stmt.get("depreciation"),
+                    }
+                    logger.info(
+                        "[QF] cash_flow: using financial_statements table fallback for %s",
                         ticker,
                     )
         except Exception as exc:
@@ -584,6 +856,62 @@ class FinancialDataFetcher:
                 )
             except Exception as exc:
                 logger.warning("Failed to build synthetic benchmark: %s", exc)
+
+        # ── Intraday quotes (Row 2: Intraday / Delayed Live Quotes) ─────────
+        try:
+            intraday_rows = self.pg.fetch_intraday_quotes(ticker, limit=390)
+            for row in intraday_rows:
+                payload = row.get("payload")
+                if not payload:
+                    continue
+                merged = dict(payload) if isinstance(payload, dict) else {}
+                if "ts_date" not in merged:
+                    merged["ts_date"] = str(row.get("ts_date", ""))
+                bundle.intraday_quotes.append(merged)
+        except Exception as exc:
+            logger.warning("Failed to fetch intraday_quotes for %s: %s", ticker, exc)
+
+        # ── Technical indicators (Row 7: Beta & Volatility / Technicals) ────
+        try:
+            tech_rows = self.pg.fetch_technicals(ticker, limit=60)
+            for row in tech_rows:
+                payload = row.get("payload")
+                if not payload:
+                    continue
+                merged = dict(payload) if isinstance(payload, dict) else {}
+                merged["_indicator"] = row.get("data_name", "")
+                merged["_ts_date"] = str(row.get("ts_date", ""))
+                bundle.technicals.append(merged)
+        except Exception as exc:
+            logger.warning("Failed to fetch technicals for %s: %s", ticker, exc)
+
+        # ── Screener snapshot (Row 8: Screener API / Bulk) ───────────────────
+        try:
+            screener_rows = self.pg.fetch_screener_snapshot(limit=100)
+            for row in screener_rows:
+                payload = row.get("payload")
+                if not payload:
+                    continue
+                merged = dict(payload) if isinstance(payload, dict) else {}
+                merged["_ticker_code"] = row.get("ticker_code", "")
+                merged["_ts_date"] = str(row.get("ts_date", ""))
+                bundle.screener_snapshot.append(merged)
+        except Exception as exc:
+            logger.warning("Failed to fetch screener_snapshot: %s", exc)
+
+        # ── Basic fundamentals (Row 9) ────────────────────────────────────────
+        try:
+            bundle.basic_fundamentals = self.pg.fetch_basic_fundamentals(ticker)
+        except Exception as exc:
+            logger.warning("Failed to fetch basic_fundamentals for %s: %s", ticker, exc)
+
+        # ── Valuation metrics (Row 19) ────────────────────────────────────────
+        try:
+            vm = self.pg.fetch_valuation_metrics(ticker)
+            if vm:
+                bundle.valuation_metrics = vm
+        except Exception as exc:
+            logger.warning("Failed to fetch valuation_metrics for %s: %s", ticker, exc)
 
         return bundle
 
@@ -896,6 +1224,26 @@ class QuantFundamentalToolkit:
     def fetch_senate_trades(self, ticker: str, limit: int = 20) -> List[Dict]:
         """Fetch recent senate/congress trading activity for the ticker."""
         return self.pg.fetch_senate_trades(ticker, limit)
+
+    def fetch_intraday_quotes(self, ticker: str, limit: int = 390) -> List[Dict]:
+        """Fetch intraday 1-minute quotes for the ticker (Row 2)."""
+        return self.pg.fetch_intraday_quotes(ticker, limit)
+
+    def fetch_technicals(self, ticker: str, limit: int = 60) -> List[Dict]:
+        """Fetch technical indicator rows for the ticker (Row 7)."""
+        return self.pg.fetch_technicals(ticker, limit)
+
+    def fetch_screener_snapshot(self, limit: int = 100) -> List[Dict]:
+        """Fetch latest bulk screener snapshot rows (Row 8)."""
+        return self.pg.fetch_screener_snapshot(limit)
+
+    def fetch_basic_fundamentals(self, ticker: str) -> Dict:
+        """Fetch basic fundamentals snapshot for the ticker (Row 9)."""
+        return self.pg.fetch_basic_fundamentals(ticker)
+
+    def fetch_valuation_metrics(self, ticker: str) -> Optional[Dict]:
+        """Fetch latest valuation metrics for the ticker (Row 19)."""
+        return self.pg.fetch_valuation_metrics(ticker)
 
     def close(self) -> None:
         pass  # psycopg2 connections are opened/closed per-query

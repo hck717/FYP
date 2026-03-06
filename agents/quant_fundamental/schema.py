@@ -180,6 +180,22 @@ class FinancialsBundle:
     # Last 4 quarters of key income statement line items — populated by fetch_financials node
     quarterly_trends: List[QuarterlyPeriod] = field(default_factory=list)
 
+    # ── EODHD data (Row 1): Historical EOD prices — already in price_history above
+    # ── EODHD data (Row 2): Intraday / delayed live quotes (intraday_1m)
+    intraday_quotes: List[Dict[str, Any]] = field(default_factory=list)
+    # ── EODHD data (Row 7): Beta & Technicals indicators (raw_timeseries)
+    technicals: List[Dict[str, Any]] = field(default_factory=list)
+    # ── EODHD data (Row 8): Screener / bulk market snapshot (market_screener)
+    screener_snapshot: List[Dict[str, Any]] = field(default_factory=list)
+    # ── EODHD data (Row 9): Basic Fundamentals — EPS, key metrics (raw_fundamentals)
+    basic_fundamentals: Dict[str, Any] = field(default_factory=dict)
+    # ── EODHD data (Row 19): Valuation Metrics from dedicated table
+    valuation_metrics: Dict[str, Any] = field(default_factory=dict)
+    # ── EODHD data (Row 20): Short Interest & Shares Stats (short_interest table)
+    # Already fetched via fetch_short_interest()
+    # ── EODHD data (Row 21): Earnings History & Surprises (earnings_surprises table)
+    # Already fetched via fetch_earnings_surprises()
+
     def is_empty(self) -> bool:
         return not any([
             self.income, self.balance, self.cashflow, self.ratios,

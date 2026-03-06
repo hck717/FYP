@@ -3,6 +3,9 @@
 -- (mounted at /docker-entrypoint-initdb.d/init-db.sql)
 -- Creates all application tables so they exist before Airflow DAGs run.
 
+-- Enable pgvector extension (requires pgvector/pgvector:pg15 image)
+CREATE EXTENSION IF NOT EXISTS vector;
+
 -- Raw time-series data (price, volume, intraday, etc.)
 CREATE TABLE IF NOT EXISTS raw_timeseries (
     id            SERIAL PRIMARY KEY,
@@ -213,4 +216,29 @@ CREATE INDEX IF NOT EXISTS idx_critic_run
     ON critic_run_log (run_id);
 CREATE INDEX IF NOT EXISTS idx_critic_check_type
     ON critic_run_log (check_type, verified);
+
+-- ---------------------------------------------------------------------------
+-- pgvector: text_chunks — embedded text segments for semantic search
+-- Stores chunks from company profiles + news, embedded with nomic-embed-text
+-- (768-dim via Ollama).  Used by the Business Analyst agent for hybrid RAG.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS text_chunks (
+    id          SERIAL PRIMARY KEY,
+    ticker      TEXT NOT NULL,
+    chunk_id    TEXT NOT NULL UNIQUE,
+    text        TEXT NOT NULL,
+    section     TEXT,
+    filing_date TEXT,
+    embedding   VECTOR(768),
+    source      TEXT DEFAULT 'eodhd',
+    ingested_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_text_chunks_ticker
+    ON text_chunks (ticker);
+
+-- HNSW index for fast cosine similarity search
+CREATE INDEX IF NOT EXISTS text_chunks_embedding_idx
+    ON text_chunks USING hnsw (embedding vector_cosine_ops)
+    WITH (m = 16, ef_construction = 64);
 

@@ -593,7 +593,7 @@ def _render_visualisations(state: Dict[str, Any]) -> None:
                 if hint == "price_history":
                     st.plotly_chart(
                         chart_price_history(price_hist, technicals, ticker, current_price),
-                        use_container_width=True,
+                        width="stretch",
                         key=f"price_history_{ticker}_{idx}",
                     )
                     rendered = True
@@ -601,7 +601,7 @@ def _render_visualisations(state: Dict[str, Any]) -> None:
                 elif hint == "price_performance":
                     st.plotly_chart(
                         chart_price_performance(price_hist, bench_hist, ticker),
-                        use_container_width=True,
+                        width="stretch",
                         key=f"price_perf_{ticker}_{idx}",
                     )
                     rendered = True
@@ -610,7 +610,7 @@ def _render_visualisations(state: Dict[str, Any]) -> None:
                 elif hint == "revenue_trend":
                     st.plotly_chart(
                         chart_revenue_trend(q_trends, dcf, ticker),
-                        use_container_width=True,
+                        width="stretch",
                         key=f"revenue_{ticker}_{idx}",
                     )
                     rendered = True
@@ -618,7 +618,7 @@ def _render_visualisations(state: Dict[str, Any]) -> None:
                 elif hint == "margin_trends":
                     st.plotly_chart(
                         chart_margin_trends(q_trends, key_metrics, ticker),
-                        use_container_width=True,
+                        width="stretch",
                         key=f"margins_{ticker}_{idx}",
                     )
                     rendered = True
@@ -626,7 +626,7 @@ def _render_visualisations(state: Dict[str, Any]) -> None:
                 elif hint == "eps_trend":
                     st.plotly_chart(
                         chart_eps_trend(q_trends, ticker, earnings_rec),
-                        use_container_width=True,
+                        width="stretch",
                         key=f"eps_{ticker}_{idx}",
                     )
                     rendered = True
@@ -634,7 +634,7 @@ def _render_visualisations(state: Dict[str, Any]) -> None:
                 elif hint == "ebitda_trend":
                     st.plotly_chart(
                         chart_ebitda_trend(q_trends, ticker),
-                        use_container_width=True,
+                        width="stretch",
                         key=f"ebitda_{ticker}_{idx}",
                     )
                     rendered = True
@@ -643,7 +643,7 @@ def _render_visualisations(state: Dict[str, Any]) -> None:
                 elif hint == "football_field":
                     st.plotly_chart(
                         chart_football_field(dcf, comps, current_price, ticker),
-                        use_container_width=True,
+                        width="stretch",
                         key=f"football_{ticker}_{idx}",
                     )
                     rendered = True
@@ -651,7 +651,7 @@ def _render_visualisations(state: Dict[str, Any]) -> None:
                 elif hint in ("dcf_waterfall", "dcf_scenarios") and dcf:
                     st.plotly_chart(
                         chart_dcf_waterfall(dcf, current_price, ticker),
-                        use_container_width=True,
+                        width="stretch",
                         key=f"dcf_{ticker}_{idx}",
                     )
                     rendered = True
@@ -661,7 +661,7 @@ def _render_visualisations(state: Dict[str, Any]) -> None:
                     if sm and isinstance(sm, dict):
                         st.plotly_chart(
                             chart_sensitivity_heatmap(sm, ticker, current_price),
-                            use_container_width=True,
+                            width="stretch",
                             key=f"sensitivity_{ticker}_{idx}",
                         )
                         rendered = True
@@ -670,7 +670,7 @@ def _render_visualisations(state: Dict[str, Any]) -> None:
                 elif hint == "peer_comps":
                     st.plotly_chart(
                         chart_peer_comps(comps, ticker),
-                        use_container_width=True,
+                        width="stretch",
                         key=f"peer_comps_{ticker}_{idx}",
                     )
                     rendered = True
@@ -679,7 +679,7 @@ def _render_visualisations(state: Dict[str, Any]) -> None:
                 elif hint == "fcf_trend":
                     st.plotly_chart(
                         chart_fcf_trend(q_trends, key_metrics, ticker),
-                        use_container_width=True,
+                        width="stretch",
                         key=f"fcf_{ticker}_{idx}",
                     )
                     rendered = True
@@ -688,7 +688,7 @@ def _render_visualisations(state: Dict[str, Any]) -> None:
                 elif hint == "technicals":
                     st.plotly_chart(
                         chart_technicals(technicals, ticker, current_price),
-                        use_container_width=True,
+                        width="stretch",
                         key=f"technicals_{ticker}_{idx}",
                     )
                     rendered = True
@@ -697,7 +697,7 @@ def _render_visualisations(state: Dict[str, Any]) -> None:
                 elif hint == "sentiment_donut":
                     st.plotly_chart(
                         chart_sentiment_donut(sentiment, ticker),
-                        use_container_width=True,
+                        width="stretch",
                         key=f"sentiment_{ticker}_{idx}",
                     )
                     rendered = True
@@ -705,7 +705,7 @@ def _render_visualisations(state: Dict[str, Any]) -> None:
                 elif hint in ("factor_scorecard", "factor_radar") and qf:
                     st.plotly_chart(
                         chart_factor_scorecard(qf, ticker),
-                        use_container_width=True,
+                        width="stretch",
                         key=f"factor_{ticker}_{idx}",
                     )
                     rendered = True
@@ -713,7 +713,7 @@ def _render_visualisations(state: Dict[str, Any]) -> None:
                 elif hint == "altman_z" and qf:
                     st.plotly_chart(
                         chart_altman_z(qf, ticker),
-                        use_container_width=True,
+                        width="stretch",
                         key=f"altman_z_{ticker}_{idx}",
                     )
                     rendered = True
@@ -722,7 +722,7 @@ def _render_visualisations(state: Dict[str, Any]) -> None:
                 elif hint == "moe_consensus":
                     st.plotly_chart(
                         chart_moe_consensus(moe, current_price, ticker),
-                        use_container_width=True,
+                        width="stretch",
                         key=f"moe_{ticker}_{idx}",
                     )
                     rendered = True
@@ -731,7 +731,7 @@ def _render_visualisations(state: Dict[str, Any]) -> None:
                 elif hint == "quarterly_trends" and q_trends:
                     st.plotly_chart(
                         chart_quarterly_trends(q_trends, ticker),
-                        use_container_width=True,
+                        width="stretch",
                         key=f"q_trends_{ticker}_{idx}",
                     )
                     rendered = True

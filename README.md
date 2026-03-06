@@ -3,7 +3,6 @@
 
 ![Python](https://img.shields.io/badge/Python-3.11%2B-blue)
 ![LangGraph](https://img.shields.io/badge/LangGraph-Orchestration-orange)
-![Qdrant](https://img.shields.io/badge/Qdrant-VectorDB-red)
 ![Neo4j](https://img.shields.io/badge/Neo4j-GraphDB-green)
 ![PostgreSQL](https://img.shields.io/badge/PostgreSQL-StructuredDB-blue)
 ![Ollama](https://img.shields.io/badge/Ollama-LocalLLM-purple)
@@ -26,11 +25,10 @@ pip install -r requirements.txt
 
 # 3. Start Ollama and pull required models  (Ollama must be running before Docker starts)
 ollama serve &                 # skip if Ollama is already running as a system service
-ollama pull nomic-embed-text   # 768-dim embeddings (used by Business Analyst + ingestion)
 ollama pull llama3.2:latest    # planner + quant narrative
 ollama pull deepseek-r1:8b     # business analyst + summarizer + financial modelling
 
-# 4. Start all Docker services (PostgreSQL, Qdrant, Neo4j, Airflow x3)
+# 4. Start all Docker services (PostgreSQL, Neo4j, Airflow x3)
 docker compose up --build -d
 sleep 60                        # wait for all containers to initialise and Airflow to migrate DB
 
@@ -40,7 +38,6 @@ python ingestion/inspect_data.py
 #   ✅ Connected to localhost:5432/airflow
 #   ✅ raw_timeseries     516,197 rows
 #   ✅ :Company           5 nodes
-#   ✅ Status: green | Points: 2390
 
 # 6. Run the full analysis pipeline (Python API)
 python - <<'EOF'
@@ -59,7 +56,6 @@ streamlit run POC/streamlit/app.py
 | Service | URL | Credentials |
 |---|---|---|
 | Airflow UI | http://localhost:8080 | admin / admin |
-| Qdrant Dashboard | http://localhost:6333/dashboard | — |
 | Neo4j Browser | http://localhost:7474 | neo4j / SecureNeo4jPass2025! |
 | PostgreSQL | localhost:5432 | airflow / airflow |
 | Ollama API | http://localhost:11434 | — |
@@ -105,9 +101,8 @@ The platform operates in three runtime layers:
 │                                                                     │
 │  EODHD DAG (01:00 UTC) ──► scrape ──► load_postgres.py             │
 │  FMP DAG   (02:00 UTC)              ──► load_neo4j.py               │
-│                                     ──► load_qdrant.py (+ Ollama)   │
 │                                                                     │
-│  Databases: PostgreSQL 15 | Qdrant | Neo4j 5.15  (all Docker)      │
+│  Databases: PostgreSQL 15 | Neo4j 5.15  (all Docker)               │
 └───────────────────────────────────┬─────────────────────────────────┘
                                     │ data at rest
                                     ▼
@@ -121,7 +116,7 @@ The platform operates in three runtime layers:
 │  ├── classifies intent & complexity (1=simple, 2=moderate, 3=full) │
 │  ├── resolves ticker symbol(s)                                      │
 │  ├── selects which agents to invoke                                 │
-│  └── runs data availability check (Neo4j + Qdrant + PG + Ollama)   │
+│  └── runs data availability check (Neo4j + PG + Ollama)            │
 │       │                                                             │
 │       ▼                                                             │
 │  node_parallel_agents  (ThreadPoolExecutor)                         │
@@ -177,8 +172,8 @@ Query + Ticker
 fetch_sentiment_data   ←  PostgreSQL: sentiment_trends table (bullish/bearish/neutral %)
     │
     ▼
-hybrid_retrieval       ←  Qdrant dense search (768-dim, nomic-embed-text)  [primary]
-                       ←  Neo4j vector index (384-dim, all-MiniLM-L6-v2)   [fallback]
+hybrid_retrieval       ←  Neo4j vector index (384-dim, all-MiniLM-L6-v2)  [primary when chunks exist]
+                       ←  Web search fallback (Perplexity sonar-pro)       [current primary — no Chunk nodes yet]
                        ←  BM25 keyword scoring
     │
     ▼
@@ -196,10 +191,10 @@ format_json_output     ←  Structured JSON with chunk_id citations
 ```
 
 **Key design choices:**
-- All JSON fields cite `qdrant::TICKER::title-slug` chunk IDs — no unsourced claims
+- All JSON fields cite `neo4j::TICKER::title-slug` chunk IDs — no unsourced claims
 - `_strip_ungrounded_inline_citations()` post-processes output to remove hallucinated IDs
 - `deepseek-r1:8b` with `think=False`; defensive `_strip_think_tags()` also applied
-- Qdrant is the primary source (~2,390 vectors across 5 tickers); Neo4j returns 0 (no Chunk nodes yet)
+- Neo4j is the primary vector source (no Chunk nodes yet — vector search returns 0); web search fallback active for all qualitative queries
 
 **CLI:**
 ```bash
@@ -456,7 +451,7 @@ The orchestration layer (`/orchestration/`) coordinates the four agents via a La
 | `state.py` | `OrchestrationState` TypedDict — the shared state schema |
 | `llm.py` | `plan_query()` (llama3.2) + `summarise_results()` (deepseek-r1:8b) + prompts |
 | `citations.py` | `build_citation_block()` + `inject_inline_numbers()` — `[N]` reference section |
-| `data_availability.py` | `check_all()` — concurrent ping of Neo4j, Qdrant, PostgreSQL, Ollama |
+| `data_availability.py` | `check_all()` — concurrent ping of Neo4j, PostgreSQL, Ollama |
 
 ### Programmatic Usage
 
@@ -505,7 +500,6 @@ All data runs **100% locally via Docker** — no cloud databases.
 | Database | Container | Port | Role |
 |---|---|---|---|
 | PostgreSQL 15 | `fyp-postgres` | 5432 | Structured time-series + fundamentals |
-| Qdrant | `fyp-qdrant` | 6333/6334 | Vector embeddings (semantic RAG) |
 | Neo4j 5.15 | `fyp-neo4j` | 7474/7687 | Graph relationships + company properties |
 
 ### PostgreSQL Schema
@@ -535,40 +529,6 @@ docker exec -it fyp-postgres psql -U airflow -d airflow
 SELECT ticker_symbol, COUNT(*) FROM raw_timeseries GROUP BY ticker_symbol;
 SELECT MAX(ingested_at) FROM raw_fundamentals;
 \q
-```
-
-### Qdrant Schema
-
-```
-Collection: financial_documents
-Vector:     768-dim, cosine distance (nomic-embed-text via Ollama)
-Status:     ~2,390 vectors (AAPL: 407, TSLA: 419, NVDA: 423, MSFT: 422, GOOGL: 329)
-
-Payload fields:
-  ticker_symbol  : str   (e.g. "AAPL")
-  agent_name     : str   (e.g. "business_analyst")
-  data_name      : str   (e.g. "financial_news")
-  title          : str   (article title — used to form chunk_id slug)
-  source         : str   (e.g. "eodhd")
-  filing_date    : str   (ISO date)
-  boost_factor   : float (default 1.0 — updated by self-improving RAG)
-```
-
-**Inspect Qdrant:**
-```bash
-# Collection status
-curl -s http://localhost:6333/collections/financial_documents | python3 -m json.tool
-
-# Semantic search test
-python - <<'EOF'
-import requests
-q = requests.post("http://localhost:11434/api/embeddings",
-    json={"model": "nomic-embed-text", "prompt": "Apple iPhone revenue growth"}).json()["embedding"]
-hits = requests.post("http://localhost:6333/collections/financial_documents/points/search",
-    json={"vector": q, "limit": 5, "with_payload": True}).json()["result"]
-for h in hits:
-    print(f"{h['score']:.3f} | {h['payload'].get('ticker_symbol')} | {h['payload'].get('title','')[:60]}")
-EOF
 ```
 
 ### Neo4j Schema
@@ -607,7 +567,7 @@ Two Airflow DAGs ingest data daily:
 
 | DAG | Schedule | Purpose |
 |---|---|---|
-| `eodhd_complete_ingestion` | Daily 01:00 UTC | News, prices, fundamentals, technicals → PG + Qdrant + Neo4j |
+| `eodhd_complete_ingestion` | Daily 01:00 UTC | News, prices, fundamentals, technicals → PG + Neo4j |
 | `fmp_complete_ingestion` | Daily 02:00 UTC | Analyst estimates, earnings, DCF inputs, insider trades → PG |
 
 **Trigger DAGs manually:**
@@ -627,7 +587,7 @@ docker exec -it $SCHED airflow dags list-runs -d eodhd_complete_ingestion
 
 # View task logs
 docker exec -it $SCHED airflow tasks logs eodhd_complete_ingestion \
-  eodhd_load_qdrant_business_analyst_AAPL 2026-02-24
+  eodhd_load_neo4j_business_analyst_AAPL 2026-02-24
 ```
 
 **Health check:**
@@ -638,7 +598,6 @@ python ingestion/inspect_data.py
 # ✅ Connected to localhost:5432/airflow
 # ✅ raw_timeseries     516,197 rows
 # ✅ :Company           5 nodes
-# ✅ Status: green | Points: 2390
 ```
 
 ---
@@ -768,7 +727,7 @@ result["react_steps"]                      # list — ReAct trace
 .venv/bin/python -m pytest agents/quant_fundamental/tests/ -v -k "test_run"
 ```
 
-All tests use mocked external services (Qdrant, Neo4j, PostgreSQL, Ollama). No live infrastructure required for the test suite.
+All tests use mocked external services (Neo4j, PostgreSQL, Ollama). No live infrastructure required for the test suite.
 
 ---
 
@@ -819,10 +778,6 @@ POSTGRES_PORT=5432
 POSTGRES_DB=airflow
 POSTGRES_USER=airflow
 POSTGRES_PASSWORD=airflow
-
-QDRANT_HOST=localhost
-QDRANT_PORT=6333
-QDRANT_COLLECTION_NAME=financial_documents
 
 NEO4J_URI=bolt://localhost:7687
 NEO4J_USER=neo4j
@@ -891,11 +846,10 @@ AIRFLOW_WWW_USER_PASSWORD=admin
 
 ### Phase 1 — Foundation & Data Infrastructure (Weeks 1–4)  COMPLETE
 
-- [x] Docker Compose: Qdrant, PostgreSQL, Neo4j, Airflow
+- [x] Docker Compose: PostgreSQL, Neo4j, Airflow
 - [x] EODHD + FMP API integration and Airflow DAGs
 - [x] PostgreSQL schema: `raw_timeseries`, `raw_fundamentals`
-- [x] Qdrant collection `financial_documents` (768-dim, ~2,390 vectors)
-- [x] ETL loaders: `load_postgres.py`, `load_neo4j.py`, `load_qdrant.py`
+- [x] ETL loaders: `load_postgres.py`, `load_neo4j.py`
 - [x] Idempotent MD5 hash deduplication
 
 ### Phase 2 — Agent Layer (Weeks 3–8)  IN PROGRESS
@@ -913,7 +867,7 @@ AIRFLOW_WWW_USER_PASSWORD=admin
 
 - [x] Streamlit POC UI (`POC/streamlit/app.py`)
 - [ ] Critic Agent (GPT-4o-mini NLI verification, ≥90% pass rate)
-- [ ] Self-Improving RAG (`SelfImprovingRAG` class, Qdrant boost-factor updates)
+- [ ] Self-Improving RAG (`SelfImprovingRAG` class, Neo4j boost-factor updates)
 - [ ] Weekly retraining DAG (`citation_tracking` → `boost_factor` update)
 - [ ] Full Streamlit UI (`ui/app.py`): streaming CoT, DCF heatmap, clickable citations
 - [ ] 50-query evaluation dataset (20 Q&A / 15 Comparison / 15 Full Analysis)
@@ -941,7 +895,7 @@ AIRFLOW_WWW_USER_PASSWORD=admin
 FYP/
 ├── README.md                     ← This file
 ├── .env                          ← API keys and configuration (not committed — create manually)
-├── docker-compose.yml            ← 6-service stack (PG, Qdrant, Neo4j, Airflow x3)
+├── docker-compose.yml            ← 5-service stack (PG, Neo4j, Airflow x3)
 ├── pyproject.toml                ← pytest configuration
 ├── conftest.py                   ← sys.path setup for pytest
 │
@@ -956,7 +910,7 @@ FYP/
 │
 ├── agents/
 │   ├── README.md                 ← Agent layer overview
-│   ├── business_analyst/         ← CRAG pipeline (deepseek-r1:8b, Qdrant + Neo4j + BM25)
+│   ├── business_analyst/         ← CRAG pipeline (deepseek-r1:8b, Neo4j + BM25 + web search)
 │   ├── quant_fundamental/        ← Deterministic factor engine (llama3.2, PostgreSQL only)
 │   ├── financial_modelling/      ← DCF + Comps + Technicals (deepseek-r1:8b, PostgreSQL)
 │   └── web_search/               ← Perplexity sonar-pro (live web)

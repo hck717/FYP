@@ -4,8 +4,7 @@ Pulls structured citations from all agent outputs and renders them
 into a numbered reference list that the summarizer appends to its narrative.
 
 Citation sources by agent:
-  business_analyst    → Qdrant vector chunks  (qdrant::TICKER::slug)
-                      → Neo4j graph chunks    (neo4j::TICKER::section::n)
+  business_analyst    → Neo4j graph chunks    (neo4j::TICKER::section::n)
                       → PostgreSQL sentiment  (postgresql:sentiment_trends)
   quant_fundamental   → PostgreSQL tables:   raw_fundamentals, raw_timeseries,
                                               market_eod_us, ratios_ttm, etc.
@@ -25,7 +24,6 @@ from typing import Any, Dict, List, Optional, Tuple
 # ── Human-readable database labels ────────────────────────────────────────────
 
 _DB_LABELS: Dict[str, str] = {
-    "qdrant":                       "Qdrant vector store (news/filings)",
     "neo4j":                        "Neo4j knowledge graph",
     "postgresql":                   "PostgreSQL",
     "postgresql:sentiment_trends":  "PostgreSQL · sentiment_trends table",
@@ -95,7 +93,6 @@ def _chunk_id_to_label(chunk_id: str, ticker: Optional[str] = None) -> Tuple[str
     """Parse a chunk_id string into (db, label, detail).
 
     Formats handled:
-      qdrant::AAPL::Apple_Reports_Record_Q  →  Qdrant, "Apple Reports Record Q", news
       neo4j::AAPL::risk_factors::0          →  Neo4j,  "Risk Factors (filing)",  AAPL
       neo4j::AAPL::mda::2                   →  Neo4j,  "MDA",                    AAPL
     """
@@ -106,17 +103,7 @@ def _chunk_id_to_label(chunk_id: str, ticker: Optional[str] = None) -> Tuple[str
     if len(parts) < 2:
         return "unknown", chunk_id, ""
 
-    backend = parts[0].lower()  # "qdrant" or "neo4j"
-
-    if backend == "qdrant":
-        # qdrant::TICKER::slug
-        tk     = parts[1] if len(parts) > 1 else (ticker or "")
-        slug   = parts[2] if len(parts) > 2 else ""
-        # Convert slug to readable title (underscores → spaces, trim to 60 chars)
-        title  = slug.replace("_", " ").replace("-", " ").strip()[:60]
-        label  = title or f"{tk} document"
-        detail = f"{tk} · Qdrant vector store"
-        return "qdrant", label, detail
+    backend = parts[0].lower()  # "neo4j"
 
     if backend == "neo4j":
         # neo4j::TICKER::section::n
@@ -131,8 +118,8 @@ def _chunk_id_to_label(chunk_id: str, ticker: Optional[str] = None) -> Tuple[str
 
 
 def _extract_inline_chunk_ids(text: str) -> List[str]:
-    """Find all [qdrant::...] and [neo4j::...] inline citation tokens in a string."""
-    return re.findall(r'\[(qdrant::[^\]]+|neo4j::[^\]]+)\]', text or "")
+    """Find all [neo4j::...] inline citation tokens in a string."""
+    return re.findall(r'\[(neo4j::[^\]]+)\]', text or "")
 
 
 def _walk_and_collect_chunk_ids(obj: Any, found: List[str]) -> None:
@@ -468,7 +455,7 @@ def build_citation_block(
 
 
 def inject_inline_numbers(text: str, chunk_id_map: Dict[str, Citation]) -> str:
-    """Replace [qdrant::...] and [neo4j::...] inline tokens with numeric refs [N].
+    """Replace [neo4j::...] inline tokens with numeric refs [N].
 
     If a token is not in the map (e.g. it was filtered as ungrounded), it is
     removed to keep the prose clean.
@@ -486,7 +473,7 @@ def inject_inline_numbers(text: str, chunk_id_map: Dict[str, Citation]) -> str:
                 return cit.ref()
         return ""  # strip unresolved token
 
-    return re.sub(r'\[(qdrant::[^\]]+|neo4j::[^\]]+)\]', _replace, text)
+    return re.sub(r'\[(neo4j::[^\]]+)\]', _replace, text)
 
 
 __all__ = ["Citation", "build_citation_block", "inject_inline_numbers"]
