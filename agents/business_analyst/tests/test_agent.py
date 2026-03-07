@@ -10,7 +10,7 @@ mocked so the suite runs entirely offline. Real logic under test:
 - JSON output schema completeness
 - web_search_fallback path merges results correctly
 - CLI smoke test (subprocess, no live services)
-- Tools unit: QdrantConnector, HybridRetriever, CRAGEvaluator, healthcheck
+ - Tools unit: Neo4jConnector, CRAGEvaluator, healthcheck
 
 Run with:
     pytest agents/business_analyst/tests/test_agent.py -v
@@ -63,7 +63,6 @@ from agents.business_analyst.tools import (
     BusinessAnalystToolkit,
     CRAGEvaluation,
     CRAGEvaluator,
-    HybridRetriever,
 )
 
 

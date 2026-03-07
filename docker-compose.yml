@@ -24,6 +24,9 @@ x-airflow-common:
     AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG: 4
     AIRFLOW__CORE__MAX_ACTIVE_RUNS_PER_DAG: 1
 
+    POSTGRES_HOST: postgres
+    POSTGRES_PORT: 5432
+
     # Airflow web user (for init)
     AIRFLOW_WWW_USER_USERNAME: admin
     AIRFLOW_WWW_USER_PASSWORD: admin

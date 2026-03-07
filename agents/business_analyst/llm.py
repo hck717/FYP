@@ -180,7 +180,6 @@ class LLMClient:
             "temperature": self.config.llm_temperature,
             "num_predict": self.config.llm_max_tokens,
             "stream": False,
-            "think": False,   # suppress <think> chain-of-thought blocks (deepseek-r1:8b)
         }
         resp = requests.post(
             f"{self.config.ollama_base_url}/api/generate",

@@ -7,11 +7,9 @@ Verifies:
   2. pgvector text_chunks — row counts, embedding dimension check
   3. Neo4j — chunk count, vector index status and dimension
 
-Usage (local):
-    POSTGRES_HOST=localhost python ingestion/etl/inspect_db.py
-
-Usage (in Airflow container):
-    python /opt/airflow/etl/inspect_db.py
+Automatically detects whether it runs inside Docker (uses the compose
+service hostnames) or on the host (defaults to localhost). Override the
+context with `INSPECT_DB_CONTEXT=host|docker` if necessary.
 """
 
 from __future__ import annotations
@@ -32,13 +30,40 @@ if _env_path.exists():
                 os.environ.setdefault(_k.strip(), _v.strip())
 
 # ── Config ─────────────────────────────────────────────────────────────────────
-PG_HOST     = os.getenv("POSTGRES_HOST",     "localhost")
+def _inspect_db_context() -> str:
+    override = os.getenv("INSPECT_DB_CONTEXT")
+    if override in ("host", "docker"):
+        return override
+    if Path("/.dockerenv").exists():
+        return "docker"
+    return "host"
+
+
+INSPECT_DB_CONTEXT = _inspect_db_context()
+IN_DOCKER = INSPECT_DB_CONTEXT == "docker"
+
+
+def _resolve_env_for_context(
+    key: str,
+    host_default: str,
+    docker_default: str,
+    docker_aliases: tuple[str, ...] = (",")
+) -> str:
+    value = os.getenv(key)
+    if IN_DOCKER:
+        return value or docker_default
+    if value and value not in docker_aliases:
+        return value
+    return host_default
+
+
+PG_HOST     = _resolve_env_for_context("POSTGRES_HOST", "localhost", "postgres", ("postgres",))
 PG_PORT     = int(os.getenv("POSTGRES_PORT", "5432"))
 PG_DB       = os.getenv("POSTGRES_DB",       "airflow")
 PG_USER     = os.getenv("POSTGRES_USER",     "airflow")
 PG_PASSWORD = os.getenv("POSTGRES_PASSWORD", "airflow")
 
-NEO4J_URI      = os.getenv("NEO4J_URI",      "bolt://localhost:7687")
+NEO4J_URI      = _resolve_env_for_context("NEO4J_URI", "bolt://localhost:7687", "bolt://neo4j:7687", ("bolt://neo4j:7687",))
 NEO4J_USER     = os.getenv("NEO4J_USER",     "neo4j")
 NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "SecureNeo4jPass2025!")
 

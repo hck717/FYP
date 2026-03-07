@@ -147,7 +147,7 @@ def _node_hybrid_retrieval(state: AgentState, toolkit: BusinessAnalystToolkit) -
 
 
 def _node_hybrid_rerank(state: AgentState, toolkit: BusinessAnalystToolkit) -> AgentState:
-    """Re-rank is already applied inside HybridRetriever.retrieve().
+    """Reranking is performed inside Neo4jConnector.vector_search().
 
     This node exists as an explicit graph step so the architecture matches
     the README diagram. It is a no-op at runtime — reranking happened in
@@ -180,9 +180,8 @@ def _node_generate_analysis(state: AgentState, llm: LLMClient) -> AgentState:
     chunks = retrieval.chunks if retrieval else []
     graph_facts = retrieval.graph_facts if retrieval else []
 
-    # Final ticker guard — even after HybridRetriever's post-merge filter a
-    # chunk may have slipped through with unknown/missing metadata (the helper
-    # lets those pass).  Re-apply here so the LLM context is guaranteed clean.
+    # Final ticker guard — Neo4j vector search may return chunks with
+    # unknown/missing metadata. Re-apply here so the LLM context is guaranteed clean.
     if ticker:
         before = len(chunks)
         from .tools import _chunk_ticker_matches
@@ -562,6 +561,12 @@ def _node_format_json_output(state: AgentState) -> AgentState:
                 else:
                     logger.debug("Removing ungrounded competitive_moat source: %s", src)
             competitive_moat = {**competitive_moat, "sources": grounded_sources}
+    
+    # Fallback: if LLM put moat analysis in qualitative_summary instead of competitive_moat
+    if not competitive_moat and qualitative_summary and not qualitative_summary.startswith("INSUFFICIENT_DATA"):
+        competitive_moat = {"narrative": qualitative_summary, "sources": [], "rating": "unknown"}
+    if not llm_output.get("qualitative_analysis") and qualitative_summary and not qualitative_summary.startswith("INSUFFICIENT_DATA"):
+        qualitative_analysis = {"narrative": qualitative_summary, "sentiment_signal": None, "strategic_implication": None, "data_quality_note": "Derived from qualitative_summary fallback"}
 
     output: Dict[str, Any] = {
         "agent": "business_analyst",

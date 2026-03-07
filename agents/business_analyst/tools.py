@@ -583,7 +583,7 @@ class PostgresConnector:
 
 
 # ----------------------------------------------------------------------------
-# pgvector connector — semantic search over text_chunks in PostgreSQL
+# Keyword scorer (BM25-lite)
 # ----------------------------------------------------------------------------
 class PgVectorConnector:
     """Semantic search over the text_chunks table using pgvector cosine similarity.
@@ -718,290 +718,6 @@ def _chunk_ticker_matches(chunk: "Chunk", ticker: str) -> bool:
     return True
 
 
-# ----------------------------------------------------------------------------
-# Hybrid retriever & evaluator
-# ----------------------------------------------------------------------------
-class HybridRetriever:
-    """Dense + sparse + graph retrieval with cross-encoder reranking.
-
-    Reranking weight mix:
-        final_score = BM25_WEIGHT * lexical + CE_WEIGHT * cross_encoder
-    where BM25_WEIGHT = 0.30 and CE_WEIGHT = 0.70 (mirrors README spec).
-
-    If sentence-transformers is unavailable or the model fails to load,
-    the reranker silently degrades to BM25-only scoring with a warning.
-
-    Retrieval sources:
-      1. Neo4j vector index (chunk_embedding, 768-dim cosine)
-      2. pgvector text_chunks table (768-dim cosine)
-    Results are merged and deduplicated by chunk_id before reranking.
-    """
-
-    BM25_WEIGHT: float = 0.30
-    CE_WEIGHT: float = 0.70
-
-    def __init__(
-        self,
-        config: BusinessAnalystConfig,
-        embedding_client: Any,
-        neo4j: Neo4jConnector,
-        pgvector: Optional["PgVectorConnector"] = None,
-    ) -> None:
-        self.config = config
-        self.embedding_client = embedding_client
-        self.neo4j = neo4j
-        self.pgvector = pgvector
-        # Deferred — loaded on first call to _cross_encoder_scores() to avoid
-        # the sentence_transformers / torch / sympy / mpmath import chain at startup
-        # (hangs on Python 3.14 during mpmath ctx_mp.py:init_builtins()).
-        self._cross_encoder = None
-        self._ce_load_attempted: bool = False
-
-    # ------------------------------------------------------------------
-    # Cross-encoder loader
-    # ------------------------------------------------------------------
-
-    def _load_cross_encoder(self):
-        """Load cross-encoder model; return None on any failure."""
-        import os as _os
-        import sys as _sys
-        CE = _get_cross_encoder_class()
-        if CE is None:
-            logger.warning("sentence-transformers not installed — reranker disabled, using BM25-only")
-            return None
-        try:
-            # Suppress verbose "LOAD REPORT" and tqdm progress bar by redirecting
-            # file descriptors 1 (stdout) and 2 (stderr) to /dev/null at the OS level.
-            # Python-level sys.stdout/stderr redirect is insufficient because
-            # sentence_transformers / tqdm write directly to the underlying fd.
-            _old_tqdm = _os.environ.get("TQDM_DISABLE")
-            _old_hf_offline = _os.environ.get("HF_HUB_OFFLINE")
-            _os.environ["TQDM_DISABLE"] = "1"
-            # Force local cache — prevents HuggingFace Hub remote fetch (which times out
-            # when the model is already cached locally).
-            _os.environ["HF_HUB_OFFLINE"] = "1"
-            _devnull_fd = _os.open(_os.devnull, _os.O_WRONLY)
-            _saved_stdout = _os.dup(1)
-            _saved_stderr = _os.dup(2)
-            _os.dup2(_devnull_fd, 1)
-            _os.dup2(_devnull_fd, 2)
-            _os.close(_devnull_fd)
-            try:
-                model = CE(self.config.reranker_model)
-            finally:
-                _os.dup2(_saved_stdout, 1)
-                _os.dup2(_saved_stderr, 2)
-                _os.close(_saved_stdout)
-                _os.close(_saved_stderr)
-                if _old_tqdm is None:
-                    _os.environ.pop("TQDM_DISABLE", None)
-                else:
-                    _os.environ["TQDM_DISABLE"] = _old_tqdm
-                if _old_hf_offline is None:
-                    _os.environ.pop("HF_HUB_OFFLINE", None)
-                else:
-                    _os.environ["HF_HUB_OFFLINE"] = _old_hf_offline
-            logger.info("Cross-encoder loaded: %s", self.config.reranker_model)
-            return model
-        except Exception as exc:
-            logger.warning("Cross-encoder load failed (%s) — falling back to BM25-only", exc)
-            return None
-
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
-
-    def retrieve(self, query: str, ticker: Optional[str]) -> RetrievalResult:
-        query_vector = self.embedding_client.embed(query)
-
-        # Source 1: Neo4j vector index
-        neo4j_chunks = self.neo4j.vector_search(query_vector, ticker, self.config.top_k)
-
-        # Source 2: pgvector text_chunks table (if available)
-        pgvec_chunks: List[Chunk] = []
-        if self.pgvector is not None:
-            try:
-                pgvec_chunks = self.pgvector.vector_search(
-                    query_vector, ticker, top_k=self.config.top_k
-                )
-            except Exception as exc:
-                logger.warning("[HybridRetriever] pgvector search failed: %s", exc)
-
-        # Merge: deduplicate by chunk_id, prefer higher score
-        seen: Dict[str, Chunk] = {}
-        for c in neo4j_chunks + pgvec_chunks:
-            if c.chunk_id not in seen or c.score > seen[c.chunk_id].score:
-                seen[c.chunk_id] = c
-        chunks = list(seen.values())
-
-        # Post-merge ticker guard
-        if ticker:
-            before = len(chunks)
-            chunks = [c for c in chunks if _chunk_ticker_matches(c, ticker)]
-            dropped = before - len(chunks)
-            if dropped:
-                logger.warning(
-                    "[HybridRetriever] Dropped %d cross-ticker chunk(s) for ticker=%s "
-                    "after post-merge filter.",
-                    dropped,
-                    ticker,
-                )
-
-        ranked, bm25_debug = self._rerank(query, chunks)
-        facts = self.neo4j.fetch_graph_facts(ticker, limit=25)
-        return RetrievalResult(chunks=ranked, graph_facts=facts, bm25_debug=bm25_debug)
-
-    # ------------------------------------------------------------------
-    # Reranking
-    # ------------------------------------------------------------------
-
-    def _rerank(self, query: str, chunks: List[Chunk]) -> Tuple[List[Chunk], Dict[str, float]]:
-        """Blend BM25 lexical score (30%) with cross-encoder score (70%).
-
-        Enhancements:
-          2B — Time-Decayed Contrastive RAG:
-               Apply exponential time-decay to base scores:
-               ``final_score = base_score * exp(-DECAY_LAMBDA * days_old)``
-               where DECAY_LAMBDA = 0.005 (≈ half-life ~139 days).
-               Chunks are tagged ``temporal_band = "recent"`` (≤30 days) or
-               ``"historical"`` (≥335 days) in metadata so the LLM context can
-               analyse the delta between the two windows.
-
-          2C — Dynamic Reranker Weighting:
-               If the query contains specific alphanumeric product/model strings
-               (e.g. "M2 Ultra", "H100", "RTX 4090") the CE weight shifts to 0.40
-               and BM25 to 0.60 — precise keyword matches matter more for product
-               queries than semantic proximity.
-
-        Falls back to dense + BM25 blend when cross-encoder is unavailable or
-        uniformly mis-calibrated (max CE score < 0.4).
-        Returns a (sorted_chunks, bm25_debug) tuple where bm25_debug maps
-        chunk_id → raw BM25 token-overlap score (before blending).
-        """
-        if not chunks:
-            return chunks, {}
-
-        # 2C: Detect product/model-specific query — shift weights to BM25-heavy
-        _PRODUCT_RE = _re_top.compile(
-            r"\b[A-Z][A-Za-z0-9]*\s*\d+\s*[A-Za-z]*\b"  # e.g. M2 Ultra, H100, RTX4090
-        )
-        is_product_query = bool(_PRODUCT_RE.search(query))
-        if is_product_query:
-            ce_w = 0.40
-            bm25_w = 0.60
-            logger.debug("_rerank: product query detected — CE=0.40 / BM25=0.60")
-        else:
-            ce_w = self.CE_WEIGHT   # 0.70
-            bm25_w = self.BM25_WEIGHT  # 0.30
-
-        # Snapshot the incoming dense scores before any modification
-        dense_scores = [float(min(1.0, c.score)) for c in chunks]
-        for i, chunk in enumerate(chunks):
-            chunk.score = dense_scores[i]
-
-        # 2B: Compute time-decay factor for each chunk
-        _DECAY_LAMBDA = 0.005  # half-life ≈ 139 days
-        _now = datetime.now(tz=timezone.utc)
-        time_decay_factors: List[float] = []
-        for chunk in chunks:
-            filing_date_raw = (chunk.metadata or {}).get("filing_date") or (chunk.metadata or {}).get("published_at")
-            days_old: float = 0.0
-            temporal_band: Optional[str] = None
-            if filing_date_raw:
-                try:
-                    if isinstance(filing_date_raw, str):
-                        # Parse ISO-8601 or YYYY-MM-DD
-                        for fmt in ("%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%d"):
-                            try:
-                                dt = datetime.strptime(filing_date_raw[:19], fmt[:len(filing_date_raw[:19])])
-                                if dt.tzinfo is None:
-                                    dt = dt.replace(tzinfo=timezone.utc)
-                                days_old = max(0.0, (_now - dt).days)
-                                break
-                            except ValueError:
-                                continue
-                    elif isinstance(filing_date_raw, (int, float)):
-                        # Unix timestamp
-                        dt = datetime.fromtimestamp(filing_date_raw, tz=timezone.utc)
-                        days_old = max(0.0, (_now - dt).days)
-                except Exception:
-                    pass
-            # Tag temporal band for contrastive analysis
-            if days_old <= 30:
-                temporal_band = "recent"
-            elif days_old >= 335:
-                temporal_band = "historical"
-            if temporal_band and chunk.metadata is not None:
-                chunk.metadata["temporal_band"] = temporal_band
-            decay = math.exp(-_DECAY_LAMBDA * days_old)
-            time_decay_factors.append(decay)
-
-        bm25_scores = [keyword_overlap_score(c.text, query) for c in chunks]
-
-        # Attempt cross-encoder scoring
-        ce_scores = self._cross_encoder_scores(query, chunks)
-
-        # Only use CE when scores are meaningful (max >= 0.4).
-        use_ce = ce_scores is not None and max(ce_scores) >= 0.4
-
-        for i, chunk in enumerate(chunks):
-            bm25 = bm25_scores[i]
-            decay = time_decay_factors[i]
-            if use_ce:
-                ce = ce_scores[i]  # type: ignore[index]
-                base = float(ce_w * ce + bm25_w * bm25)
-            else:
-                # Dense + BM25 fallback: 70% dense score + 30% BM25
-                base = float(0.7 * dense_scores[i] + 0.3 * bm25)
-            # Apply time-decay (2B)
-            chunk.score = float(min(1.0, base * decay))
-
-        if ce_scores is not None and not use_ce:
-            logger.debug(
-                "_rerank: CE max score %.3f < 0.4 — using dense+BM25 fallback "
-                "(cross-encoder mis-calibrated for this corpus/query)",
-                max(ce_scores),
-            )
-
-        sorted_chunks = sorted(chunks, key=lambda c: c.score, reverse=True)
-        bm25_debug: Dict[str, float] = {
-            chunks[i].chunk_id: round(bm25_scores[i], 4) for i in range(len(chunks))
-        }
-        return sorted_chunks, bm25_debug
-
-    def _cross_encoder_scores(
-        self, query: str, chunks: List[Chunk]
-    ) -> Optional[List[float]]:
-        """Return normalised [0,1] cross-encoder scores, or None on failure.
-
-        The cross-encoder model is loaded lazily on the first call to avoid
-        importing sentence_transformers / torch at toolkit construction time,
-        which hangs on Python 3.14 due to mpmath ctx_mp.py:init_builtins().
-        """
-        if self._cross_encoder is None and not self._ce_load_attempted:
-            self._ce_load_attempted = True
-            self._cross_encoder = self._load_cross_encoder()
-        if self._cross_encoder is None:
-            return None
-        import os as _os
-        try:
-            pairs = [(query, c.text) for c in chunks]
-            # Suppress tqdm progress bar printed to stderr during predict()
-            _old_tqdm = _os.environ.get("TQDM_DISABLE")
-            _os.environ["TQDM_DISABLE"] = "1"
-            try:
-                raw_scores: List[float] = self._cross_encoder.predict(pairs, show_progress_bar=False).tolist()  # type: ignore[union-attr]
-            finally:
-                if _old_tqdm is None:
-                    _os.environ.pop("TQDM_DISABLE", None)
-                else:
-                    _os.environ["TQDM_DISABLE"] = _old_tqdm
-            return _sigmoid_normalise(raw_scores)
-        except Exception as exc:
-            logger.warning("Cross-encoder predict failed: %s — using BM25-only", exc)
-            return None
-
-
 @dataclass
 class CRAGEvaluation:
     status: CRAGStatus
@@ -1056,7 +772,6 @@ class CRAGEvaluator:
 class BusinessAnalystToolkit:
     def __init__(self, config: Optional[BusinessAnalystConfig] = None) -> None:
         self.config = config or BusinessAnalystConfig()
-        # All embeddings use Ollama nomic-embed-text (768-dim).
         self.embedding = EmbeddingClient(
             self.config.ollama_base_url,
             self.config.embedding_model,
@@ -1064,13 +779,6 @@ class BusinessAnalystToolkit:
         )
         self.neo4j = Neo4jConnector(self.config)
         self.pg = PostgresConnector(self.config)
-        self.pgvector = PgVectorConnector(self.config)
-        self.retriever = HybridRetriever(
-            self.config,
-            self.embedding,
-            self.neo4j,
-            self.pgvector,
-        )
         self.evaluator = CRAGEvaluator(self.config)
 
     def fetch_company_overview(self, ticker: Optional[str]) -> Optional[Dict[str, Any]]:
@@ -1173,9 +881,11 @@ class BusinessAnalystToolkit:
 
     def retrieve(self, query: str, ticker: Optional[str]) -> RetrievalResult:
         try:
-            return self.retriever.retrieve(query, ticker)
+            vector = self.embedding.embed(query)
+            chunks = self.neo4j.vector_search(vector, ticker, top_k=self.config.top_k)
+            return RetrievalResult(chunks=chunks, graph_facts=[], bm25_debug={})
         except Exception as exc:
-            logger.error("Hybrid retrieval failed: %s", exc)
+            logger.error("Neo4j retrieval failed: %s", exc)
             return RetrievalResult(chunks=[], graph_facts=[], bm25_debug={})
 
     def evaluate(self, chunks: Sequence[Chunk], ticker: Optional[str] = None) -> CRAGEvaluation:
@@ -1218,8 +928,6 @@ class BusinessAnalystToolkit:
 __all__ = [
     "BusinessAnalystToolkit",
     "EmbeddingClient",
-    "PgVectorConnector",
-    "HybridRetriever",
     "CRAGEvaluator",
     "CRAGEvaluation",
     "Neo4jConnector",

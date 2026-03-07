@@ -90,11 +90,12 @@ def ensure_tables() -> None:
         id            SERIAL PRIMARY KEY,
         ticker_symbol TEXT      NOT NULL,
         data_name     TEXT      NOT NULL,
+        period_type   TEXT,
         as_of_date    DATE      NOT NULL,
         payload       JSONB     NOT NULL,
         source        TEXT      NOT NULL,
         ingested_at   TIMESTAMP DEFAULT NOW(),
-        UNIQUE (ticker_symbol, data_name, as_of_date, source)
+        UNIQUE (ticker_symbol, data_name, period_type, as_of_date, source)
     );
 
     -- Macro: bulk screener snapshot
@@ -169,7 +170,7 @@ def ensure_tables() -> None:
         price            NUMERIC,
         transaction_date DATE,
         ingested_at      TIMESTAMP DEFAULT NOW(),
-        UNIQUE (ticker, insider_name, transaction_date, transaction_type)
+        UNIQUE (ticker, insider_name, transaction_date, transaction_type, shares, price)
     );
     CREATE INDEX IF NOT EXISTS idx_insider_ticker_date
         ON insider_transactions (ticker, transaction_date DESC);
@@ -505,6 +506,16 @@ def ensure_tables() -> None:
 def _run_migrations() -> None:
     """Apply incremental schema migrations that are safe to re-run."""
     migrations = [
+        # 2026-03: raw_fundamentals - add period_type column for financial statements
+        # This allows quarterly and yearly data for the same date
+        "ALTER TABLE raw_fundamentals ADD COLUMN IF NOT EXISTS period_type TEXT",
+        # Drop old constraint and add new one with period_type
+        "ALTER TABLE raw_fundamentals DROP CONSTRAINT IF EXISTS raw_fundamentals_ticker_symbol_data_name_as_of_date_source_key",
+        "ALTER TABLE raw_fundamentals ADD UNIQUE (ticker_symbol, data_name, period_type, as_of_date, source)",
+        # 2026-03: insider_transactions - add shares and price to unique constraint
+        # This handles multiple transactions for same insider/date/type with different amounts
+        "ALTER TABLE insider_transactions DROP CONSTRAINT IF EXISTS insider_transactions_ticker_insider_name_transaction_date_transaction_type_key",
+        "ALTER TABLE insider_transactions ADD UNIQUE (ticker, insider_name, transaction_date, transaction_type, shares, price)",
         # 2025-Q4: corporate_bond_yields gained isin + extra fundamental columns.
         # Old schema only had: id, ticker, yield, maturity_date, ts_date, ingested_at
         "ALTER TABLE corporate_bond_yields ADD COLUMN IF NOT EXISTS isin TEXT",
@@ -586,7 +597,7 @@ def _safe_date(val) -> str | None:
     except Exception:
         pass
     s = str(val).strip()
-    if not s or s.lower() in ("nan", "none", "nat", "null", ""):
+    if not s or s.lower() in ("nan", "none", "nat", "null", "", "0000-00-00"):
         return None
     return s[:10]  # take YYYY-MM-DD portion
 
@@ -719,9 +730,8 @@ def _insert_insider_transactions(ticker_symbol: str, df: pd.DataFrame) -> int:
                 INSERT INTO insider_transactions
                     (ticker, insider_name, transaction_type, shares, price, transaction_date)
                 VALUES %s
-                ON CONFLICT (ticker, insider_name, transaction_date, transaction_type)
-                DO UPDATE SET shares = EXCLUDED.shares, price = EXCLUDED.price,
-                              ingested_at = NOW()
+                ON CONFLICT (ticker, insider_name, transaction_date, transaction_type, shares, price)
+                DO UPDATE SET ingested_at = NOW()
             """, rows)
         conn.commit()
     return len(rows)
@@ -1182,7 +1192,9 @@ def _insert_dataframe_generic(
     payload_cols = [c for c in df.columns if c != date_col]
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
-    rows = []
+    # Build separate row lists for timeseries vs fundamentals
+    rows_ts = []
+    rows_fund = []
     for _, row in df.iterrows():
         ts_val = str(row[date_col]) if date_col else now[:10]
         payload = {}
@@ -1191,21 +1203,29 @@ def _insert_dataframe_generic(
             if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
                 v = None
             payload[c] = v
-        rows.append((ticker_symbol, data_name, ts_val, json.dumps(payload), source, now))
+        # timeseries: 6 columns
+        rows_ts.append((ticker_symbol, data_name, ts_val, json.dumps(payload), source, now))
+        # fundamentals: 7 columns (with period_type = None)
+        rows_fund.append((ticker_symbol, data_name, None, ts_val, json.dumps(payload), source, now))
 
-    # Deduplicate within the batch
-    seen: dict = {}
-    for r in rows:
-        key = (r[0], r[1], r[2], r[4])
-        seen[key] = r
-    rows = list(seen.values())
+    # Deduplicate within each batch
+    def deduplicate(rows):
+        seen = {}
+        for r in rows:
+            key = tuple(r[:4]) + (r[5],)  # exclude payload and timestamp from key
+            if key not in seen:
+                seen[key] = r
+        return list(seen.values())
 
-    if not rows:
+    rows_ts = deduplicate(rows_ts)
+    rows_fund = deduplicate(rows_fund)
+
+    if not rows_ts and not rows_fund:
         return 0
 
     with get_pg_conn() as conn:
         with conn.cursor() as cur:
-            if date_col:
+            if date_col and rows_ts:
                 execute_values(cur, """
                     INSERT INTO raw_timeseries
                         (ticker_symbol, data_name, ts_date, payload, source, ingested_at)
@@ -1213,18 +1233,18 @@ def _insert_dataframe_generic(
                     ON CONFLICT (ticker_symbol, data_name, ts_date, source) DO UPDATE SET
                         payload     = EXCLUDED.payload,
                         ingested_at = EXCLUDED.ingested_at
-                """, rows)
-            else:
+                """, rows_ts)
+            if not date_col and rows_fund:
                 execute_values(cur, """
                     INSERT INTO raw_fundamentals
-                        (ticker_symbol, data_name, as_of_date, payload, source, ingested_at)
+                        (ticker_symbol, data_name, period_type, as_of_date, payload, source, ingested_at)
                     VALUES %s
-                    ON CONFLICT (ticker_symbol, data_name, as_of_date, source) DO UPDATE SET
+                    ON CONFLICT (ticker_symbol, data_name, period_type, as_of_date, source) DO UPDATE SET
                         payload     = EXCLUDED.payload,
                         ingested_at = EXCLUDED.ingested_at
-                """, rows)
+                """, rows_fund)
         conn.commit()
-    return len(rows)
+    return len(rows_ts) + len(rows_fund)
 
 
 def _insert_textual_documents(docs: list[dict]) -> int:
@@ -1279,15 +1299,22 @@ def _insert_economic_events(df: pd.DataFrame) -> int:
     if df.empty:
         return 0
     rows = []
+    seen = set()
     for _, row in df.iterrows():
         d = row.to_dict()
         ev_date = _safe_date(d.get("date") or d.get("event_date"))
         if not ev_date:
             continue
+        country = str(d.get("country") or "")[:10]
+        event = str(d.get("event") or d.get("event_name") or d.get("name") or "")
+        key = (ev_date, country, event)
+        if key in seen:
+            continue
+        seen.add(key)
         rows.append((
             ev_date,
-            str(d.get("country") or "")[:10],
-            str(d.get("event") or d.get("event_name") or d.get("name") or ""),
+            country,
+            event,
             _safe_numeric(d.get("actual")),
             _safe_numeric(d.get("forecast")),
             _safe_numeric(d.get("previous")),
@@ -1837,6 +1864,257 @@ def _insert_text_chunks_pg(
     return len(rows)
 
 
+def _populate_raw_fundamentals_from_statements(ticker_symbol: str) -> int:
+    ticker_dir = BASE_ETL_DIR / ticker_symbol
+    total = 0
+    today = date.today().isoformat()
+
+    # ── 1. Extract from financial_statements.json ──
+    fin_stmt_path = ticker_dir / "financial_statements.json"
+    if fin_stmt_path.exists():
+        try:
+            with open(fin_stmt_path) as f:
+                fin_data = json.load(f)
+            
+            financials = fin_data
+            
+            # Use a dict to deduplicate by (data_name, as_of_date)
+            # Key format: (data_name, period_date, period_type)
+            rows_dict = {}
+            
+            # Income Statement
+            income_stmt_q = financials.get("Income_Statement", {}).get("quarterly", {})
+            income_stmt_y = financials.get("Income_Statement", {}).get("yearly", {})
+            
+            for period_date, stmt in income_stmt_q.items():
+                if stmt:
+                    key = ("income_statement", "quarterly", period_date)
+                    rows_dict[key] = (
+                        ticker_symbol,
+                        "income_statement",
+                        "quarterly",
+                        _safe_date(period_date) or today,
+                        json.dumps({"period": period_date, "period_type": "quarterly", **stmt}),
+                        "eodhd",
+                    )
+            
+            for period_date, stmt in income_stmt_y.items():
+                if stmt:
+                    key = ("income_statement", "yearly", period_date)
+                    rows_dict[key] = (
+                        ticker_symbol,
+                        "income_statement",
+                        "yearly",
+                        _safe_date(period_date) or today,
+                        json.dumps({"period": period_date, "period_type": "yearly", **stmt}),
+                        "eodhd",
+                    )
+            
+            # Balance Sheet
+            balance_q = financials.get("Balance_Sheet", {}).get("quarterly", {})
+            balance_y = financials.get("Balance_Sheet", {}).get("yearly", {})
+            
+            for period_date, stmt in balance_q.items():
+                if stmt:
+                    key = ("balance_sheet", "quarterly", period_date)
+                    rows_dict[key] = (
+                        ticker_symbol,
+                        "balance_sheet",
+                        "quarterly",
+                        _safe_date(period_date) or today,
+                        json.dumps({"period": period_date, "period_type": "quarterly", **stmt}),
+                        "eodhd",
+                    )
+            
+            for period_date, stmt in balance_y.items():
+                if stmt:
+                    key = ("balance_sheet", "yearly", period_date)
+                    rows_dict[key] = (
+                        ticker_symbol,
+                        "balance_sheet",
+                        "yearly",
+                        _safe_date(period_date) or today,
+                        json.dumps({"period": period_date, "period_type": "yearly", **stmt}),
+                        "eodhd",
+                    )
+            
+            # Cash Flow
+            cashflow_q = financials.get("Cash_Flow", {}).get("quarterly", {})
+            cashflow_y = financials.get("Cash_Flow", {}).get("yearly", {})
+            
+            for period_date, stmt in cashflow_q.items():
+                if stmt:
+                    key = ("cash_flow", "quarterly", period_date)
+                    rows_dict[key] = (
+                        ticker_symbol,
+                        "cash_flow",
+                        "quarterly",
+                        _safe_date(period_date) or today,
+                        json.dumps({"period": period_date, "period_type": "quarterly", **stmt}),
+                        "eodhd",
+                    )
+            
+            for period_date, stmt in cashflow_y.items():
+                if stmt:
+                    key = ("cash_flow", "yearly", period_date)
+                    rows_dict[key] = (
+                        ticker_symbol,
+                        "cash_flow",
+                        "yearly",
+                        _safe_date(period_date) or today,
+                        json.dumps({"period": period_date, "period_type": "yearly", **stmt}),
+                        "eodhd",
+                    )
+            
+            # Use individual inserts instead of execute_values due to JSON handling issues
+            inserted = 0
+            if rows_dict:
+                try:
+                    with get_pg_conn() as conn:
+                        with conn.cursor() as cur:
+                            for k, v in rows_dict.items():
+                                ticker = v[0]
+                                data_name = v[1]
+                                period_type = v[2]
+                                as_of_date = v[3]
+                                payload = v[4]
+                                source = v[5]
+                                cur.execute("""
+                                    INSERT INTO raw_fundamentals
+                                        (ticker_symbol, data_name, period_type, as_of_date, payload, source)
+                                    VALUES (%s, %s, %s, %s, %s, %s)
+                                    ON CONFLICT (ticker_symbol, data_name, period_type, as_of_date, source) DO UPDATE SET
+                                        payload = EXCLUDED.payload,
+                                        ingested_at = NOW()
+                                """, (ticker, data_name, period_type, as_of_date, payload, source))
+                                inserted += 1
+                        conn.commit()
+                    total += inserted
+                    print(f"[PG raw_fundamentals] {ticker_symbol}: {inserted} statement rows upserted")
+                except Exception as stmt_exc:
+                    print(f"[PG raw_fundamentals] {ticker_symbol}/financial_statements: ERROR — {stmt_exc}")
+                    raise
+        
+        except Exception as exc:
+            print(f"[PG raw_fundamentals] {ticker_symbol}/financial_statements: ERROR — {exc}")
+    
+    # ── 2. Extract ratios/metrics from company_profile.json (unchanged) ──
+    ticker_dir = BASE_ETL_DIR / ticker_symbol
+    profile_path = ticker_dir / "company_profile.json"
+    if profile_path.exists():
+        try:
+            with open(profile_path) as f:
+                profile = json.load(f)
+            
+            highlights = profile.get("Highlights", {}) or {}
+            valuation = profile.get("Valuation", {}) or {}
+            general = profile.get("General", {}) or {}
+            
+            rows_metrics = []
+            as_of = _safe_date(general.get("UpdatedAt")) or today
+            
+            # financial_ratios: subset of Highlights
+            if highlights:
+                financial_ratios = {
+                    "PERatio": highlights.get("PERatio"),
+                    "PEGRatio": highlights.get("PEGRatio"),
+                    "ProfitMargin": highlights.get("ProfitMargin"),
+                    "OperatingMarginTTM": highlights.get("OperatingMarginTTM"),
+                    "ReturnOnAssetsTTM": highlights.get("ReturnOnAssetsTTM"),
+                    "ReturnOnEquityTTM": highlights.get("ReturnOnEquityTTM"),
+                    "DividendYield": highlights.get("DividendYield"),
+                }
+                rows_metrics.append((
+                    ticker_symbol,
+                    "financial_ratios",
+                    None,  # period_type - null for snapshot metrics
+                    as_of,
+                    json.dumps({k: v for k, v in financial_ratios.items() if v is not None}),
+                    "eodhd",
+                ))
+            
+            # ratios_ttm: merge Highlights + Valuation TTM fields
+            if highlights or valuation:
+                ratios_ttm = {
+                    **{k: v for k, v in highlights.items() if "TTM" in k or "Ratio" in k},
+                    **{k: v for k, v in valuation.items() if "TTM" in k or k.startswith("Price")},
+                }
+                if ratios_ttm:
+                    rows_metrics.append((
+                        ticker_symbol,
+                        "ratios_ttm",
+                        None,  # period_type
+                        as_of,
+                        json.dumps(ratios_ttm),
+                        "eodhd",
+                    ))
+            
+            # key_metrics_ttm: full Highlights section
+            if highlights:
+                rows_metrics.append((
+                    ticker_symbol,
+                    "key_metrics_ttm",
+                    None,  # period_type
+                    as_of,
+                    json.dumps(highlights),
+                    "eodhd",
+                ))
+            
+            # enterprise_values: Valuation section
+            if valuation:
+                rows_metrics.append((
+                    ticker_symbol,
+                    "enterprise_values",
+                    None,  # period_type
+                    as_of,
+                    json.dumps(valuation),
+                    "eodhd",
+                ))
+            
+            # financial_scores: placeholder
+            rows_metrics.append((
+                ticker_symbol,
+                "financial_scores",
+                None,  # period_type
+                as_of,
+                json.dumps({
+                    "piotroskiScore": None,
+                    "altmanZScore": None,
+                    "beneishMScore": None,
+                    "note": "Not available from EODHD"
+                }),
+                "eodhd",
+            ))
+            
+            if rows_metrics:
+                inserted = 0
+                try:
+                    with get_pg_conn() as conn:
+                        with conn.cursor() as cur:
+                            for row in rows_metrics:
+                                cur.execute("""
+                                    INSERT INTO raw_fundamentals
+                                        (ticker_symbol, data_name, period_type, as_of_date, payload, source)
+                                    VALUES (%s, %s, %s, %s, %s, %s)
+                                    ON CONFLICT (ticker_symbol, data_name, period_type, as_of_date, source) DO UPDATE SET
+                                        payload = EXCLUDED.payload,
+                                        ingested_at = NOW()
+                                """, row)
+                                inserted += 1
+                        conn.commit()
+                    total += inserted
+                    print(f"[PG raw_fundamentals] {ticker_symbol}: {inserted} metrics rows upserted")
+                except Exception as exc:
+                    print(f"[PG raw_fundamentals] {ticker_symbol}/company_profile: ERROR — {exc}")
+                    raise
+        
+        except Exception as exc:
+            print(f"[PG raw_fundamentals] {ticker_symbol}/company_profile: ERROR — {exc}")
+    
+    return total
+
+
+
 def load_postgres_for_ticker(ticker_symbol: str) -> int:
     ticker_dir    = BASE_ETL_DIR / ticker_symbol
     metadata_path = ticker_dir / "metadata.json"
@@ -1911,7 +2189,14 @@ def load_postgres_for_ticker(ticker_symbol: str) -> int:
         total += vm_n
     except Exception as exc:
         print(f"[PG Loader] {ticker_symbol}/valuation_from_profile: ERROR — {exc}")
+    # Populate raw_fundamentals with decomposed statement views
+    try:
+        rf_n = _populate_raw_fundamentals_from_statements(ticker_symbol)
+        total += rf_n
+    except Exception as exc:
+        print(f"[PG Loader] {ticker_symbol}/raw_fundamentals: ERROR — {exc}")
 
+        
     # Embed and upsert text chunks into pgvector text_chunks table
     profile_path = BASE_ETL_DIR / ticker_symbol / "company_profile.json"
     if profile_path.exists():
@@ -1927,8 +2212,8 @@ def load_postgres_for_ticker(ticker_symbol: str) -> int:
             total += chunk_n
         except Exception as exc:
             print(f"[PG Loader] {ticker_symbol}/text_chunks: WARNING — {exc}")
-
     return total
+
 
 
 # ── Macro loader ──────────────────────────────────────────────────────────────
@@ -2044,14 +2329,23 @@ def load_postgres_macro() -> int:
                     _pair = data_name.replace("forex_historical_rates_", "").upper()
                 n = _insert_forex_rates(df, pair_name=_pair)
             elif data_name == "etf_index_constituents":
-                # Store ETF/index constituents as raw_timeseries rows keyed by _GLOBAL
-                now_ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+                # Store ETF/index constituents as raw_timeseries rows keyed by SPY (the ETF ticker)
+                # Deduplicate by code to avoid duplicate key errors
                 rows_etf = []
-                for _, row in df.iterrows():
+                seen = set()
+                base_ts = datetime.utcnow()
+                for idx, (_, row) in enumerate(df.iterrows()):
                     d = row.to_dict()
+                    code = d.get("key") or d.get("Code") or d.get("ticker") or d.get("symbol") or ""
+                    if code in seen:
+                        continue
+                    seen.add(code)
                     payload = {k: (None if (isinstance(v, float) and math.isnan(v)) else v)
                                for k, v in d.items()}
-                    rows_etf.append(("_GLOBAL", "etf_index_constituents", now_ts, json.dumps(payload), "eodhd", now_ts))
+                    payload['_constituent_code'] = code
+                    # Use base timestamp + microsecond offset to ensure uniqueness
+                    ts = base_ts.replace(microsecond=base_ts.microsecond + idx * 1000)
+                    rows_etf.append(("SPY", "etf_index_constituents", ts, json.dumps(payload), "eodhd", ts))
                 if rows_etf:
                     with get_pg_conn() as conn:
                         with conn.cursor() as cur:
@@ -2060,7 +2354,7 @@ def load_postgres_macro() -> int:
                                     (ticker_symbol, data_name, ts_date, payload, source, ingested_at)
                                 VALUES %s
                                 ON CONFLICT (ticker_symbol, data_name, ts_date, source) DO UPDATE SET
-                                    payload     = EXCLUDED.payload,
+                                    payload = EXCLUDED.payload,
                                     ingested_at = NOW()
                             """, rows_etf)
                         conn.commit()
