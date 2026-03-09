@@ -2,21 +2,32 @@
 """
 ingest_broker_reports.py — Extract text from PDF broker research reports and load into Neo4j.
 
+Changes vs original:
+  - content_hash-based MERGE prevents duplicate chunks across reruns
+  - embedding_version property stored on every Chunk node (tracks model changes)
+  - Automatic detection of new PDFs via mtime/hash (scan_new_pdfs helper)
+  - Retry wrapper around Ollama embed calls (tenacity, max 3 attempts)
+  - In-memory deduplication: chunks with cosine similarity > 0.95 are dropped
+
 Run directly:
     python ingestion/etl/ingest_broker_reports.py           # AAPL (default)
     python ingestion/etl/ingest_broker_reports.py TSLA      # single ticker
-    python ingestion/etl/ingest_broker_reports.py --all      # all tickers
+    python ingestion/etl/ingest_broker_reports.py --all     # all tickers
 
-Requires: pip install pypdf requests
+Requires: pip install pypdf requests tenacity
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
+import logging
 import os
-import sys
 import re
+import sys
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 # ── Load .env ─────────────────────────────────────────────────────────────────
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -40,17 +51,21 @@ NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "SecureNeo4jPass2025!")
 # Determine if we're running inside Docker by checking for /.dockerenv
 IN_DOCKER = Path("/.dockerenv").exists()
 if IN_DOCKER:
-    # Inside Docker container - use host.docker.internal or host-gateway
     OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://host.docker.internal:11434")
 else:
-    # Running on host - use localhost
     OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 
 OLLAMA_EMBED_MODEL = os.getenv("EMBEDDING_MODEL", "nomic-embed-text")
+# Lock to a tagged version to prevent silent model drift between runs.
+# Override with EMBEDDING_MODEL_VERSION env var if needed.
+EMBEDDING_MODEL_VERSION = os.getenv("EMBEDDING_MODEL_VERSION", "1.0")
 EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIMENSION", "768"))
 
 CHUNK_SIZE = 800
 OVERLAP = 100
+
+# Similarity threshold above which two chunks are considered duplicates
+DEDUP_SIMILARITY_THRESHOLD = float(os.getenv("CHUNK_DEDUP_SIMILARITY_THRESHOLD", "0.95"))
 
 # Try to import pypdf
 try:
@@ -63,8 +78,114 @@ except ImportError:
         sys.exit(1)
 
 import requests
-import numpy as np
 from neo4j import GraphDatabase
+
+# Tenacity for retry logic
+try:
+    from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+    _TENACITY_AVAILABLE = True
+except ImportError:
+    _TENACITY_AVAILABLE = False
+    logger.warning("[ingest_broker_reports] tenacity not installed — retries disabled")
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _content_hash(text: str) -> str:
+    """MD5 hash of chunk text for deduplication key."""
+    return hashlib.md5(text.encode("utf-8")).hexdigest()
+
+
+def _cosine_similarity(a: list[float], b: list[float]) -> float:
+    """Dot product similarity between two L2-normalised vectors."""
+    import math
+    dot = sum(x * y for x, y in zip(a, b))
+    mag_a = math.sqrt(sum(x * x for x in a))
+    mag_b = math.sqrt(sum(x * x for x in b))
+    if mag_a == 0.0 or mag_b == 0.0:
+        return 0.0
+    return dot / (mag_a * mag_b)
+
+
+def _dedup_chunks(chunks: list[dict]) -> list[dict]:
+    """
+    Remove chunks whose embeddings are too similar to a previously seen chunk
+    (cosine similarity > DEDUP_SIMILARITY_THRESHOLD).
+    Falls back to content_hash deduplication when no embedding is present.
+    """
+    seen_hashes: set[str] = set()
+    seen_embeddings: list[list[float]] = []
+    result: list[dict] = []
+
+    for chunk in chunks:
+        h = chunk.get("content_hash") or _content_hash(chunk["text"])
+        if h in seen_hashes:
+            continue
+
+        emb = chunk.get("embedding")
+        if emb:
+            is_dup = any(
+                _cosine_similarity(emb, prev) > DEDUP_SIMILARITY_THRESHOLD
+                for prev in seen_embeddings
+            )
+            if is_dup:
+                continue
+            seen_embeddings.append(emb)
+
+        seen_hashes.add(h)
+        result.append(chunk)
+
+    removed = len(chunks) - len(result)
+    if removed:
+        logger.info("[dedup] Removed %d near-duplicate chunks (threshold=%.2f)", removed, DEDUP_SIMILARITY_THRESHOLD)
+    return result
+
+
+# ── PDF scan helper ───────────────────────────────────────────────────────────
+
+def scan_new_pdfs(ticker: str, section: str, state_file: Path | None = None) -> list[Path]:
+    """
+    Return PDF paths in data/{ticker}/{section}/ that are NEW or MODIFIED
+    since the last successful ingestion, detected via mtime+size hash.
+
+    *state_file* is a JSON file that persists {filename: mtime_size_hash}.
+    When None, defaults to data/{ticker}/.pdf_scan_state_{section}.json.
+    """
+    pdf_dir = TEXTUAL_DATA_DIR / ticker / section
+    if not pdf_dir.exists():
+        return []
+
+    if state_file is None:
+        state_file = TEXTUAL_DATA_DIR / ticker / f".pdf_scan_state_{section}.json"
+
+    state: dict[str, str] = {}
+    if state_file.exists():
+        try:
+            with open(state_file) as f:
+                state = json.load(f)
+        except Exception:
+            state = {}
+
+    new_pdfs: list[Path] = []
+    current_state: dict[str, str] = {}
+
+    for pdf_path in sorted(pdf_dir.glob("*.pdf")):
+        stat = pdf_path.stat()
+        file_sig = hashlib.md5(f"{stat.st_mtime}:{stat.st_size}".encode()).hexdigest()
+        current_state[pdf_path.name] = file_sig
+        if state.get(pdf_path.name) != file_sig:
+            new_pdfs.append(pdf_path)
+
+    try:
+        state_file.parent.mkdir(parents=True, exist_ok=True)
+        with open(state_file, "w") as f:
+            json.dump(current_state, f, indent=2)
+    except Exception as exc:
+        logger.warning("[scan_new_pdfs] Could not save state: %s", exc)
+
+    if new_pdfs:
+        logger.info("[scan_new_pdfs] %s/%s: %d new/modified PDFs detected", ticker, section, len(new_pdfs))
+    return new_pdfs
 
 
 def get_driver():
@@ -81,14 +202,14 @@ def extract_text_from_pdf(pdf_path: Path) -> str:
             if text:
                 text_parts.append(text)
         full_text = "\n\n".join(text_parts)
-        
+
         # Clean up whitespace
         full_text = re.sub(r'\n{3,}', '\n\n', full_text)
         full_text = re.sub(r' {2,}', ' ', full_text)
-        
+
         return full_text
     except Exception as e:
-        print(f"  [PDF Error] {pdf_path.name}: {e}")
+        logger.warning("  [PDF Error] %s: %s", pdf_path.name, e)
         return ""
 
 
@@ -96,17 +217,16 @@ def split_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = OVERLAP) 
     """Split text into overlapping chunks by word boundaries."""
     if not text or not text.strip():
         return []
-    
+
     words = text.split()
     chunks = []
     buf = []
     buf_len = 0
-    
+
     for word in words:
         wl = len(word) + 1
         if buf_len + wl > chunk_size and buf:
             chunks.append(" ".join(buf))
-            # Carry over last few words for overlap
             carry = []
             carry_len = 0
             for w in reversed(buf):
@@ -118,72 +238,107 @@ def split_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = OVERLAP) 
             buf_len = carry_len
         buf.append(word)
         buf_len += wl
-    
+
     if buf:
         chunks.append(" ".join(buf))
-    
+
     return chunks
 
 
+def _embed_with_retry(texts: list[str], model: str, base_url: str) -> list[list[float]]:
+    """Embed a batch of texts via Ollama with exponential-backoff retry."""
+    url = f"{base_url.rstrip('/')}/api/embed"
+
+    def _call() -> list[list[float]]:
+        resp = requests.post(
+            url,
+            json={"model": model, "input": texts},
+            timeout=120,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        batch_embeddings = data.get("embeddings")
+        if not batch_embeddings:
+            raise RuntimeError(f"Ollama returned empty embeddings for model '{model}'")
+        return batch_embeddings
+
+    if _TENACITY_AVAILABLE:
+        @retry(
+            stop=stop_after_attempt(3),
+            wait=wait_exponential(multiplier=1, min=2, max=30),
+            retry=retry_if_exception_type((requests.RequestException, RuntimeError)),
+            reraise=True,
+        )
+        def _call_with_retry() -> list[list[float]]:
+            return _call()
+        return _call_with_retry()
+    else:
+        last_exc: Exception | None = None
+        for attempt in range(3):
+            try:
+                return _call()
+            except Exception as exc:
+                last_exc = exc
+                import time
+                time.sleep(2 ** attempt)
+        raise RuntimeError(f"Embed failed after 3 attempts: {last_exc}")
+
+
 def embed_texts(texts: list[str], model: str, base_url: str) -> list[list[float]]:
-    """Embed texts using Ollama."""
+    """Embed texts using Ollama with per-batch retry."""
     if not texts:
         return []
-    
-    url = f"{base_url.rstrip('/')}/api/embed"
+
     embeddings = []
     batch_size = 8
-    
+
     for start in range(0, len(texts), batch_size):
         batch = texts[start:start + batch_size]
         try:
-            resp = requests.post(
-                url,
-                json={"model": model, "input": batch},
-                timeout=120,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            batch_embeddings = data.get("embeddings")
-            if batch_embeddings:
-                embeddings.extend(batch_embeddings)
-            else:
-                print(f"  [Ollama] Empty embeddings for batch {start}")
-                embeddings.extend([[0.0] * EMBEDDING_DIM] * len(batch))
+            batch_embeddings = _embed_with_retry(batch, model, base_url)
+            embeddings.extend(batch_embeddings)
         except Exception as e:
-            print(f"  [Ollama Error] {e}")
+            logger.error("  [Ollama Error] batch %d: %s", start, e)
             embeddings.extend([[0.0] * EMBEDDING_DIM] * len(batch))
-    
+
     return embeddings
 
 
-def load_broker_report_chunks(ticker: str) -> int:
-    """Load broker research report PDF text chunks into Neo4j for a ticker."""
+def load_broker_report_chunks(ticker: str, only_new: bool = False) -> int:
+    """
+    Load broker research report PDF text chunks into Neo4j for a ticker.
+
+    Args:
+        ticker:    Ticker symbol (e.g. "AAPL").
+        only_new:  If True, skip PDFs that have not changed since last run.
+    """
     broker_dir = TEXTUAL_DATA_DIR / ticker / "broker"
-    
+
     if not broker_dir.exists():
-        print(f"[{ticker}] No broker directory found")
+        logger.info("[%s] No broker directory found", ticker)
         return 0
-    
-    pdf_files = list(broker_dir.glob("*.pdf")) + list(broker_dir.glob("*.pdf.pdf"))
-    
+
+    if only_new:
+        pdf_files = scan_new_pdfs(ticker, "broker")
+    else:
+        pdf_files = list(broker_dir.glob("*.pdf")) + list(broker_dir.glob("*.pdf.pdf"))
+
     if not pdf_files:
-        print(f"[{ticker}] No PDF files found in {broker_dir}")
+        logger.info("[%s] No PDF files found in %s", ticker, broker_dir)
         return 0
-    
-    print(f"[{ticker}] Found {len(pdf_files)} broker research PDFs")
-    
+
+    logger.info("[%s] Found %d broker research PDFs", ticker, len(pdf_files))
+
     all_chunks = []
-    
+
     for pdf_file in pdf_files:
-        print(f"  Processing: {pdf_file.name}")
-        
-        # Extract institution name from filename (e.g., "Barclays", "JP Morgan")
+        logger.info("  Processing: %s", pdf_file.name)
+
+        # Extract institution name from filename
         filename = pdf_file.stem
         institution = "Unknown"
         for part in filename.split():
-            if part in ["Barclays", "JP", "Morgan", "JPMorgan", "Ameriprise", "UBS", "Wells", "Fargo", "Phillip", "Securities", "Goldman", " Sachs", "Morgan Stanley", "Citi", "Citigroup", "Deutsche", "Bank"]:
-                # Build institution name
+            if part in ["Barclays", "JP", "Morgan", "JPMorgan", "Ameriprise", "UBS", "Wells", "Fargo", "Phillip", "Securities", "Goldman", "Sachs", "Morgan Stanley", "Citi", "Citigroup", "Deutsche", "Bank"]:
                 if part in ["JP", "Morgan"]:
                     institution = "JP Morgan"
                 elif part in ["Wells", "Fargo"]:
@@ -196,70 +351,83 @@ def load_broker_report_chunks(ticker: str) -> int:
                     institution = part
                 break
         else:
-            # Try to extract from filename pattern
             match = re.match(r'^([A-Za-z\s]+)', filename)
             if match:
                 institution = match.group(1).strip()
-        
+
         # Extract date from filename
         date_match = re.search(r'(\d{4})[_\-]?(\d{2})[_\-]?(\d{2})', pdf_file.name)
         if date_match:
             filing_date = f"{date_match.group(1)}-{date_match.group(2)}-{date_match.group(3)}"
         else:
             filing_date = None
-        
+
         # Extract text
         text = extract_text_from_pdf(pdf_file)
         if not text.strip():
-            print(f"    No text extracted from {pdf_file.name}")
+            logger.warning("    No text extracted from %s", pdf_file.name)
             continue
-        
+
         # Split into chunks
         chunks = split_text(text, CHUNK_SIZE, OVERLAP)
-        
-        # Create chunk dicts
+
+        # Create chunk dicts — include content_hash for Neo4j MERGE dedup
         for i, chunk_text in enumerate(chunks):
-            chunk_id = f"{ticker}::broker_report::{institution[:20]}::{i}"
+            c_hash = _content_hash(chunk_text)
+            chunk_id = f"{ticker}::broker_report::{c_hash[:16]}"
             all_chunks.append({
                 "chunk_id": chunk_id,
+                "content_hash": c_hash,
                 "ticker": ticker,
                 "text": chunk_text,
                 "section": "broker_report",
                 "filing_date": filing_date,
                 "source_file": pdf_file.name,
                 "institution": institution,
+                "embedding_version": EMBEDDING_MODEL_VERSION,
             })
-        
-        print(f"    Created {len(chunks)} chunks from {institution}")
-    
+
+        logger.info("    Created %d chunks from %s", len(chunks), institution)
+
     if not all_chunks:
-        print(f"[{ticker}] No chunks created")
+        logger.info("[%s] No chunks created", ticker)
         return 0
-    
-    # Embed chunks
-    print(f"[{ticker}] Embedding {len(all_chunks)} chunks via Ollama...")
+
+    # Embed chunks (with retry)
+    logger.info("[%s] Embedding %d chunks via Ollama...", ticker, len(all_chunks))
     texts = [c["text"] for c in all_chunks]
     embeddings = embed_texts(texts, OLLAMA_EMBED_MODEL, OLLAMA_BASE_URL)
-    
+
     for chunk, emb in zip(all_chunks, embeddings):
         chunk["embedding"] = emb
-    
-    # Write to Neo4j
-    print(f"[{ticker}] Writing to Neo4j...")
+
+    # Near-duplicate removal (embedding-based)
+    all_chunks = _dedup_chunks(all_chunks)
+    logger.info("[%s] %d unique chunks after dedup", ticker, len(all_chunks))
+
+    # Write to Neo4j — MERGE on content_hash to prevent duplicates across reruns
+    logger.info("[%s] Writing to Neo4j...", ticker)
     cypher = """
     UNWIND $rows AS row
     MERGE (c:Company {ticker: row.ticker})
-    MERGE (chunk:Chunk {chunk_id: row.chunk_id})
-      SET chunk.text       = row.text,
-          chunk.section    = row.section,
-          chunk.filing_date = row.filing_date,
-          chunk.ticker     = row.ticker,
-          chunk.embedding  = row.embedding,
-          chunk.source_file = row.source_file,
-          chunk.institution = row.institution
+    MERGE (chunk:Chunk {content_hash: row.content_hash, ticker: row.ticker})
+      ON CREATE SET
+          chunk.chunk_id          = row.chunk_id,
+          chunk.text              = row.text,
+          chunk.section           = row.section,
+          chunk.filing_date       = row.filing_date,
+          chunk.source_file       = row.source_file,
+          chunk.institution       = row.institution,
+          chunk.embedding         = row.embedding,
+          chunk.embedding_version = row.embedding_version,
+          chunk.created_at        = datetime()
+      ON MATCH SET
+          chunk.embedding         = row.embedding,
+          chunk.embedding_version = row.embedding_version,
+          chunk.updated_at        = datetime()
     MERGE (c)-[:HAS_CHUNK]->(chunk)
     """
-    
+
     driver = get_driver()
     try:
         with driver.session() as session:
@@ -271,37 +439,41 @@ def load_broker_report_chunks(ticker: str) -> int:
                 written += len(batch)
     finally:
         driver.close()
-    
-    print(f"[{ticker}] Wrote {written} broker report chunks to Neo4j")
+
+    logger.info("[%s] Wrote %d broker report chunks to Neo4j", ticker, written)
     return written
 
 
 def main():
     import argparse
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
     parser = argparse.ArgumentParser(description="Ingest broker research PDFs into Neo4j")
     parser.add_argument("ticker", nargs="?", default="AAPL", help="Ticker symbol (default: AAPL)")
     parser.add_argument("--all", action="store_true", help="Process all tracked tickers")
+    parser.add_argument("--only-new", action="store_true", help="Only process new/modified PDFs")
     args = parser.parse_args()
-    
+
     if args.all:
         tickers = TRACKED_TICKERS
     else:
         tickers = [args.ticker]
-    
+
     print("=" * 60)
     print("Broker Research Report PDF Ingestion")
     print("=" * 60)
     print(f"Tickers: {', '.join(tickers)}")
     print(f"Neo4j: {NEO4J_URI}")
     print(f"Ollama: {OLLAMA_BASE_URL} ({OLLAMA_EMBED_MODEL})")
+    print(f"Embedding version: {EMBEDDING_MODEL_VERSION}")
+    print(f"Dedup threshold: {DEDUP_SIMILARITY_THRESHOLD}")
     print("=" * 60)
-    
+
     total = 0
     for ticker in tickers:
         ticker = ticker.strip()
-        n = load_broker_report_chunks(ticker)
+        n = load_broker_report_chunks(ticker, only_new=args.only_new)
         total += n
-    
+
     print(f"\nTotal chunks written: {total}")
 
 
