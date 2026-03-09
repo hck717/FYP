@@ -20,89 +20,84 @@
 ## Pipeline Architecture
 
 ```
-For each agent × ticker:
+For each ticker:
 
   [scrape_*] ──┬──► [load_postgres_*]
-               ├──► [load_neo4j_*]      ──► [eodhd_generate_summary]
-               └──► [load_qdrant_*]
+               ├──► [load_neo4j_*]
+               ├──► [textual_load_earnings_calls_*]
+               └──► [textual_load_broker_reports_*] ──► [eodhd_generate_summary]
 ```
 
-Scrape and load tasks run **per-agent per-ticker** in parallel. All load tasks fan into a single summary task at the end.
+Scrape and load tasks run **per-ticker** in parallel. All load tasks fan into a single summary task at the end.
 
 ---
 
-## Agents & Data Collected
+## Tasks
 
-### 1. `business_analyst`
+### 1. Scrape Tasks
+- `eodhd_scrape_{TICKER}` — Fetches data from EODHD API and saves to `agent_data/`
 
-Focused on qualitative and sentiment data for news-based analysis.
+### 2. Load Tasks
+- `eodhd_load_postgres_{TICKER}` — Upserts data into PostgreSQL
+- `eodhd_load_neo4j_{TICKER}` — Creates Company nodes and relationships in Neo4j
+- `textual_load_earnings_calls_{TICKER}` — Ingests PDF earnings calls into Neo4j chunks
+- `textual_load_broker_reports_{TICKER}` — Ingests PDF broker reports into Neo4j chunks
 
-| Dataset | EODHD Endpoint | Records | Destination |
-|---|---|---|---|
-| `financial_news` | `/news` | 100 articles | Qdrant (vector) |
-| `sentiment_trends` | `/sentiments` | 1 snapshot | Qdrant (vector) |
-| `company_profile` | `/fundamentals/{ticker}` | 1 profile | Neo4j (graph) |
+### 3. Macro Tasks
+- `eodhd_load_postgres_macro` — Loads macro data (treasury, forex, GDP, etc.)
+- `eodhd_load_neo4j_macro` — Creates macro relationships in Neo4j
 
----
-
-### 2. `quantitative_fundamental`
-
-High-frequency price and technical data for quantitative models.
-
-| Dataset | EODHD Endpoint | Frequency / Window | Destination |
-|---|---|---|---|
-| `realtime_quote` | `/real-time/{ticker}` | Latest snapshot | PostgreSQL |
-| `live_stock_price` | `/real-time/{ticker}` | Latest snapshot | PostgreSQL |
-| `historical_prices_eod` | `/eod/{ticker}` | Last 30 days (daily) | PostgreSQL |
-| `intraday_1m` | `/intraday/{ticker}` | 1-minute bars (full history) | PostgreSQL |
-| `intraday_5m` | `/intraday/{ticker}` | 5-minute bars | PostgreSQL |
-| `intraday_15m` | `/intraday/{ticker}` | 15-minute bars | PostgreSQL |
-| `intraday_1h` | `/intraday/{ticker}` | 1-hour bars | PostgreSQL |
-| `fundamentals` | `/fundamentals/{ticker}` | Full nested JSON | PostgreSQL |
-| `technical_sma` | `/technical/{ticker}` | SMA-50, full history | PostgreSQL |
-| `technical_ema` | `/technical/{ticker}` | EMA-20, full history | PostgreSQL |
-
-> **Note:** `fundamentals` is saved as JSON only — its deeply nested structure (`General`, `Financials` keys) cannot be auto-flattened to CSV.
+### 4. Summary Task
+- `eodhd_generate_summary` — Generates ingestion summary report
 
 ---
 
-### 3. `financial_modeling`
+## Data Collected
 
-Long-term price history, corporate actions, and macro calendars for financial modeling.
+### PostgreSQL Tables
 
-| Dataset | EODHD Endpoint | Window | Destination |
-|---|---|---|---|
-| `historical_prices_weekly` | `/eod/{ticker}?period=w` | Last 365 days | PostgreSQL |
-| `historical_prices_monthly` | `/eod/{ticker}?period=m` | Last 730 days | PostgreSQL |
-| `dividends_history` | `/div/{ticker}` | Full history | PostgreSQL |
-| `splits_history` | `/splits/{ticker}` | Full history | PostgreSQL |
-| `earnings_history` | `/calendar/earnings` | Per ticker | PostgreSQL |
-| `fundamentals_full` | `/fundamentals/{ticker}` | Full snapshot | PostgreSQL |
-| `analyst_estimates_eodhd` | `/fundamentals/{ticker}` | Full snapshot | PostgreSQL |
-| `economic_calendar` | `/economic-events` | Last 30 days | PostgreSQL (global table) |
-| `ipo_calendar` | `/calendar/ipos` | Last 365 days | PostgreSQL (global table) |
-| `bulk_eod_us` | `/eod-bulk-last-day/US` | All US equities, last day | PostgreSQL (global table) |
-
-> **Global datasets** (`bulk_eod_us`, `economic_calendar`, `ipo_calendar`) are stored once per day in shared tables (`market_eod_us`, `global_economic_calendar`, `global_ipo_calendar`) — not duplicated per ticker.
-
----
-
-## Storage Destinations
-
-| Destination | Table(s) | Used For |
+| Dataset | Description | Records |
 |---|---|---|
-| **PostgreSQL** | `raw_timeseries`, `raw_fundamentals`, `market_eod_us`, `global_economic_calendar`, `global_ipo_calendar` | Quantitative & financial modeling data |
-| **Neo4j** | Company nodes & relationships | Company profiles, graph relationships |
-| **Qdrant** | Vector collections (prepared) | News embeddings, sentiment for RAG |
+| `raw_timeseries` | Historical OHLCV data | ~870K rows |
+| `financial_statements` | Balance sheet, income, cash flow | ~2,200 rows |
+| `sentiment_trends` | Bullish/bearish/neutral % | 165 rows |
+| `valuation_metrics` | PE, PB, PS ratios | 10 rows |
+| `insider_transactions` | Insider buying/selling | ~1,700 rows |
+| `institutional_holders` | 13F holdings | 243 rows |
+| `earnings_surprises` | EPS actuals vs estimates | 521 rows |
+| `text_chunks` | pgvector embeddings | 48 chunks |
+
+### Neo4j Nodes
+
+| Node Type | Description | Count |
+|---|---|---|
+| `:Company` | Company with 85+ properties | 51 nodes |
+| `:Chunk` | Text chunks for RAG | 1,829 chunks |
+
+### Chunk Breakdown
+
+| Ticker | earnings_call | broker_report | other | Total |
+|---|---|---|---|---|
+| AAPL | 131 | 400 | 13 | 544 |
+| TSLA | 130 | 158 | 13 | 301 |
+| NVDA | 137 | 96 | 12 | 245 |
+| MSFT | 138 | 73 | 13 | 224 |
+| GOOGL | 142 | 361 | 12 | 515 |
 
 ---
 
-## Deduplication & Change Detection
+## Running DAG Tasks Manually
 
-- Each dataset is **MD5-hashed** on scrape. If the hash matches the previous run, the dataset is skipped (no re-write, no re-insert).
-- PostgreSQL inserts use `ON CONFLICT ... DO UPDATE` — safe to re-run without duplicating rows.
-- Unix integer timestamps from intraday/realtime endpoints are automatically converted to `TIMESTAMP` before insert.
-- Global datasets check `ingested_at::date = CURRENT_DATE` before inserting — loaded only once per day.
+```bash
+# Test individual tasks
+docker exec fyp-airflow-scheduler airflow tasks test eodhd_complete_ingestion eodhd_scrape_AAPL 2026-03-07
+docker exec fyp-airflow-scheduler airflow tasks test eodhd_complete_ingestion eodhd_load_postgres_AAPL 2026-03-07
+docker exec fyp-airflow-scheduler airflow tasks test eodhd_complete_ingestion eodhd_load_neo4j_AAPL 2026-03-07
+
+# Test textual ingestion
+docker exec fyp-airflow-scheduler airflow tasks test eodhd_complete_ingestion textual_load_earnings_calls_AAPL 2026-03-07
+docker exec fyp-airflow-scheduler airflow tasks test eodhd_complete_ingestion textual_load_broker_reports_AAPL 2026-03-07
+```
 
 ---
 
@@ -110,31 +105,14 @@ Long-term price history, corporate actions, and macro calendars for financial mo
 
 | Variable | Description | Default |
 |---|---|---|
-| `EODHD_API_KEY` | EODHD API key | *(required)* |
-| `TRACKED_TICKERS` | Comma-separated ticker list | `AAPL` |
-| `EODHD_RATE_LIMIT` | API calls per minute | `1000` |
-| `POSTGRES_HOST` | PostgreSQL host | `fyp-postgres` |
-| `POSTGRES_PORT` | PostgreSQL port | `5432` |
-| `POSTGRES_DB` | PostgreSQL database | `airflow` |
-| `POSTGRES_USER` | PostgreSQL user | `airflow` |
-| `POSTGRES_PASSWORD` | PostgreSQL password | `airflow` |
+| `TRACKED_TICKERS` | Comma-separated tickers | `AAPL,GOOGL,MSFT,NVDA,TSLA` |
+| `EODHD_API_KEY` | EODHD API key | Required |
+| `OLLAMA_BASE_URL` | Ollama API URL | `http://host.docker.internal:11434` |
 
 ---
 
-## Triggering Manually
+## Notes
 
-```bash
-# Unpause and trigger
-docker exec fyp-airflow-scheduler airflow dags unpause eodhd_complete_ingestion
-docker exec fyp-airflow-scheduler airflow dags trigger eodhd_complete_ingestion
-
-# Check task states
-docker exec fyp-airflow-scheduler airflow tasks states-for-dag-run \
-  eodhd_complete_ingestion <run_id>
-
-# Test a single task
-docker exec fyp-airflow-scheduler airflow tasks test \
-  eodhd_complete_ingestion \
-  eodhd_load_postgres_quantitative_fundamental_AAPL \
-  2026-02-24
-```
+- **Textual Data**: Earnings calls and broker reports are stored in `data/textual data/` and ingested separately
+- **No Timeout**: Text embedding uses Ollama with no timeout
+- **Cross-Platform**: Uses `host.docker.internal` for Docker containers to access host Ollama

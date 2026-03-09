@@ -52,8 +52,13 @@ PG_USER     = os.getenv("POSTGRES_USER",     "airflow")
 PG_PASSWORD = os.getenv("POSTGRES_PASSWORD", "airflow")
 
 # Ollama embedding config (for pgvector text_chunks)
-OLLAMA_BASE_URL    = os.getenv("OLLAMA_BASE_URL",  "http://localhost:11434")
-OLLAMA_EMBED_MODEL = os.getenv("EMBEDDING_MODEL",  "nomic-embed-text")
+# Determine if we're running inside Docker
+_IN_DOCKER = Path("/.dockerenv").exists()
+if _IN_DOCKER:
+    OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://host.docker.internal:11434")
+else:
+    OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+OLLAMA_EMBED_MODEL = os.getenv("EMBEDDING_MODEL", "nomic-embed-text")
 
 _MACRO_TICKER = "_MACRO"
 

@@ -47,8 +47,11 @@ class QuantFundamentalConfig:
     llm_max_tokens: int = field(
         default_factory=lambda: int(os.getenv("QUANT_LLM_MAX_TOKENS", "4096"))
     )
+    # Determine Ollama URL based on environment
+    _in_docker = Path("/.dockerenv").exists()
+    _default_ollama = "http://host.docker.internal:11434" if _in_docker else "http://localhost:11434"
     ollama_base_url: str = field(
-        default_factory=lambda: os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+        default_factory=lambda: os.getenv("OLLAMA_BASE_URL", _default_ollama)
     )
     # No hard cap by default — quality over speed.
     # Set QUANT_REQUEST_TIMEOUT=<seconds> env var to add a cap if needed.

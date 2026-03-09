@@ -50,6 +50,7 @@ from __future__ import annotations
 import logging
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import requests
@@ -65,7 +66,10 @@ _PG_PORT        = int(os.getenv("POSTGRES_PORT",     "5432"))
 _PG_DB          = os.getenv("POSTGRES_DB",           "airflow")
 _PG_USER        = os.getenv("POSTGRES_USER",         "airflow")
 _PG_PASS        = os.getenv("POSTGRES_PASSWORD",     "airflow")
-_OLLAMA_URL     = os.getenv("OLLAMA_BASE_URL",       "http://localhost:11434")
+# Determine Ollama URL based on environment
+_IN_DOCKER = Path("/.dockerenv").exists()
+_DEFAULT_OLLAMA = "http://host.docker.internal:11434" if _IN_DOCKER else "http://localhost:11434"
+_OLLAMA_URL     = os.getenv("OLLAMA_BASE_URL",       _DEFAULT_OLLAMA)
 _LLM_MODEL      = os.getenv("LLM_MODEL_BUSINESS_ANALYST", "deepseek-r1:8b")
 _EMBED_MODEL    = os.getenv("EMBEDDING_MODEL",       "all-MiniLM-L6-v2")
 

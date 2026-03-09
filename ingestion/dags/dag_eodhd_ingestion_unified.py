@@ -695,12 +695,55 @@ with DAG(
         execution_timeout=timedelta(minutes=2),
     )
 
+    # Textual document ingestion tasks (earnings calls and broker reports)
+    # These require the textual data to be present in /opt/airflow/data/
+    def load_textual_earnings_calls(ticker_symbol: str):
+        """Wrapper to call earnings call ingestion."""
+        import sys
+        sys.path.insert(0, "/opt/airflow/ingestion/etl")
+        from ingest_earnings_calls import load_earnings_call_chunks
+        # Map ticker symbol to full ticker (e.g., AAPL.US -> AAPL)
+        ticker = ticker_symbol.replace(".US", "")
+        return load_earnings_call_chunks(ticker)
+
+    def load_textual_broker_reports(ticker_symbol: str):
+        """Wrapper to call broker report ingestion."""
+        import sys
+        sys.path.insert(0, "/opt/airflow/ingestion/etl")
+        from ingest_broker_reports import load_broker_report_chunks
+        # Map ticker symbol to full ticker (e.g., AAPL.US -> AAPL)
+        ticker = ticker_symbol.replace(".US", "")
+        return load_broker_report_chunks(ticker)
+
+    # Create textual ingestion tasks for each ticker
+    earnings_call_tasks: dict[str, PythonOperator] = {}
+    broker_report_tasks: dict[str, PythonOperator] = {}
+
+    for _symbol in TICKER_SYMBOLS:
+        earnings_call_tasks[_symbol] = PythonOperator(
+            task_id=f"textual_load_earnings_calls_{_symbol}",
+            python_callable=load_textual_earnings_calls,
+            op_kwargs={"ticker_symbol": _symbol},
+            execution_timeout=timedelta(minutes=10),
+        )
+        broker_report_tasks[_symbol] = PythonOperator(
+            task_id=f"textual_load_broker_reports_{_symbol}",
+            python_callable=load_textual_broker_reports,
+            op_kwargs={"ticker_symbol": _symbol},
+            execution_timeout=timedelta(minutes=10),
+        )
+
     # Wire up dependencies — load_neo4j runs AFTER load_pg (sequential per ticker)
     # so that company_profile.json is available for chunk embedding
     for _symbol in TICKER_SYMBOLS:
         scrape_tasks[_symbol] >> load_pg_tasks[_symbol] >> load_neo4j_tasks[_symbol]
         load_pg_tasks[_symbol] >> summary_task
         load_neo4j_tasks[_symbol] >> summary_task
+        # Textual data ingestion runs after Neo4j load (depends on Neo4j being available)
+        load_neo4j_tasks[_symbol] >> earnings_call_tasks[_symbol]
+        load_neo4j_tasks[_symbol] >> broker_report_tasks[_symbol]
+        earnings_call_tasks[_symbol] >> summary_task
+        broker_report_tasks[_symbol] >> summary_task
 
     # Macro is triggered by the first ticker's scrape
     scrape_tasks[TICKER_SYMBOLS[0]] >> load_macro_task

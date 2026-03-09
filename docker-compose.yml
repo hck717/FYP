@@ -45,7 +45,8 @@ x-airflow-common:
     FMP_API_KEY: 6kqjitcYPxyr60Xy1Jfem92Q1z9LfCHM
     EODHD_API_KEY: 6957671cac2858.27368157
 
-    # Ollama (Mac/Docker Desktop friendly)
+    # Ollama - use host-gateway for cross-platform compatibility (works on Mac, Linux, Windows)
+    # The extra_hosts section maps host.docker.internal to the host gateway IP
     OLLAMA_BASE_URL: http://host.docker.internal:11434
     OLLAMA_HOST: host.docker.internal
     OLLAMA_PORT: 11434
@@ -67,8 +68,20 @@ x-airflow-common:
     BUSINESS_ANALYST_MAX_CHUNKS: 50
     BUSINESS_ANALYST_CHUNK_SIZE: 1000
     BUSINESS_ANALYST_OVERLAP: 200
+    # LLM generation token budget — deepseek-r1:8b supports 32k context.
+    # 16000 is needed to accommodate <think> blocks + full JSON schema output.
+    BUSINESS_ANALYST_MAX_TOKENS: 16000
+    # num_ctx: Ollama context window.  Default Ollama value is 4096, which is
+    # smaller than the BA prompt alone (~4500-8000 tokens).  Must be explicit.
+    BUSINESS_ANALYST_NUM_CTX: 32768
 
     TRACKED_TICKERS: "AAPL,TSLA,NVDA,MSFT,GOOGL"
+
+    # Ensure /opt/airflow is always on PYTHONPATH so that `agents/` and
+    # `orchestration/` are importable when running modules directly with
+    # `python -m agents.business_analyst.agent` (Airflow's DAG loader adds
+    # this automatically, but direct python invocations do not).
+    PYTHONPATH: /opt/airflow
 
     # You can add more agent/ingestion settings here if needed (hard-coded)
     # QUANT_AGENT_SQL_TIMEOUT: 30
@@ -80,6 +93,10 @@ x-airflow-common:
     - ./ingestion/etl:/opt/airflow/etl
     - ./ingestion:/opt/airflow/ingestion
     - ./agents:/opt/airflow/agents
+    - ./orchestration:/opt/airflow/orchestration
+    - ./data:/opt/airflow/data
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
   depends_on:
     &airflow-common-depends-on
     postgres:

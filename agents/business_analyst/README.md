@@ -1,392 +1,423 @@
 # Business Analyst Agent
 
-> **Status:** Complete (live-tested, all 5 tickers validated)
-> **Based on:** [`skills/business_analyst_crag`](https://github.com/hck717/Agent-skills-POC/tree/main/skills/business_analyst_crag) (POC v4.2)
+> **Architecture:** Optimized Adaptive Agentic Graph RAG (v2)
+> **Status:** Live-tested, all 5 tickers validated
 
 ---
 
 ## Role
 
-The Business Analyst Agent is the **qualitative intelligence layer** of the multi-agent equity research system. It answers structural questions about a company — competitive moat, business model, risk factors, and strategic positioning — by retrieving verified facts from local knowledge bases.
+The Business Analyst Agent is the **qualitative intelligence layer** of the multi-agent equity research system. It answers structural questions about a company — competitive moat, business model, risk factors, strategic positioning, and earnings call highlights — by retrieving verified facts from local knowledge bases and synthesising them with an LLM.
 
-It does **NOT** make buy/sell judgements. It surfaces grounded facts and gaps for the Supervisor and Synthesizer to interpret.
+It does **NOT** make buy/sell judgements or produce price targets. It surfaces grounded analysis and data gaps for the Supervisor and Synthesizer to interpret.
 
 **Handled by this agent:**
-- Competitive moat and strategic positioning analysis
-- Business model and revenue composition breakdown
-- Risk factor synthesis (from filings and news)
+- Competitive moat depth and trajectory
+- Business model and revenue composition
+- Risk factor synthesis (from filings, earnings calls, broker reports)
 - Historical sentiment trends (bullish/bearish/neutral %)
-- Qualitative narrative synthesis with cited sources
+- Management guidance and earnings call Q&A
+- Broker research report synthesis
+- Qualitative narrative with cited source IDs
 
-**Handled by other agents (do not overlap):**
-- Real-time news and breaking events → Web Search Agent
+**Not handled here (separate agents):**
+- Breaking news and real-time events → Web Search Agent
 - Financial ratios, DCF, valuation → Financial Modelling Agent
-- Macro environment → (Phase 3 — not yet implemented)
+- Macro environment → Phase 3 (not yet implemented)
 
 ---
 
-## Architecture: CRAG (Corrective RAG)
+## Architecture: Optimized Adaptive Agentic Graph RAG
 
-The agent implements **Graph-Augmented Corrective RAG** — it evaluates retrieval confidence before generating, and adapts its strategy accordingly.
+The pipeline classifies every query into one of three paths before retrieving, then evaluates retrieval quality (CRAG) on the complex path and adaptively rewrites or falls back as needed.
 
 ```
 Query + Ticker
     │
     ▼
-fetch_sentiment_data      ←  PostgreSQL: bullish/bearish/neutral %
+metadata_precheck         ←  Neo4j chunk counts, pgvector status, sentiment flag
     │
     ▼
-hybrid_retrieval          ←  Neo4j vector index (chunk_embedding, when Chunk nodes exist)
-                          ←  BM25 sparse keyword scoring
+fetch_sentiment_data      ←  PostgreSQL: bullish/bearish/neutral % + Company node + graph community
     │
     ▼
-hybrid_rerank             ←  30% BM25 + 70% Cross-Encoder (ms-marco-MiniLM-L-6-v2)
-                          ←  When max CE score < 0.4: 70% dense + 30% BM25 blend
+classify_query            ←  LLM (lightweight): SIMPLE / NUMERICAL / COMPLEX
     │
-    ▼
-crag_evaluate             ←  CORRECT (>0.55) / AMBIGUOUS (0.35–0.55) / INCORRECT (<0.35)
-    │
-    ├─ CORRECT    → generate_analysis  (LLM from retrieved context)
-    ├─ AMBIGUOUS  → rewrite_query → retry hybrid_retrieval (max 1 rewrite loop)
-    └─ INCORRECT  → web_search_fallback (calls Web Search Agent stub)
-    │
-    ▼
-format_json_output        ←  Structured JSON for Supervisor
-    │
-   END → return to Supervisor
+    ├─ SIMPLE     → fast_path_retrieval    (vector + BM25, small top_k, no rerank)
+    │                    │
+    ├─ NUMERICAL  → numerical_path         (fast retrieval + guaranteed sentiment fetch)
+    │                    │
+    └─ COMPLEX    → complex_retrieval      (multi-stage: bi-encoder recall → cross-encoder
+                         │                  rerank → RRF fusion + graph traversal)
+                         ▼
+                    crag_evaluate          ←  CORRECT (≥0.6) / AMBIGUOUS (0.4–0.6) / INCORRECT (<0.4)
+                         │
+                         ├─ CORRECT    → generate_analysis
+                         ├─ AMBIGUOUS  → rewrite_query → retry complex_retrieval (max 2 loops)
+                         └─ INCORRECT  → web_search_fallback (only if no local data at all)
+                                              │
+                    (All paths converge)      │
+                         ▼  ←────────────────┘
+                    semantic_cache_check   ←  pass-through (caching is at retrieval layer)
+                         │
+                         ▼
+                    format_json_output     ←  citation grounding check, JSON assembly, inline sanitise
+                         │
+                        END → return to Supervisor
 ```
+
+**SIMPLE and NUMERICAL paths bypass CRAG** — they pre-set `crag_status=CORRECT` and `confidence=1.0` and go straight to generation.
+
+**COMPLEX path** runs full multi-stage retrieval followed by CRAG evaluation. INCORRECT is only routed to web fallback when there is genuinely no local data; otherwise the LLM generates from whatever was found and surfaces gaps in `missing_context`.
 
 ---
 
-## Infrastructure State
+## Input-to-Output Walkthrough
 
-| Service | Container | Status | Notes |
-|---|---|---|---|
-| PostgreSQL | `fyp-postgres` | healthy | `sentiment_trends` table: 5 rows (AAPL/TSLA/MSFT/NVDA/GOOGL) |
-| Neo4j | `fyp-neo4j` | healthy | 5 `Company` nodes with 85+ real financial properties each (marketCap, PE ratio, profit margin, sector, industry, etc.). No `Chunk` nodes yet. Vector search returns 0 results; agent falls back to web search when retrieval is INCORRECT. Company node properties ARE used for `company_overview` fields. |
-| Ollama | local | running | Models: `all-MiniLM-L6-v2` (local via sentence-transformers), `deepseek-r1:8b`, `qwen2.5:7b`, `llama3.2:latest`. Version 0.14.2. |
+### 1. Inputs
+```python
+task   = "What revenue guidance did NVIDIA give for next quarter?"
+ticker = "NVDA"
+```
+
+### 2. `metadata_precheck`
+Queries Neo4j and pgvector for chunk counts and index readiness. Caches the result in `state["metadata_profile"]` so later nodes don't re-query.
+
+### 3. `fetch_sentiment_data`
+- **Sentiment** — `SELECT bullish_pct, bearish_pct, neutral_pct, trend FROM sentiment_trends WHERE ticker=?` (PostgreSQL)
+- **Company node** — `MATCH (c:Company {ticker: $t}) RETURN c` (Neo4j), used for the `company_overview` section (market cap, P/E, sector, etc.)
+- **Graph community summary** — relationship-count centrality across `:RISK`, `:STRATEGY`, `:COMPETES_WITH` edges (2A: Graph RAG)
+
+### 4. `classify_query`
+Sends the query to a lightweight LLM call with `QUERY_CLASSIFICATION_PROMPT`. Returns one of:
+- `SIMPLE` — factual single-answer questions (e.g. "What sector is Apple in?")
+- `NUMERICAL` — metric/ratio/guidance questions (e.g. "What revenue guidance did NVIDIA give?")
+- `COMPLEX` — multi-faceted qualitative questions (e.g. "What are Tesla's key business risks?")
+
+Falls back to `COMPLEX` on any error.
+
+### 5. Retrieval paths
+
+#### SIMPLE — `fast_path_retrieval`
+- Calls `toolkit.retrieve_fast(query, ticker)`
+- Uses a smaller `fast_path_top_k` budget (default: 5)
+- Neo4j vector similarity search + optional BM25 re-scoring
+- No cross-encoder reranking
+- Pre-sets `crag_status=CORRECT, confidence=1.0`
+
+#### NUMERICAL — `numerical_path`
+- Same `retrieve_fast()` call as SIMPLE
+- Additionally ensures sentiment data is fetched if not already present
+- Pre-sets `crag_status=CORRECT, confidence=1.0`
+
+#### COMPLEX — `complex_retrieval`
+Multi-stage pipeline:
+1. **Bi-encoder recall** — Neo4j vector index (`chunk_embedding`) + pgvector cosine search, top-100 each
+2. **Cross-encoder rerank** — `ms-marco-MiniLM-L-6-v2` scores top candidates; when max CE score < 0.4 the blend falls back to 70% dense + 30% BM25
+3. **Graph traversal** — follow `:RISK`, `:STRATEGY`, `:COMPETES_WITH`, `:MENTIONS` edges from matched Chunk nodes
+4. **RRF fusion** — Reciprocal Rank Fusion merges dense, BM25, and graph results into a final ranked list
+
+Controlled by `multi_stage_recall_k` (default: 100 per source).
+
+### 6. `crag_evaluate` (COMPLEX path only)
+Scores the top retrieved chunks against the query using the cross-encoder. Classifies:
+- **CORRECT** (confidence ≥ 0.6) → proceed to generation
+- **AMBIGUOUS** (0.4 ≤ confidence < 0.6) → rewrite query and retry (up to `max_rewrite_loops`, default: 2)
+- **INCORRECT** (confidence < 0.4) → web fallback only if no local data; otherwise generate and surface gaps
+
+### 7. `generate_analysis`
+Builds a rich context string:
+- Analyst question (framed prominently)
+- Sentiment block (bullish/bearish/neutral %)
+- Graph facts (top-25 relationship facts)
+- Graph community summary
+- Top retrieved chunks (up to 7, with chunk_id, score, source, temporal band)
+- Temporal 2B tagging: RECENT vs. HISTORICAL chunks are separated so the LLM can analyse the *delta*
+
+Sends to `llm.generate()` (model: `deepseek-r1:8b` by default, `temperature=0.2`).
+
+### 8. `format_json_output`
+- Merges LLM output, sentiment block, company node, and web fallback results
+- Priority for `company_overview`: Neo4j Company node > LLM-generated > graph_facts extraction
+- Runs citation grounding check (`validate_citations()`)
+- Strips ungrounded inline `[neo4j::...]` citations from prose (backstop sanitiser)
+- Normalises `key_risks` (nulls out invented source IDs, coerces `mitigation_observed: "null"`)
+- Sanitises `competitive_moat.sources` (bare string arrays of hallucinated IDs)
+- Falls back `qualitative_summary` from `management_guidance` when LLM left it null
+
+### 9. Output
+Returns a structured JSON dict (see Output Schema below).
 
 ---
 
 ## Data Sources
 
 | Source | Content | Storage |
-|---|---|---|
+|--------|---------|---------|
 | `sentiment_trends` | Bullish / bearish / neutral % per ticker + trend direction | PostgreSQL |
-| `:Company` nodes | Company nodes with 85+ financial properties per ticker | Neo4j (properties used for `company_overview`; no chunk/document data yet) |
-| Future: document chunks | News articles, earnings summaries, analyst reports | Neo4j `:Chunk` nodes (planned — not yet ingested) |
+| `:Company` nodes | 85+ financial properties (market cap, P/E, sector, margins, …) | Neo4j |
+| `:Chunk` nodes (earnings_call) | Earnings call transcript chunks | Neo4j vector index |
+| `:Chunk` nodes (broker_report) | Broker research report chunks | Neo4j vector index |
+| `:Chunk` nodes (description, highlights, …) | Company profile sections | Neo4j vector index |
+| `text_chunks` | pgvector embeddings (same documents, alternative index) | PostgreSQL |
+| `:RISK`, `:STRATEGY`, `:COMPETES_WITH` edges | Relationship graph for graph traversal | Neo4j |
 
-**Sentiment data (live values):**
+### Current Chunk Coverage (Neo4j)
 
-| Ticker | Bullish % | Bearish % | Neutral % | Trend |
-|---|---|---|---|---|
-| AAPL | 72.4 | 14.2 | 13.4 | improving |
-| MSFT | 68.9 | 17.3 | 13.8 | improving |
-| NVDA | 79.3 | 11.5 | 9.2 | improving |
-| GOOGL | 61.8 | 22.4 | 15.8 | stable |
-| TSLA | 45.1 | 38.7 | 16.2 | deteriorating |
+| Ticker | earnings_call | broker_report | other | Total |
+|--------|---------------|---------------|-------|-------|
+| AAPL   | 131           | 400           | 13    | 544   |
+| TSLA   | 130           | 158           | 13    | 301   |
+| NVDA   | 137           | 96            | 12    | 245   |
+| MSFT   | 138           | 73            | 13    | 224   |
+| GOOGL  | 142           | 361           | 12    | 515   |
 
-**Note on Neo4j:** The graph currently has no `Chunk` nodes or knowledge-graph relationships (`FACES_RISK`, `HAS_STRATEGY`, `COMPETES_WITH`, `HAS_FACT`). Vector search returns 0 results; the CRAG evaluator scores retrieval as INCORRECT and the agent falls back to Web Search. Neo4j warnings about missing properties are expected and harmless.
+**Total: 1,829 chunks across 5 tickers**
 
 ---
 
 ## LLM & Models
 
-```python
-# Primary LLM — reasoning-grade model for qualitative analysis
-llm = "deepseek-r1:8b"           # via Ollama at localhost:11434
-temperature = 0.2                 # Low: factual grounding preferred
-num_predict = 8192                # Max tokens for generation (increased for detailed output)
-request_timeout = None            # No timeout — deepseek-r1 can be slow
-
-# Embedding model — all-MiniLM-L6-v2 (384-dim), run locally via sentence-transformers
-embedder = "all-MiniLM-L6-v2"    # local CPU, no Ollama dependency
-
-# Reranker — Cross-Encoder for CRAG evaluation + final reranking
-reranker = "cross-encoder/ms-marco-MiniLM-L-6-v2"   # sentence-transformers, local CPU
-
-# Retrieval
-top_k = 15                        # Chunks retrieved from Neo4j vector index
-chunks_fed_to_llm = 10            # Top-N chunks passed in context
-chars_per_chunk = 800             # Text per chunk fed to LLM
-```
-
-**deepseek-r1:8b behaviour notes:**
-- `"think": False` is set in the Ollama API payload to suppress `<think>...</think>` reasoning blocks at the API level (Ollama ≥ 0.14.2). A defensive `_strip_think_tags()` in `llm.py` also strips any residual blocks.
-- May wrap output in ` ```json ``` ` markdown fences — stripped by `_strip_markdown_fences()` before JSON parsing.
+| Purpose | Model | Notes |
+|---------|-------|-------|
+| Primary generation | `deepseek-r1:8b` | via Ollama, `temperature=0.2`, no timeout |
+| Query classification | `llama3.2:latest` (configurable) | Lightweight — single-word output |
+| Query rewrite | same as primary | Used on AMBIGUOUS path |
+| Bi-encoder (embedding) | `nomic-embed-text` (via Ollama) | Neo4j + pgvector |
+| Cross-encoder (rerank) | `ms-marco-MiniLM-L-6-v2` | HuggingFace, local |
 
 ---
 
-## CRAG Evaluation Logic
+## Chunk ID Formats
 
-| Score | Status | Action |
-|---|---|---|
-| > 0.55 | `CORRECT` | Use retrieved context directly for generation |
-| 0.35 – 0.55 | `AMBIGUOUS` | LLM rewrites query → retry retrieval once (max 1 loop) |
-| < 0.35 | `INCORRECT` | Trigger Web Search Agent fallback |
-
-When the cross-encoder max score is < 0.4 across all candidates, the reranker falls back to a `0.7×dense + 0.3×BM25` blend instead of CE-weighted scores.
+| Document Type | Format | Example |
+|---------------|--------|---------|
+| Neo4j Earnings Call | `neo4j::TICKER::earnings_call::<title>::<n>` | `neo4j::AAPL::earnings_call::Apple Inc Earnings Call 2026129::5` |
+| Neo4j Broker Report | `neo4j::TICKER::broker_report::<institution>::<n>` | `neo4j::AAPL::broker_report::JP Morgan::2` |
+| Neo4j Company Profile | `neo4j::TICKER::<section>::<n>` | `neo4j::AAPL::highlights::0` |
+| pgvector chunk | `pgvec::TICKER::<uuid>` | `pgvec::NVDA::a3f1...` |
 
 ---
 
-## Output Format (JSON)
-
-The agent returns **structured JSON only** — no freeform Markdown prose. The Supervisor reads this directly.
-
-Every factual claim cites a `chunk_id` from the retrieval source (`neo4j::{ticker}::{id}` format when Chunk nodes are populated).
+## Output Schema
 
 ```json
 {
   "agent": "business_analyst",
   "ticker": "AAPL",
-  "query_date": "2026-02-26",
+  "query_date": "2026-03-09",
   "company_overview": {
-    "name": "Apple Inc",
+    "name": "Apple Inc.",
     "sector": "Technology",
-    "market_cap": 3200000000000,
-    "pe_ratio": 28.5,
+    "industry": "Consumer Electronics",
+    "market_cap": 3.4e12,
+    "pe_ratio": 29.5,
     "profit_margin": 0.253
   },
   "sentiment": {
-    "bullish_pct": 72.4,
-    "bearish_pct": 14.2,
-    "neutral_pct": 13.4,
-    "trend": "improving",
+    "bullish_pct": 90.88,
+    "bearish_pct": 0.0,
+    "neutral_pct": 9.12,
+    "trend": "bullish",
     "source": "postgresql:sentiment_trends",
-    "sentiment_interpretation": "narrative explaining how sentiment data corroborates or contradicts document findings [chunk_id: ...]"
+    "sentiment_interpretation": "..."
   },
   "competitive_moat": {
     "rating": "wide",
-    "key_strengths": [
-      "ecosystem lock-in [chunk_id: neo4j::AAPL::...]"
-    ],
-    "vulnerabilities": [
-      "China market dependency [chunk_id: neo4j::AAPL::...]"
-    ],
-    "sources": ["neo4j::AAPL::..."]
+    "narrative": "...",
+    "key_strengths": ["...", "..."],
+    "threats": ["...", "..."],
+    "trajectory": "stable",
+    "sources": ["neo4j::AAPL::earnings_call::...::3"]
   },
   "qualitative_analysis": {
-    "narrative": "≥3 sentences directly answering the analyst question with [chunk_id] citations",
-    "sentiment_signal": "how sentiment data corroborates or contradicts document findings [chunk_id: ...]",
-    "strategic_implication": "single most important 2-3 year business model implication [chunk_id: ...]",
-    "data_quality_note": "honest assessment of retrieved context quality and gaps"
+    "narrative": "...",
+    "sentiment_signal": "...",
+    "strategic_implication": "...",
+    "data_quality_note": null
+  },
+  "management_guidance": {
+    "forward_outlook_summary": "...",
+    "earnings_call_highlights": ["...", "..."],
+    "near_term_catalysts": ["...", "..."]
+  },
+  "sentiment_verdict": {
+    "signal": "CONSTRUCTIVE",
+    "rationale": "..."
   },
   "key_risks": [
     {
-      "risk": "description with [chunk_id] citation",
+      "risk": "...",
       "severity": "HIGH",
-      "mitigation_observed": "observed mitigation or null",
-      "source": "chunk_id string"
+      "mitigation_observed": "...",
+      "source": "neo4j::AAPL::broker_report::JP Morgan::2"
     }
   ],
   "missing_context": [
-    {
-      "gap": "description of what is missing",
-      "severity": "HIGH"
-    }
+    { "gap": "...", "severity": "MEDIUM" }
   ],
   "crag_status": "CORRECT",
   "confidence": 0.85,
   "fallback_triggered": false,
-  "qualitative_summary": "1-2 sentence factual summary with cited chunk_id — no sentiment judgement"
+  "qualitative_summary": "One-to-two sentence executive summary."
 }
 ```
 
-**chunk_id format:** `neo4j::{TICKER}::{id}` (when Neo4j Chunk nodes are populated). Currently Neo4j has no Chunk nodes, so retrieval returns empty and the agent falls back to Web Search for qualitative data.
+**`crag_status`** values: `CORRECT` | `AMBIGUOUS` | `INCORRECT`
 
----
-
-## Public API
-
-The package exports two functions from `agents.business_analyst`:
-
-### `run(task, ticker, config)` — targeted query
-
-```python
-from agents.business_analyst import run
-
-result = run(task="What is Apple's competitive moat?", ticker="AAPL")
-```
-
-Answers a **single analyst question**. Output breadth is scoped to the `task` string. Use this when the Supervisor or Synthesizer has a specific follow-up question.
-
-### `run_full_analysis(ticker, config)` — comprehensive dossier
-
-```python
-from agents.business_analyst import run_full_analysis
-
-dossier = run_full_analysis(ticker="AAPL")
-# dossier["competitive_moat"]["rating"]  → "wide"
-# dossier["key_risks"]                   → [{risk, severity, source}, ...]
-# dossier["qualitative_summary"]          → "1-2 sentence executive summary"
-```
-
-Issues a **single comprehensive task** covering all five pillars in one pipeline run:
-1. Competitive moat — rating (wide/narrow/none), strengths, vulnerabilities
-2. Business model and primary revenue sources
-3. Strategic positioning and the most important 2-3 year implication
-4. Key risk factors with severity (HIGH/MEDIUM/LOW) and observed mitigations
-5. How current sentiment corroborates or contradicts document evidence
-
-**This is the intended entry point for the Synthesizer.** It returns the same JSON schema as `run()` with all sections populated, giving the Synthesizer a complete qualitative intelligence package without multiple round-trips to the agent.
-
----
-
-## File Structure
-
-```
-agents/business_analyst/
-├── README.md              # This file
-├── README_zh-yue.md       # Cantonese (廣東話) version of this README
-├── __init__.py            # Package init — exports run() and run_full_analysis()
-├── agent.py               # LangGraph CRAG pipeline (8 nodes) + run_full_analysis()
-├── config.py              # Centralised env-var configuration
-├── health.py              # Service health check script
-├── llm.py                 # Ollama LLM client (generate, rewrite_query, JSON extraction)
-├── prompts.py             # System prompt + JSON schema prompt + query rewrite prompt
-├── schema.py              # Dataclasses: Chunk, RetrievalResult, SentimentSnapshot, CRAGStatus
-├── tools.py               # Neo4j, PostgreSQL connectors + CRAG evaluator + reranker
-├── web_search_interface.py # Web Search Agent fallback stub
-└── tests/
-    └── test_agent.py      # 39 unit + integration tests (all mocked, all passing)
-```
+**`confidence`**: 0.0–1.0 — 1.0 for SIMPLE/NUMERICAL (bypass CRAG), real cross-encoder score for COMPLEX.
 
 ---
 
 ## Environment Variables
 
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `OLLAMA_BASE_URL` | Ollama API URL | `http://localhost:11434` |
+| `NEO4J_URI` | Neo4j bolt URI | `bolt://localhost:7687` |
+| `NEO4J_USER` | Neo4j username | `neo4j` |
+| `NEO4J_PASSWORD` | Neo4j password | `password` |
+| `POSTGRES_DSN` | PostgreSQL connection string | — |
+| `BUSINESS_ANALYST_MODEL` | Primary LLM model | `deepseek-r1:8b` |
+| `BA_QUERY_CLASSIFIER_MODEL` | Query classification model | `llama3.2:latest` |
+| `BUSINESS_ANALYST_REQUEST_TIMEOUT` | Ollama request timeout (s) | `None` (no timeout) |
+| `RAG_TOP_K` | Chunks returned to LLM | `15` |
+| `RAG_SCORE_THRESHOLD` | Minimum relevance score | `0.6` |
+| `BA_FAST_PATH_TOP_K` | Top-K for SIMPLE/NUMERICAL paths | `5` |
+| `BA_MULTI_STAGE_RECALL_K` | Bi-encoder recall pool per source | `100` |
+| `BA_MAX_REWRITE_LOOPS` | Max query rewrites on AMBIGUOUS | `2` |
+| `CRAG_CORRECT_THRESHOLD` | Confidence ≥ this → CORRECT | `0.6` |
+| `CRAG_AMBIGUOUS_THRESHOLD` | Confidence ≥ this → AMBIGUOUS | `0.4` |
+
+---
+
+## Running the Agent
+
+### CLI — basic
+
 ```bash
-# LLM
-OLLAMA_BASE_URL=http://localhost:11434
-BUSINESS_ANALYST_MODEL=deepseek-r1:8b
+# From host (venv activated)
+python -m agents.business_analyst.agent --ticker AAPL
 
-# Embedding (local via sentence-transformers — no Ollama dependency)
-EMBEDDING_MODEL=all-MiniLM-L6-v2
-EMBEDDING_DIMENSION=384
+# Inside Docker
+docker exec fyp-airflow-webserver \
+    python -m agents.business_analyst.agent --ticker AAPL \
+    --task "What is Apple's competitive moat?"
+```
 
-# Reranker (loaded locally via sentence-transformers)
-RERANKER_MODEL=cross-encoder/ms-marco-MiniLM-L-6-v2
+### CLI — with verbose pipeline trace (stderr)
 
-# Retrieval
-RAG_TOP_K=15
-RAG_SCORE_THRESHOLD=0.6
+```bash
+python -m agents.business_analyst.agent \
+    --ticker TSLA \
+    --task "What are Tesla's key business risks?" \
+    --verbose
+```
 
-# Neo4j (Company node properties used for company_overview; Chunk nodes not yet ingested)
-NEO4J_URI=bolt://localhost:7687
-NEO4J_USER=neo4j
-NEO4J_PASSWORD=changeme_neo4j_password
+Example stderr output:
+```
+[10:15:01] [01] >> METADATA PRECHECK  |  ticker=TSLA
+[10:15:01] [02]   OK METADATA PRECHECK done  |  neo4j_chunks=301  pgvec_chunks=0  sentiment=yes  index=ONLINE  (0.12s)
+[10:15:01] [03] >> FETCH SENTIMENT  |  ticker=TSLA
+[10:15:01] [04]   OK FETCH SENTIMENT done  |  bullish=62.5%  bearish=15.0%  neutral=22.5%  trend=bullish  (0.08s)
+[10:15:01] [05] >> CLASSIFY QUERY  |  query='What are Tesla's key business risks?'
+[10:15:03] [06]   OK CLASSIFY QUERY done  |  class=COMPLEX  (1.84s)
+[10:15:03] [07] >> COMPLEX RETRIEVAL (multi-stage)  |  ticker=TSLA
+[10:15:07] [08]   OK COMPLEX RETRIEVAL done  |  chunks=12  graph_facts=5  top_score=0.781  (3.92s)
+[10:15:07] [09] >> CRAG EVALUATE  |  ticker=TSLA  chunks_to_score=12
+[10:15:07] [10]   OK CRAG EVALUATE done  |  status=CORRECT  confidence=0.720  (0.41s)
+[10:15:07] [11] >> GENERATE ANALYSIS (LLM)  |  ticker=TSLA  chunks=12  graph_facts=5
+[10:15:45] [12]   OK GENERATE ANALYSIS done  |  (37.91s)
+[10:15:45] [13] >> SEMANTIC CACHE CHECK  |  cache operates at retrieval layer — pass-through
+[10:15:45] [14] >> FORMAT JSON OUTPUT  |  ticker=TSLA  crag=CORRECT  confidence=0.720  fallback=False
+[10:15:45] [15]   OK CITATION GROUNDING  |  cited=8  grounded=8  ungrounded=0  rate=100.0%
+[10:15:45] [16]   OK FORMAT JSON OUTPUT done
+```
 
-# PostgreSQL (sentiment data)
-POSTGRES_HOST=localhost
-POSTGRES_PORT=5432
-POSTGRES_DB=airflow
-POSTGRES_USER=airflow
-POSTGRES_PASSWORD=airflow
+### CLI — with citation validation report
+
+```bash
+python -m agents.business_analyst.agent \
+    --ticker NVDA \
+    --task "What revenue guidance did NVIDIA give?" \
+    --validate-citations
+```
+
+Appends to stderr after the run:
+```
+--- Citation Grounding Report ---
+  Total cited IDs  : 5
+  Grounded         : 5
+  Ungrounded       : 0
+  Grounding rate   : 100.0%
+---------------------------------
+```
+
+### Programmatic
+
+```python
+from agents.business_analyst.agent import run, run_full_analysis
+
+# Single question
+result = run(task="What is Apple's competitive moat?", ticker="AAPL")
+
+# Full institutional-grade dossier (all 7 pillars)
+dossier = run_full_analysis(ticker="AAPL")
 ```
 
 ---
 
-## Run Commands
+## Citation Grounding
 
-**Base command (replace `--ticker` and `--task` as needed):**
+Every factual claim in the output should cite a chunk_id from the retrieved set. The agent enforces this at two layers:
 
-```bash
-cd /Users/brianho/FYP && \
-BUSINESS_ANALYST_MODEL=deepseek-r1:8b \
-EMBEDDING_MODEL=all-MiniLM-L6-v2 \
-EMBEDDING_DIMENSION=384 \
-.venv/bin/python -m agents.business_analyst.agent \
-  --ticker AAPL \
-  --task "What is Apple's main business model and revenue sources?" \
-  --log-level WARNING
-```
+1. **Prompt (Option A)** — the system prompt instructs the LLM to only cite verbatim chunk_ids from the `RETRIEVED DOCUMENT CHUNKS` section.
+2. **Post-processor (Option B)** — `_strip_ungrounded_inline_citations()` scans all prose fields and replaces any `[neo4j::...]` token that doesn't prefix-match a real retrieved ID.
 
-**5 suggested test commands:**
+`validate_citations(output, retrieval)` provides a machine-readable grounding report:
 
-```bash
-# 1. AAPL — competitive moat (falls back to web search — no Chunk nodes in Neo4j yet)
-BUSINESS_ANALYST_MODEL=deepseek-r1:8b EMBEDDING_MODEL=all-MiniLM-L6-v2 EMBEDDING_DIMENSION=384 \
-.venv/bin/python -m agents.business_analyst.agent \
-  --ticker AAPL --log-level WARNING
+```python
+from agents.business_analyst.agent import validate_citations
 
-# 2. TSLA — risk factors (tests key_risks output block)
-BUSINESS_ANALYST_MODEL=deepseek-r1:8b EMBEDDING_MODEL=all-MiniLM-L6-v2 EMBEDDING_DIMENSION=384 \
-.venv/bin/python -m agents.business_analyst.agent \
-  --ticker TSLA \
-  --task "What are Tesla's key business risks and competitive vulnerabilities?" \
-  --log-level WARNING
-
-# 3. NVDA — strategic positioning (tests competitive_moat block)
-BUSINESS_ANALYST_MODEL=deepseek-r1:8b EMBEDDING_MODEL=all-MiniLM-L6-v2 EMBEDDING_DIMENSION=384 \
-.venv/bin/python -m agents.business_analyst.agent \
-  --ticker NVDA \
-  --task "How defensible is NVIDIA's AI chip moat against in-house alternatives?" \
-  --log-level WARNING
-
-# 4. MSFT — services & cloud strategy (tests qualitative_analysis narrative)
-BUSINESS_ANALYST_MODEL=deepseek-r1:8b EMBEDDING_MODEL=all-MiniLM-L6-v2 EMBEDDING_DIMENSION=384 \
-.venv/bin/python -m agents.business_analyst.agent \
-  --ticker MSFT \
-  --task "Assess Microsoft's cloud and AI services strategy and revenue mix." \
-  --log-level WARNING
-
-# 5. GOOGL — web search fallback path
-BUSINESS_ANALYST_MODEL=deepseek-r1:8b EMBEDDING_MODEL=all-MiniLM-L6-v2 EMBEDDING_DIMENSION=384 \
-.venv/bin/python -m agents.business_analyst.agent \
-  --ticker GOOGL \
-  --task "What is Alphabet's advertising dependency risk and diversification strategy?" \
-  --log-level INFO
+report = validate_citations(output=result, retrieval=retrieval_result)
+# {
+#   "total_cited": 8,
+#   "grounded": 8,
+#   "ungrounded": 0,
+#   "grounding_rate_pct": 100.0,
+#   "ungrounded_ids": []
+# }
 ```
 
 ---
 
-## Validated Live Results
+## Infrastructure
 
-All 5 supported tickers have been validated end-to-end with Neo4j and PostgreSQL data. Since Neo4j has no Chunk nodes yet, the CRAG evaluator returns INCORRECT and the web search fallback is triggered for qualitative retrieval.
-
-| Ticker | CRAG Status | Confidence | Fallback |
-|---|---|---|---|
-| AAPL | INCORRECT → web fallback | — | true |
-| TSLA | INCORRECT → web fallback | — | true |
-| MSFT | INCORRECT → web fallback | — | true |
-| NVDA | INCORRECT → web fallback | — | true |
-| GOOGL | INCORRECT → web fallback | — | true |
-
-**Notes:**
-- Neo4j returns 0 chunks for all tickers (no `Chunk` nodes ingested). Web search fallback activates for all qualitative queries.
-- Company node properties (marketCap, PE ratio, sector, etc.) are still fetched from Neo4j and populate the `company_overview` section of every output.
-- Sentiment data from PostgreSQL `sentiment_trends` is populated for all 5 tickers.
+| Service | Container | Status | Notes |
+|---------|-----------|--------|-------|
+| PostgreSQL | `fyp-postgres` | healthy | `sentiment_trends`, `financial_statements`, `text_chunks` (pgvector) |
+| Neo4j | `fyp-neo4j` | healthy | 51 Company nodes, 1,829 Chunk nodes, vector index ONLINE |
+| Ollama | local | running | `deepseek-r1:8b`, `llama3.2:latest`, `nomic-embed-text` |
 
 ---
 
-## Design Decisions
-
-- **CRAG over basic RAG:** Retrieval confidence is evaluated before generation — no silent low-quality answers.
-- **Web Search fallback is by design:** When context scores < 0.35 (or when Neo4j has no Chunk nodes), the agent calls the Web Search Agent — inter-agent collaboration, not a failure.
-- **JSON output only:** All output is structured JSON consumed by the Supervisor — no freeform Markdown prose.
-- **Sentiment as context, not conclusion:** PostgreSQL sentiment % is injected as background context; the LLM interprets it against document evidence rather than inheriting the label.
-- **Citation enforcement (Rule 9):** Every claim in `key_risks`, `competitive_moat`, and `qualitative_analysis` must reference a real `chunk_id`. The system prompt explicitly forbids invented IDs.
-- **Inline citation post-processor:** `_strip_ungrounded_inline_citations()` recursively walks the output dict after LLM generation and replaces any `[chunk_id]` token that does not match a retrieved chunk ID with `[source unavailable]`. This is a safety net for LLM hallucination of chunk IDs.
-- **Unicode normalisation for chunk IDs:** Chunk IDs can contain Unicode characters from article titles. Both cited IDs and real IDs are NFKD-normalised to ASCII before comparison to prevent false-alarm grounding failures.
-- **`json.dumps(ensure_ascii=False)`:** LLM output containing Unicode characters is serialised without ASCII escaping to preserve the original characters for regex-based citation matching.
-- **No timeout:** `request_timeout = None` — deepseek-r1:8b can take several minutes on complex prompts; a hard timeout causes false `GENERATION_ERROR` failures.
-- **`"think": False` API param:** Passed in the Ollama request payload to suppress deepseek-r1 `<think>` blocks at the API level (Ollama ≥ 0.14.2). More reliable than the `/no_think` directive. Defensive `_strip_think_tags()` also runs as a fallback.
-- **`_strip_markdown_fences`:** deepseek-r1 occasionally wraps output in ` ```json ``` ` fences; these are stripped before JSON parsing in `llm.py`.
-- **Neo4j is the primary retrieval target:** When Chunk nodes are ingested, Neo4j vector search will be the primary source. Until then, the CRAG evaluator returns INCORRECT and web search is the qualitative data source.
-
----
-
-## Tests
+## Testing
 
 ```bash
-# Run all 39 tests
-cd /Users/brianho/FYP && .venv/bin/python -m pytest agents/business_analyst/tests/ -q
+# Run all agent tests
+pytest agents/business_analyst/tests/ -v
 
-# Expected: 39 passed
+# Run specific test
+pytest agents/business_analyst/tests/test_agent.py::test_full_pipeline -v
+
+# Quick smoke-test three query classes from the CLI
+python -m agents.business_analyst.agent --ticker AAPL \
+    --task "What sector is Apple in?" --verbose          # → SIMPLE
+
+python -m agents.business_analyst.agent --ticker NVDA \
+    --task "What revenue guidance did NVIDIA give?" --verbose   # → NUMERICAL
+
+python -m agents.business_analyst.agent --ticker TSLA \
+    --task "What are Tesla's key business risks and how does sentiment reflect them?" \
+    --verbose                                            # → COMPLEX
 ```
-
-All tests are unit/integration tests with mocked external services (Neo4j, PostgreSQL, Ollama). No live infrastructure required to run the test suite.
-
----
-
-*Last updated: 2026-02-26*

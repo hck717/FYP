@@ -38,6 +38,22 @@ class SentimentSnapshot:
     source: str = "postgresql:sentiment_trends"
 
 
+@dataclass(slots=True)
+class MetadataProfile:
+    ticker: str
+    neo4j_chunk_count: int
+    neo4j_chunk_index_ready: bool
+    pgvector_chunk_count: int
+    pgvector_table_ready: bool
+    pgvector_embedding_index: bool
+    has_sentiment: bool
+    sentiment_last_updated: Optional[str]
+    last_checked: float
+    has_neo4j_chunks: bool
+    has_pg_fundamentals: bool
+    has_pg_timeseries: bool
+
+
 def serialise_chunk(chunk: Chunk) -> Dict[str, Any]:
     return {
         "chunk_id": chunk.chunk_id,
@@ -54,4 +70,5 @@ __all__ = [
     "RetrievalResult",
     "SentimentSnapshot",
     "serialise_chunk",
+    "MetadataProfile",
 ]

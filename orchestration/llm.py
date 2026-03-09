@@ -21,7 +21,11 @@ import requests
 
 logger = logging.getLogger(__name__)
 
-_OLLAMA_BASE_URL  = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+# Determine Ollama URL based on environment
+from pathlib import Path
+_IN_DOCKER = Path("/.dockerenv").exists()
+_DEFAULT_OLLAMA = "http://host.docker.internal:11434" if _IN_DOCKER else "http://localhost:11434"
+_OLLAMA_BASE_URL  = os.getenv("OLLAMA_BASE_URL", _DEFAULT_OLLAMA)
 _PLANNER_MODEL    = os.getenv(
     "ORCHESTRATION_PLANNER_MODEL",
     # Use llama3.2:latest for planning — it is fast (~3s) and reliable.

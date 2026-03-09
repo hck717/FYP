@@ -10,10 +10,46 @@ from typing import Any, Dict, List, Optional
 import requests
 
 from .config import BusinessAnalystConfig
-from .prompts import SYSTEM_PROMPT, JSON_SCHEMA_PROMPT, REWRITE_PROMPT
+from .prompts import SYSTEM_PROMPT, JSON_SCHEMA_PROMPT, QUERY_CLASSIFICATION_PROMPT, REWRITE_PROMPT
 from .schema import SentimentSnapshot
 
 logger = logging.getLogger(__name__)
+
+
+def _sanitise_json_string_newlines(text: str) -> str:
+    """Replace literal newlines inside JSON string values with \\n escape sequences.
+
+    LLMs (especially deepseek-r1) frequently emit multi-paragraph string values
+    with bare newline characters, which is invalid JSON (RFC 7159 §7 requires
+    that control characters including U+000A be escaped as \\n inside strings).
+
+    Strategy: scan the text tracking whether we are inside a quoted string.
+    When inside a string, replace bare CR/LF with their JSON escape equivalents.
+    """
+    result: list[str] = []
+    in_str = False
+    escape = False
+    for ch in text:
+        if escape:
+            escape = False
+            result.append(ch)
+            continue
+        if ch == "\\" and in_str:
+            escape = True
+            result.append(ch)
+            continue
+        if ch == '"':
+            in_str = not in_str
+            result.append(ch)
+            continue
+        if in_str and ch == "\n":
+            result.append("\\n")
+            continue
+        if in_str and ch == "\r":
+            result.append("\\r")
+            continue
+        result.append(ch)
+    return "".join(result)
 
 
 def _strip_think_tags(text: str) -> str:
@@ -46,8 +82,10 @@ def _extract_json_from_text(text: str) -> Dict[str, Any]:
 
     Strategy:
     1. Try parsing the text directly (after stripping markdown fences).
-    2. Find first ``{`` … matching ``}`` balanced brace substring and parse that.
-    3. Raise JSONDecodeError if no valid JSON object found.
+    2. Sanitise literal newlines inside strings, then retry.
+    3. Find first ``{`` … matching ``}`` balanced brace substring and parse that
+       (with and without newline sanitisation).
+    4. Raise JSONDecodeError if no valid JSON object found.
     """
     cleaned = _strip_markdown_fences(text)
     # Direct parse (ideal case)
@@ -55,40 +93,47 @@ def _extract_json_from_text(text: str) -> Dict[str, Any]:
         return json.loads(cleaned)
     except json.JSONDecodeError:
         pass
-    # Find first balanced JSON object using brace matching
-    start = cleaned.find("{")
-    if start != -1:
-        depth = 0
-        in_str = False
-        escape = False
-        for i, ch in enumerate(cleaned[start:], start=start):
-            if escape:
-                escape = False
-                continue
-            if ch == "\\" and in_str:
-                escape = True
-                continue
-            if ch == '"':
-                in_str = not in_str
-                continue
-            if in_str:
-                continue
-            if ch == "{":
-                depth += 1
-            elif ch == "}":
-                depth -= 1
-                if depth == 0:
-                    try:
-                        return json.loads(cleaned[start : i + 1])
-                    except json.JSONDecodeError:
-                        break
+    # Sanitise embedded newlines in strings and retry — LLMs often violate RFC 7159
+    sanitised = _sanitise_json_string_newlines(cleaned)
+    try:
+        return json.loads(sanitised)
+    except json.JSONDecodeError:
+        pass
+    # Find first balanced JSON object using brace matching (on sanitised text)
+    for attempt_text in (sanitised, cleaned):
+        start = attempt_text.find("{")
+        if start != -1:
+            depth = 0
+            in_str = False
+            escape = False
+            for i, ch in enumerate(attempt_text[start:], start=start):
+                if escape:
+                    escape = False
+                    continue
+                if ch == "\\" and in_str:
+                    escape = True
+                    continue
+                if ch == '"':
+                    in_str = not in_str
+                    continue
+                if in_str:
+                    continue
+                if ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        try:
+                            return json.loads(attempt_text[start : i + 1])
+                        except json.JSONDecodeError:
+                            break
 
-        # Balanced-brace scan failed — likely truncated JSON.
-        # Attempt repair: close all unclosed { and [ with matching } and ].
-        fragment = cleaned[start:]
-        repaired = _repair_truncated_json(fragment)
-        if repaired is not None:
-            return repaired
+            # Balanced-brace scan failed — likely truncated JSON.
+            # Attempt repair: close all unclosed { and [ with matching } and ].
+            fragment = attempt_text[start:]
+            repaired = _repair_truncated_json(fragment)
+            if repaired is not None:
+                return repaired
 
     raise json.JSONDecodeError("No valid JSON object found in text", cleaned, 0)
 
@@ -172,13 +217,28 @@ class LLMClient:
     def generate(self, query: str, ticker: Optional[str], context: str, sentiment: Optional[SentimentSnapshot] = None) -> Dict[str, Any]:
         # Extract real chunk IDs from context so we can inject them into the prompt
         # to prevent the LLM from constructing plausible-looking but wrong IDs.
-        real_chunk_ids = re.findall(r'chunk_id: (qdrant::[^\]]+|neo4j::[^\]]+)', context)
+        # Matches:
+        #   neo4j::TICKER::...  (indexed with neo4j prefix)
+        #   pgvec::TICKER::...  (pgvector)
+        #   qdrant::TICKER::... (legacy)
+        #   TICKER::...         (bare format from Neo4jConnector — no prefix)
+        # The pattern captures everything from chunk_id: up to the first ']' or newline.
+        real_chunk_ids = re.findall(
+            r'chunk_id:\s*((?:neo4j|pgvec|qdrant)::[^\]\n]+|[A-Z]{1,6}::[^\]\n]+)',
+            context,
+        )
+        # Deduplicate while preserving order
+        seen: set = set()
+        real_chunk_ids = [c for c in real_chunk_ids if not (c in seen or seen.add(c))]  # type: ignore[func-returns-value]
         prompt = self._build_prompt(query, ticker, context, sentiment, real_chunk_ids)
         payload = {
             "model": self.config.llm_model,
             "prompt": prompt,
             "temperature": self.config.llm_temperature,
             "num_predict": self.config.llm_max_tokens,
+            # num_ctx MUST be set explicitly — Ollama's default (4096) is smaller
+            # than our prompt alone, causing silent truncation and garbage output.
+            "num_ctx": self.config.llm_num_ctx,
             "stream": False,
         }
         resp = requests.post(
@@ -187,7 +247,15 @@ class LLMClient:
             timeout=self.config.request_timeout,
         )
         resp.raise_for_status()
-        content = resp.json().get("response", "")
+        resp_data = resp.json()
+        content = resp_data.get("response", "")
+        # Log token usage for diagnosing context-window and generation-budget issues
+        logger.debug(
+            "Ollama generate stats: prompt_eval_count=%s eval_count=%s eval_duration_ms=%s",
+            resp_data.get("prompt_eval_count"),
+            resp_data.get("eval_count"),
+            int(resp_data.get("eval_duration", 0) / 1e6),
+        )
 
         # If the model returned an empty response (can happen when think=False
         # conflicts with the model's generation mode), retry without that flag.
@@ -211,6 +279,8 @@ class LLMClient:
                 "Raw response snippet: %.300s",
                 content,
             )
+            # Log the full raw content at DEBUG level for diagnosis
+            logger.debug("LLM full raw response (first attempt):\n%s", content)
 
         # --- Retry with Ollama's native JSON mode ---
         # This forces the model to emit a valid JSON object regardless of its
@@ -226,9 +296,11 @@ class LLMClient:
             "prompt": json_mode_prompt,
             "temperature": 0.0,          # deterministic for the retry
             "num_predict": self.config.llm_max_tokens,
+            "num_ctx": self.config.llm_num_ctx,
             "stream": False,
             "format": "json",            # Ollama native JSON mode
         }
+        retry_content = ""
         try:
             json_resp = requests.post(
                 f"{self.config.ollama_base_url}/api/generate",
@@ -237,6 +309,7 @@ class LLMClient:
             )
             json_resp.raise_for_status()
             retry_content = json_resp.json().get("response", "")
+            logger.debug("LLM format:json retry raw response snippet: %.500s", retry_content)
             result = _extract_json(retry_content)
             logger.info("LLM JSON retry (format:json) succeeded.")
             return result
@@ -244,9 +317,42 @@ class LLMClient:
             logger.error(
                 "LLM JSON decode failed after format:json retry: %s\nRaw response snippet: %.500s",
                 exc,
-                retry_content if "retry_content" in dir() else "",
+                retry_content,
             )
             raise
+
+    def classify_query(self, query: str) -> str:
+        """Classify a query as SIMPLE, NUMERICAL, or COMPLEX using a lightweight model.
+
+        Uses ``config.query_classifier_model`` (default: llama3.2:latest) for speed.
+        Returns one of the three class strings; falls back to "COMPLEX" on any error
+        so the full retrieval pipeline is always available as a safe default.
+        """
+        prompt = QUERY_CLASSIFICATION_PROMPT.replace("{{query}}", query)
+        payload = {
+            "model": self.config.query_classifier_model,
+            "prompt": prompt,
+            "temperature": 0.0,
+            "num_predict": 10,
+            "stream": False,
+        }
+        try:
+            resp = requests.post(
+                f"{self.config.ollama_base_url}/api/generate",
+                json=payload,
+                timeout=30,  # short timeout — lightweight classification only
+            )
+            resp.raise_for_status()
+            raw = resp.json().get("response", "").strip().upper()
+            # Extract the first word to handle trailing punctuation/whitespace
+            word = raw.split()[0] if raw.split() else ""
+            if word in ("SIMPLE", "NUMERICAL", "COMPLEX"):
+                return word
+            logger.warning("[ClassifyQuery] unexpected response %r — defaulting to COMPLEX", raw)
+            return "COMPLEX"
+        except Exception as exc:
+            logger.warning("[ClassifyQuery] classification failed: %s — defaulting to COMPLEX", exc)
+            return "COMPLEX"
 
     def rewrite_query(self, query: str) -> str:
         payload = {

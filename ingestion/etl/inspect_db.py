@@ -353,16 +353,45 @@ def check_neo4j() -> bool:
                 print(_fail("Neo4j vector index 'chunk_embedding' NOT FOUND"))
                 all_pass = False
 
-            # Per-ticker chunk coverage
+            # Per-ticker chunk coverage - breakdown by section
             result = session.run(
                 "MATCH (c:Company)-[:HAS_CHUNK]->(ch:Chunk) "
-                "RETURN c.ticker AS ticker, count(ch) AS n ORDER BY ticker"
+                "RETURN c.ticker AS ticker, ch.section AS section, count(ch) AS n "
+                "ORDER BY ticker, section"
             ).data()
             if result:
+                # Group by ticker
+                ticker_chunks = {}
                 for row in result:
-                    print(_ok(f"  Neo4j chunks [{row['ticker']}]: {row['n']}"))
+                    t = row['ticker']
+                    s = row['section']
+                    n = row['n']
+                    if t not in ticker_chunks:
+                        ticker_chunks[t] = {}
+                    ticker_chunks[t][s] = n
+                
+                for ticker in sorted(ticker_chunks.keys()):
+                    sections = ticker_chunks[ticker]
+                    total = sum(sections.values())
+                    # Show breakdown
+                    breakdown = ", ".join([f"{k}:{v}" for k, v in sections.items()])
+                    print(_ok(f"  Neo4j chunks [{ticker}]: {total} total ({breakdown})"))
             else:
                 print(_warn("No Company->Chunk relationships found"))
+
+            # Check for textual document types specifically
+            print("\n--- Textual Document Coverage ---")
+            for section in ['earnings_call', 'broker_report']:
+                result = session.run(
+                    f"MATCH (c:Company)-[:HAS_CHUNK]->(ch:Chunk {{section: '{section}'}}) "
+                    "RETURN c.ticker AS ticker, count(ch) AS n ORDER BY ticker"
+                ).data()
+                if result and sum(r['n'] for r in result) > 0:
+                    total = sum(r['n'] for r in result)
+                    tickers_covered = [r['ticker'] for r in result if r['n'] > 0]
+                    print(_ok(f"{section}: {total} chunks across {len(tickers_covered)} tickers ({', '.join(tickers_covered)})"))
+                else:
+                    print(_warn(f"{section}: 0 chunks (run ingest_earnings_calls.py or ingest_broker_reports.py)"))
 
     except Exception as exc:
         print(_fail(f"Neo4j query failed: {exc}"))

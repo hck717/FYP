@@ -7,20 +7,38 @@ import logging
 import math
 import os
 import re as _re_top
+import time
+from collections import OrderedDict
 from contextlib import closing
-from datetime import datetime, timezone
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+import hashlib
+import threading
 
 import psycopg2
 from neo4j import GraphDatabase, basic_auth
 from psycopg2.extras import RealDictCursor
 import requests
 
-from .config import BusinessAnalystConfig
-from .schema import Chunk, CRAGStatus, RetrievalResult, SentimentSnapshot
+try:
+    from orchestration.data_availability import check_all, ticker_data_profile
+    _ORCHESTRATION_AVAILABLE = True
+except ModuleNotFoundError:
+    # orchestration package not on sys.path (e.g. running outside the repo root).
+    # The metadata profile degrades gracefully: has_pg_fundamentals / has_pg_timeseries
+    # will be False, but all other pipeline functionality is unaffected.
+    _ORCHESTRATION_AVAILABLE = False
 
-# Cross-encoder reranker — loaded lazily so import never hard-fails.
+    def check_all(*args, **kwargs):  # type: ignore[misc]
+        return {}
+
+    def ticker_data_profile(*args, **kwargs):  # type: ignore[misc]
+        return {}
+
+from .config import BusinessAnalystConfig
+from .schema import Chunk, CRAGStatus, MetadataProfile, RetrievalResult, SentimentSnapshot
+
 _CrossEncoder = None  # type: ignore[assignment]
 
 def _get_cross_encoder_class():
@@ -34,6 +52,110 @@ def _get_cross_encoder_class():
     return _CrossEncoder
 
 logger = logging.getLogger(__name__)
+
+
+# ----------------------------------------------------------------------------
+# Process-level metadata cache (singleton, thread-safe)
+# ----------------------------------------------------------------------------
+
+@dataclass(slots=True)
+class _MetadataCacheEntry:
+    profile: MetadataProfile
+    expires_at: float
+
+
+class _MetadataCache:
+    """Thread-safe in-process TTL cache for MetadataProfile objects.
+
+    A single instance is shared across all toolkit instances within a
+    process so repeated calls within the same pipeline run hit the cache
+    rather than re-querying Neo4j / PostgreSQL.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._store: Dict[str, _MetadataCacheEntry] = {}
+
+    def get(self, ticker: str) -> Optional[MetadataProfile]:
+        with self._lock:
+            entry = self._store.get(ticker.upper())
+            if entry is None:
+                return None
+            if time.monotonic() > entry.expires_at:
+                del self._store[ticker.upper()]
+                return None
+            return entry.profile
+
+    def set(self, ticker: str, profile: MetadataProfile, ttl: float) -> None:
+        with self._lock:
+            self._store[ticker.upper()] = _MetadataCacheEntry(
+                profile=profile,
+                expires_at=time.monotonic() + ttl,
+            )
+
+
+# Singleton — one per process
+_METADATA_CACHE = _MetadataCache()
+
+
+# ----------------------------------------------------------------------------
+# Process-level semantic cache (LRU + TTL)
+# ----------------------------------------------------------------------------
+
+@dataclass(slots=True)
+class _SemanticCacheEntry:
+    retrieval: RetrievalResult
+    expires_at: float
+
+
+class _SemanticCache:
+    """Thread-safe LRU + TTL cache keyed on (ticker, query_hash).
+
+    A cache hit returns a previously computed RetrievalResult so the
+    pipeline can skip the embedding + vector-search round-trip for
+    repeated or near-identical queries (e.g. hot tickers like AAPL).
+    """
+
+    def __init__(self, max_entries: int = 128) -> None:
+        self._lock = threading.Lock()
+        self._store: OrderedDict[str, _SemanticCacheEntry] = OrderedDict()
+        self._max = max_entries
+
+    @staticmethod
+    def _key(ticker: Optional[str], query: str) -> str:
+        raw = f"{(ticker or '').upper()}::{query.strip().lower()}"
+        return hashlib.md5(raw.encode()).hexdigest()
+
+    def get(self, ticker: Optional[str], query: str) -> Optional[RetrievalResult]:
+        key = self._key(ticker, query)
+        with self._lock:
+            entry = self._store.get(key)
+            if entry is None:
+                return None
+            if time.monotonic() > entry.expires_at:
+                del self._store[key]
+                return None
+            # LRU: move to end
+            self._store.move_to_end(key)
+            return entry.retrieval
+
+    def set(self, ticker: Optional[str], query: str, retrieval: RetrievalResult, ttl: float) -> None:
+        key = self._key(ticker, query)
+        with self._lock:
+            if key in self._store:
+                self._store.move_to_end(key)
+            self._store[key] = _SemanticCacheEntry(
+                retrieval=retrieval,
+                expires_at=time.monotonic() + ttl,
+            )
+            # Evict LRU entry if over capacity
+            while len(self._store) > self._max:
+                self._store.popitem(last=False)
+
+
+# Singleton — one per process (max_entries updated on first toolkit init)
+_SEMANTIC_CACHE = _SemanticCache(max_entries=128)
+
 
 
 # ----------------------------------------------------------------------------
@@ -366,6 +488,34 @@ class Neo4jConnector:
             logger.warning("fetch_etf_constituents failed for %s: %s", ticker, exc)
             return []
 
+    def fetch_chunk_count(self, ticker: Optional[str]) -> int:
+        """Return the number of Chunk nodes for *ticker* in Neo4j (fast COUNT query)."""
+        if not ticker:
+            return 0
+        cypher = """
+        MATCH (c:Company {ticker: $ticker})-[:HAS_CHUNK]->(ch:Chunk)
+        RETURN count(ch) AS n
+        """
+        try:
+            with self.driver.session(database=None) as session:
+                record = session.run(cypher, ticker=ticker).single()
+                return int(record["n"]) if record else 0
+        except Exception as exc:
+            logger.warning("[Neo4j] chunk count query failed for %s: %s", ticker, exc)
+            return 0
+
+    def is_vector_index_online(self) -> bool:
+        """Return True when the chunk_embedding vector index is ONLINE."""
+        cypher = "SHOW INDEXES YIELD name, state WHERE name = $name RETURN state"
+        try:
+            with self.driver.session(database=None) as session:
+                record = session.run(cypher, name=self.config.neo4j_chunk_index).single()
+                if record:
+                    return str(record["state"]).upper() == "ONLINE"
+        except Exception as exc:
+            logger.warning("[Neo4j] vector index status query failed: %s", exc)
+        return False
+
     def close(self) -> None:
         self.driver.close()
 
@@ -664,6 +814,38 @@ class PgVectorConnector:
             )
         return chunks
 
+    def chunk_count(self, ticker: Optional[str]) -> int:
+        """Return the number of embedded rows in text_chunks for *ticker*."""
+        if not ticker:
+            return 0
+        sql = "SELECT COUNT(*) AS n FROM text_chunks WHERE ticker = %s AND embedding IS NOT NULL"
+        try:
+            conn = self._pg_connect()
+            with closing(conn), conn.cursor() as cur:
+                cur.execute(sql, (ticker,))
+                row = cur.fetchone()
+                return int(row[0]) if row else 0
+        except Exception as exc:
+            logger.warning("[PgVector] chunk_count failed for %s: %s", ticker, exc)
+            return 0
+
+    def has_embedding_index(self) -> bool:
+        """Return True when an ivfflat/hnsw index exists on text_chunks.embedding."""
+        sql = """
+        SELECT indexname FROM pg_indexes
+        WHERE tablename = 'text_chunks'
+          AND indexdef ILIKE '%embedding%'
+        LIMIT 1
+        """
+        try:
+            conn = self._pg_connect()
+            with closing(conn), conn.cursor() as cur:
+                cur.execute(sql)
+                return cur.fetchone() is not None
+        except Exception as exc:
+            logger.warning("[PgVector] has_embedding_index check failed: %s", exc)
+            return False
+
 
 # ----------------------------------------------------------------------------
 # Keyword scorer (BM25-lite)
@@ -685,6 +867,57 @@ def _sigmoid_normalise(scores: List[float]) -> List[float]:
     """Map raw cross-encoder logits to [0, 1] via sigmoid."""
     import math as _math
     return [1.0 / (1.0 + _math.exp(-s)) for s in scores]
+
+
+def _rrf_fuse(
+    ranked_lists: List[List[Chunk]],
+    k: int = 60,
+) -> List[Chunk]:
+    """Reciprocal Rank Fusion over multiple ranked chunk lists.
+
+    For each list, the RRF score for a chunk at rank ``r`` (1-indexed) is
+    ``1 / (k + r)``.  Scores are summed across lists so a chunk appearing
+    in multiple lists gets a composite boost.
+
+    Args:
+        ranked_lists: Each element is an ordered list of Chunk objects
+                      (best first).  Duplicate chunk_ids across lists are
+                      merged — the chunk text/metadata from the first
+                      occurrence is kept.
+        k:            RRF constant (default 60, from the original paper).
+
+    Returns:
+        A single deduplicated list sorted by descending RRF score, with
+        ``chunk.score`` updated to the normalised RRF composite score.
+    """
+    rrf_scores: Dict[str, float] = {}
+    chunk_map: Dict[str, Chunk] = {}
+
+    for ranked in ranked_lists:
+        for rank, chunk in enumerate(ranked, start=1):
+            cid = chunk.chunk_id
+            rrf_scores[cid] = rrf_scores.get(cid, 0.0) + 1.0 / (k + rank)
+            if cid not in chunk_map:
+                chunk_map[cid] = chunk
+
+    # Normalise RRF scores to [0, 1] by dividing by the theoretical maximum
+    # (a chunk appearing at rank 1 in every list: n_lists * 1/(k+1))
+    n = max(len(ranked_lists), 1)
+    max_score = n / (k + 1)
+    result: List[Chunk] = []
+    for cid, rrf in sorted(rrf_scores.items(), key=lambda x: -x[1]):
+        base_chunk = chunk_map[cid]
+        normed = min(rrf / max_score, 1.0)
+        result.append(
+            Chunk(
+                chunk_id=base_chunk.chunk_id,
+                text=base_chunk.text,
+                score=normed,
+                source=base_chunk.source,
+                metadata=base_chunk.metadata,
+            )
+        )
+    return result
 
 
 # ----------------------------------------------------------------------------
@@ -779,10 +1012,267 @@ class BusinessAnalystToolkit:
         )
         self.neo4j = Neo4jConnector(self.config)
         self.pg = PostgresConnector(self.config)
+        self.pgvec = PgVectorConnector(self.config)
         self.evaluator = CRAGEvaluator(self.config)
+        # Update singleton semantic cache size from config (idempotent on repeated init)
+        global _SEMANTIC_CACHE
+        _SEMANTIC_CACHE._max = self.config.semantic_cache_max_entries
 
-    def fetch_company_overview(self, ticker: Optional[str]) -> Optional[Dict[str, Any]]:
-        return self.neo4j.fetch_company_overview(ticker)
+    # ------------------------------------------------------------------
+    # Metadata pre-check (cached)
+    # ------------------------------------------------------------------
+
+    def get_metadata_profile(self, ticker: str) -> MetadataProfile:
+        """Return a cached MetadataProfile for *ticker*.
+
+        The profile captures:
+        - Neo4j Chunk node count + vector index readiness
+        - pgvector row count + embedding index presence
+        - Sentiment data availability
+
+        Results are cached in-process for ``config.metadata_cache_ttl`` seconds
+        (default 60 s) to avoid repeated DB round-trips within a single run.
+        """
+        cached = _METADATA_CACHE.get(ticker)
+        if cached is not None:
+            logger.debug("[MetadataCache] HIT for ticker=%s", ticker)
+            return cached
+
+        logger.debug("[MetadataCache] MISS for ticker=%s — querying backends", ticker)
+
+        # Neo4j
+        neo4j_chunk_count = 0
+        neo4j_index_ready = False
+        try:
+            neo4j_chunk_count = self.neo4j.fetch_chunk_count(ticker)
+            neo4j_index_ready = self.neo4j.is_vector_index_online()
+        except Exception as exc:
+            logger.warning("[MetadataProfile] Neo4j query failed for %s: %s", ticker, exc)
+
+        # pgvector
+        pgvec_count = 0
+        pgvec_table_ready = False
+        pgvec_index = False
+        try:
+            pgvec_count = self.pgvec.chunk_count(ticker)
+            pgvec_table_ready = True
+            pgvec_index = self.pgvec.has_embedding_index()
+        except Exception as exc:
+            logger.warning("[MetadataProfile] pgvector query failed for %s: %s", ticker, exc)
+
+        # Sentiment
+        has_sentiment = False
+        sentiment_last_updated: Optional[str] = None
+        try:
+            snap = self.pg.fetch_sentiment(ticker)
+            has_sentiment = snap is not None
+        except Exception as exc:
+            logger.warning("[MetadataProfile] sentiment check failed for %s: %s", ticker, exc)
+
+        # Fundamentals / timeseries flags (reuse check_all from data_availability)
+        has_pg_fundamentals = False
+        has_pg_timeseries = False
+        try:
+            avail_all = check_all(tickers=[ticker])
+            av = ticker_data_profile(avail_all, ticker)
+            has_pg_fundamentals = bool(av.get("has_fundamentals", False))
+            has_pg_timeseries = bool(av.get("has_timeseries", False))
+        except Exception as exc:
+            logger.debug("[MetadataProfile] data_availability profile failed for %s: %s", ticker, exc)
+
+        profile = MetadataProfile(
+            ticker=ticker,
+            neo4j_chunk_count=neo4j_chunk_count,
+            neo4j_chunk_index_ready=neo4j_index_ready,
+            pgvector_chunk_count=pgvec_count,
+            pgvector_table_ready=pgvec_table_ready,
+            pgvector_embedding_index=pgvec_index,
+            has_sentiment=has_sentiment,
+            sentiment_last_updated=sentiment_last_updated,
+            last_checked=time.monotonic(),
+            has_neo4j_chunks=neo4j_chunk_count > 0,
+            has_pg_fundamentals=has_pg_fundamentals,
+            has_pg_timeseries=has_pg_timeseries,
+        )
+        _METADATA_CACHE.set(ticker, profile, ttl=self.config.metadata_cache_ttl)
+        logger.info(
+            "[MetadataProfile] ticker=%s neo4j_chunks=%d pgvec_chunks=%d "
+            "sentiment=%s neo4j_index=%s",
+            ticker, neo4j_chunk_count, pgvec_count, has_sentiment, neo4j_index_ready,
+        )
+        return profile
+
+    # ------------------------------------------------------------------
+    # Fast-path retrieval (vector + BM25, no full graph traversal)
+    # ------------------------------------------------------------------
+
+    def retrieve_fast(self, query: str, ticker: Optional[str]) -> RetrievalResult:
+        """Stage-1 fast hybrid retrieval for SIMPLE and NUMERICAL query paths.
+
+        Uses a smaller top_k budget (``config.fast_path_top_k``) and skips
+        graph traversal / cross-encoder reranking to minimise latency.
+        Checks the semantic cache first; populates it on miss.
+        """
+        # Semantic cache check
+        cached = _SEMANTIC_CACHE.get(ticker, query)
+        if cached is not None:
+            logger.info("[SemanticCache] HIT for ticker=%s (fast path)", ticker)
+            return cached
+
+        try:
+            vector = self.embedding.embed(query)
+            chunks = self.neo4j.vector_search(vector, ticker, top_k=self.config.fast_path_top_k)
+
+            # BM25 re-scoring blend
+            for i, chunk in enumerate(chunks):
+                bm25 = keyword_overlap_score(chunk.text, query)
+                chunks[i] = Chunk(
+                    chunk_id=chunk.chunk_id,
+                    text=chunk.text,
+                    score=0.7 * chunk.score + 0.3 * bm25,
+                    source=chunk.source,
+                    metadata=chunk.metadata,
+                )
+            chunks.sort(key=lambda c: -c.score)
+            result = RetrievalResult(chunks=chunks, graph_facts=[], bm25_debug={})
+        except Exception as exc:
+            logger.error("Fast-path retrieval failed: %s", exc)
+            result = RetrievalResult(chunks=[], graph_facts=[], bm25_debug={})
+
+        _SEMANTIC_CACHE.set(ticker, query, result, ttl=self.config.semantic_cache_ttl)
+        return result
+
+    # ------------------------------------------------------------------
+    # Multi-stage retrieval (Stage 1 recall → Stage 2 rerank + graph → RRF)
+    # ------------------------------------------------------------------
+
+    def retrieve_multi_stage(self, query: str, ticker: Optional[str]) -> RetrievalResult:
+        """Two-stage retrieval for COMPLEX query paths.
+
+        Stage 1 — Fast bi-encoder recall:
+            - Neo4j vector search top-``multi_stage_recall_k`` (dense)
+            - pgvector vector search top-``multi_stage_recall_k`` (dense)
+            - BM25 keyword scoring over Neo4j results
+
+        Stage 2 — Cross-encoder precision rerank + graph traversal:
+            - Cross-encoder (ms-marco-MiniLM-L-6-v2) re-scores the Stage-1
+              recall pool; degrades gracefully if sentence-transformers absent.
+            - Graph-traversal facts (HAS_STRATEGY / HAS_FACT) appended as
+              supplementary context.
+
+        Fusion — Reciprocal Rank Fusion (RRF) merges all scored lists into a
+        single ordered result, returning the top ``config.top_k`` chunks.
+
+        Results are cached in the semantic cache (TTL = ``config.semantic_cache_ttl``).
+        """
+        # Semantic cache check
+        cached = _SEMANTIC_CACHE.get(ticker, query)
+        if cached is not None:
+            logger.info("[SemanticCache] HIT for ticker=%s (multi-stage path)", ticker)
+            return cached
+
+        recall_k = self.config.multi_stage_recall_k
+        final_k = self.config.top_k
+
+        try:
+            vector = self.embedding.embed(query)
+        except Exception as exc:
+            logger.error("Embedding failed in multi-stage retrieval: %s", exc)
+            return RetrievalResult(chunks=[], graph_facts=[], bm25_debug={})
+
+        # --- Stage 1: Bi-encoder recall ---
+        neo4j_chunks: List[Chunk] = []
+        pgvec_chunks: List[Chunk] = []
+        try:
+            neo4j_chunks = self.neo4j.vector_search(vector, ticker, top_k=recall_k)
+        except Exception as exc:
+            logger.warning("[MultiStage] Neo4j recall failed: %s", exc)
+        try:
+            pgvec_chunks = self.pgvec.vector_search(vector, ticker, top_k=recall_k)
+        except Exception as exc:
+            logger.warning("[MultiStage] pgvector recall failed: %s", exc)
+
+        # BM25 re-scoring on Neo4j results
+        bm25_ranked: List[Chunk] = []
+        for chunk in neo4j_chunks:
+            bm25 = keyword_overlap_score(chunk.text, query)
+            bm25_ranked.append(
+                Chunk(
+                    chunk_id=chunk.chunk_id,
+                    text=chunk.text,
+                    score=bm25,
+                    source=chunk.source,
+                    metadata=chunk.metadata,
+                )
+            )
+        bm25_ranked.sort(key=lambda c: -c.score)
+
+        # --- Stage 2: Cross-encoder rerank ---
+        # Merge recall pool (deduplicated by chunk_id)
+        recall_pool: List[Chunk] = []
+        seen_ids: set = set()
+        for chunk in neo4j_chunks + pgvec_chunks:
+            if chunk.chunk_id not in seen_ids:
+                recall_pool.append(chunk)
+                seen_ids.add(chunk.chunk_id)
+
+        ce_ranked: List[Chunk] = []
+        CE = _get_cross_encoder_class()
+        if CE is not None and recall_pool:
+            try:
+                ce_model = CE(self.config.reranker_model)
+                pairs = [(query, c.text[:512]) for c in recall_pool]
+                raw_scores: List[float] = ce_model.predict(pairs).tolist()  # type: ignore[union-attr]
+                norm_scores = _sigmoid_normalise(raw_scores)
+                ce_ranked = [
+                    Chunk(
+                        chunk_id=recall_pool[i].chunk_id,
+                        text=recall_pool[i].text,
+                        score=norm_scores[i],
+                        source=recall_pool[i].source,
+                        metadata=recall_pool[i].metadata,
+                    )
+                    for i in range(len(recall_pool))
+                ]
+                ce_ranked.sort(key=lambda c: -c.score)
+                logger.debug(
+                    "[MultiStage] Cross-encoder reranked %d chunks; top score=%.3f",
+                    len(ce_ranked), ce_ranked[0].score if ce_ranked else 0.0,
+                )
+            except Exception as exc:
+                logger.warning("[MultiStage] Cross-encoder rerank failed: %s", exc)
+                ce_ranked = sorted(recall_pool, key=lambda c: -c.score)
+        else:
+            # Degrade gracefully: sort recall pool by bi-encoder score
+            ce_ranked = sorted(recall_pool, key=lambda c: -c.score)
+
+        # --- RRF Fusion ---
+        ranked_lists = [neo4j_chunks, pgvec_chunks, bm25_ranked, ce_ranked]
+        fused = _rrf_fuse([lst for lst in ranked_lists if lst], k=60)
+        fused = fused[:final_k]
+
+        # --- Graph traversal facts (supplementary context) ---
+        graph_facts: List[Dict[str, Any]] = []
+        try:
+            graph_facts = self.neo4j.fetch_graph_facts(ticker, limit=25)
+        except Exception as exc:
+            logger.warning("[MultiStage] graph facts fetch failed: %s", exc)
+
+        result = RetrievalResult(
+            chunks=fused,
+            graph_facts=graph_facts,
+            bm25_debug={"bm25_pool_size": len(bm25_ranked), "recall_pool_size": len(recall_pool)},
+        )
+        _SEMANTIC_CACHE.set(ticker, query, result, ttl=self.config.semantic_cache_ttl)
+        return result
+
+    # ------------------------------------------------------------------
+    # Existing retrieval (kept as default / backward compat)
+    # ------------------------------------------------------------------
+
+    def retrieve(self, query: str, ticker: Optional[str]) -> RetrievalResult:
+        """Default retrieval (wraps retrieve_multi_stage for the complex path)."""
+        return self.retrieve_multi_stage(query, ticker)
 
     def fetch_community_summary(self, ticker: Optional[str]) -> Optional[str]:
         """Return graph-community summary string for *ticker* (see Neo4jConnector)."""
@@ -790,6 +1280,14 @@ class BusinessAnalystToolkit:
             return self.neo4j.fetch_community_summary(ticker)
         except Exception as exc:
             logger.warning("Community summary fetch failed for %s: %s", ticker, exc)
+            return None
+
+    def fetch_company_overview(self, ticker: Optional[str]) -> Optional[Dict[str, Any]]:
+        """Return the Neo4j Company node properties for *ticker*."""
+        try:
+            return self.neo4j.fetch_company_overview(ticker)
+        except Exception as exc:
+            logger.warning("Company overview fetch failed for %s: %s", ticker, exc)
             return None
 
     def fetch_sentiment(self, ticker: Optional[str]) -> Optional[SentimentSnapshot]:
@@ -878,15 +1376,6 @@ class BusinessAnalystToolkit:
         except Exception as exc:
             logger.warning("Textual documents fetch failed for %s: %s", ticker, exc)
             return []
-
-    def retrieve(self, query: str, ticker: Optional[str]) -> RetrievalResult:
-        try:
-            vector = self.embedding.embed(query)
-            chunks = self.neo4j.vector_search(vector, ticker, top_k=self.config.top_k)
-            return RetrievalResult(chunks=chunks, graph_facts=[], bm25_debug={})
-        except Exception as exc:
-            logger.error("Neo4j retrieval failed: %s", exc)
-            return RetrievalResult(chunks=[], graph_facts=[], bm25_debug={})
 
     def evaluate(self, chunks: Sequence[Chunk], ticker: Optional[str] = None) -> CRAGEvaluation:
         return self.evaluator.evaluate(chunks, ticker=ticker)
