@@ -45,17 +45,22 @@ x-airflow-common:
     FMP_API_KEY: 6kqjitcYPxyr60Xy1Jfem92Q1z9LfCHM
     EODHD_API_KEY: 6957671cac2858.27368157
 
-    # Ollama - use host-gateway for cross-platform compatibility (works on Mac, Linux, Windows)
-    # The extra_hosts section maps host.docker.internal to the host gateway IP
-    OLLAMA_BASE_URL: http://host.docker.internal:11434
-    OLLAMA_HOST: host.docker.internal
+    # DeepSeek API — used by the Business Analyst agent (replaces Ollama for generation)
+    DEEPSEEK_API_KEY: 
+    BUSINESS_ANALYST_LLM_PROVIDER: deepseek
+
+    # Ollama – still used for embeddings (nomic-embed-text)
+    OLLAMA_BASE_URL: http://ollama:11434
+    OLLAMA_HOST: ollama
     OLLAMA_PORT: 11434
 
-    # LLM & Embedding models (using your earlier values)
-    LLM_MODEL_BUSINESS_ANALYST: llama3.2:3b
+    # Embedding model — lock to tagged version to prevent silent model drift.
+    # Override with EMBEDDING_MODEL env var if you pull a different version.
+    LLM_MODEL_BUSINESS_ANALYST: deepseek-reasoner
     LLM_MODEL_QUANTITATIVE: llama3.2:3b
     LLM_MODEL_FINANCIAL_MODELING: llama3.2:3b
-    EMBEDDING_MODEL: nomic-embed-text
+    EMBEDDING_MODEL: nomic-embed-text:v1.5
+    EMBEDDING_MODEL_VERSION: "1.0"
     EMBEDDING_DIMENSION: 768
 
     # Other common database / agent settings
@@ -68,12 +73,13 @@ x-airflow-common:
     BUSINESS_ANALYST_MAX_CHUNKS: 50
     BUSINESS_ANALYST_CHUNK_SIZE: 1000
     BUSINESS_ANALYST_OVERLAP: 200
-    # LLM generation token budget — deepseek-r1:8b supports 32k context.
-    # 16000 is needed to accommodate <think> blocks + full JSON schema output.
-    BUSINESS_ANALYST_MAX_TOKENS: 16000
-    # num_ctx: Ollama context window.  Default Ollama value is 4096, which is
-    # smaller than the BA prompt alone (~4500-8000 tokens).  Must be explicit.
-    BUSINESS_ANALYST_NUM_CTX: 32768
+    # DeepSeek API — max output tokens for deepseek-reasoner (supports up to 32k)
+    BUSINESS_ANALYST_MAX_TOKENS: 32000
+
+    # BA agent tuning — all configurable without code changes
+    BA_MAX_REWRITE_LOOPS: 3
+    CRAG_CORRECT_THRESHOLD: "0.6"
+    CRAG_AMBIGUOUS_THRESHOLD: "0.4"
 
     TRACKED_TICKERS: "AAPL,TSLA,NVDA,MSFT,GOOGL"
 
@@ -83,9 +89,9 @@ x-airflow-common:
     # this automatically, but direct python invocations do not).
     PYTHONPATH: /opt/airflow
 
-    # You can add more agent/ingestion settings here if needed (hard-coded)
-    # QUANT_AGENT_SQL_TIMEOUT: 30
-    # etc.
+    # Slack webhook for Airflow failure notifications (optional).
+    # Set this variable to enable alerts: SLACK_WEBHOOK_URL: https://hooks.slack.com/...
+    # SLACK_WEBHOOK_URL: ""
 
   volumes:
     - ./ingestion/dags:/opt/airflow/dags
@@ -95,11 +101,11 @@ x-airflow-common:
     - ./agents:/opt/airflow/agents
     - ./orchestration:/opt/airflow/orchestration
     - ./data:/opt/airflow/data
-  extra_hosts:
-    - "host.docker.internal:host-gateway"
   depends_on:
     &airflow-common-depends-on
     postgres:
+      condition: service_healthy
+    ollama:
       condition: service_healthy
 
 services:
@@ -134,17 +140,58 @@ services:
       NEO4J_server_memory_heap_initial__size: "256m"
       NEO4J_server_memory_heap_max__size: "512m"
       NEO4J_server_memory_pagecache_size: "256m"
+      # Prevent the entrypoint from looping on password-reset when the DB is
+      # already initialized (avoids "Neo4j is already running" crash loop on restart)
+      NEO4J_EDITION: community
     volumes:
       - ./data/neo4j_data:/data
       - ./data/neo4j_logs:/logs
       - ./data/neo4j_import:/var/lib/neo4j/import
       - ./data/neo4j_plugins:/plugins
-    restart: always
+    restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:7474 || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 5
+      start_period: 30s
+
+  # ── Ollama LLM / embedding service ─────────────────────────────────────────
+  # Runs as a proper Docker service so all other containers reach it via
+  # http://ollama:11434 — no more host.docker.internal hacks on Linux/Mac/Windows.
+  #
+  # GPU support (NVIDIA): uncomment the `deploy` block below and ensure the
+  # NVIDIA Container Toolkit is installed (https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/).
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-data:/root/.ollama
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 30s
+      timeout: 10s
+      retries: 20
+      start_period: 120s
+    entrypoint: ["/bin/sh", "-c"]
+    command: >
+      "
+      ollama serve &
+      SERVE_PID=$$!;
+      echo 'Waiting for Ollama server...';
+      i=0; while [ $$i -lt 300 ]; do
+        ollama list > /dev/null 2>&1 && break;
+        sleep 1; i=$$(($$i+1));
+      done;
+      echo 'Pulling models if missing...';
+      ollama pull llama3.2:latest || echo 'llama3.2 skipped/failed';
+      ollama pull deepseek-r1:8b || echo 'deepseek-r1 skipped/failed';
+      ollama pull nomic-embed-text:v1.5 || echo 'nomic skipped/failed';
+      echo 'Models pulled, ready!';
+      wait $$SERVE_PID
+      "
 
   airflow-webserver:
     <<: *airflow-common
@@ -181,10 +228,23 @@ services:
           --lastname User \
           --role Admin \
           --email admin@example.com || true
+        # Pull required Ollama models on first startup
+        echo "[init] Pulling Ollama models via http://ollama:11434 ..."
+        curl -sf http://ollama:11434/api/tags && \
+          curl -X POST http://ollama:11434/api/pull -d '{"name":"nomic-embed-text:v1.5"}' && \
+          curl -X POST http://ollama:11434/api/pull -d '{"name":"llama3.2:3b"}' || \
+          echo "[init] WARNING: Could not pull Ollama models — pull manually after startup."
     depends_on:
       postgres:
         condition: service_healthy
+      ollama:
+        condition: service_healthy
     restart: "no"
+
+volumes:
+  # Named volume for Ollama model storage.
+  # Use `docker volume inspect fyp_ollama-data` to locate the data on the host.
+  ollama-data:
 
 networks:
   default:

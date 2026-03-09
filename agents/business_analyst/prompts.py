@@ -30,9 +30,12 @@ CRITICAL - DOCUMENT TYPES NOW AVAILABLE:
    - Risk assessments from sell-side perspective
 
 IMPORTANT - CITATION FORMAT:
-- Neo4j chunk IDs follow format: neo4j::TICKER::source_type::document_name::chunk_number
-  Example: "neo4j::TICKER::earnings_call::Q4 2025 Earnings::5"
-- pgvector chunk IDs follow format: pgvec::TICKER::<uuid>
+- Chunk IDs follow format: TICKER::section::content_hash  (e.g. "AAPL::broker_report::efd9122b713b00f6")
+- Each chunk header in the context shows: [chunk_id: <id>] (relevance=..., source_name='<human name>', ...)
+- When citing a chunk inline, use the format: [<source_name> | <chunk_id>]
+  Example: [Wells Fargo | AAPL::broker_report::efd9122b713b00f6]
+  Example: [AAPL Earnings Call Q4 2025 | AAPL::earnings_call::3a7c1d9f2b0e5f8a]
+- Use the source_name exactly as shown in the chunk header — do not invent institution names.
 - ONLY use chunk_ids that appear VERBATIM in the "Valid chunk IDs" list injected below the context.
   Do NOT construct or guess chunk_ids. If you are not 100% certain an ID is on the list, omit the citation.
 
@@ -41,7 +44,9 @@ IMPORTANT - CITATION FORMAT:
 1. Output MUST be a single valid JSON object. No markdown fences (no ```), no prose outside the JSON.
 
 2. CITATIONS: Every factual claim must be cited with a chunk_id taken VERBATIM from the
-   "Valid chunk IDs" list injected below. Do NOT shorten, truncate, or invent chunk_ids.
+   "Valid chunk IDs" list injected below. Format: [<source_name> | <chunk_id>] where
+   source_name comes from the chunk header's source_name field. Do NOT shorten, truncate,
+   or invent chunk_ids or source names.
    Forbidden citation forms: [implied from context], [implied from general context],
    [general context], [assumed], or any chunk_id not in the provided list.
 
@@ -70,8 +75,9 @@ IMPORTANT - CITATION FORMAT:
 9. No newlines inside JSON string values. No trailing commas.
 
 10. INLINE CITATION DISCIPLINE: When you write a citation inside a prose string
-    (e.g. inside "narrative", "risk", "strategic_implication"), the chunk_id you
-    place in brackets MUST appear verbatim in the "Valid chunk IDs" list below.
+    (e.g. inside "narrative", "risk", "strategic_implication"), format it as:
+    [<source_name> | <chunk_id>] where source_name comes from the chunk header.
+    The chunk_id you place MUST appear verbatim in the "Valid chunk IDs" list below.
     If you are not 100% certain the exact ID is on that list, write the claim
     WITHOUT any citation bracket — do NOT write [source unavailable], [unknown],
     or any other placeholder. Omit the bracket entirely.
@@ -118,6 +124,17 @@ Return ONLY a valid JSON object matching this structure (no markdown, no extra k
     "source": "postgresql:sentiment_trends",
     "sentiment_interpretation": "MINIMUM 8 sentences about {{ticker}} only. (1) State the exact bullish/bearish/neutral split and compare explicitly to the ~55% large-cap baseline — is {{ticker}} above, at, or below that rate, and by how much? (2) Characterise what the dominant bullish cohort is specifically betting on for {{ticker}} — name the thesis in concrete terms. (3) Characterise what the bearish minority fears for {{ticker}} — name the precise risk mechanism. (4) Identify any tension between the headline sentiment reading and the documentary evidence in the retrieved chunks. (5) Assess the quality of the bullish consensus for {{ticker}}. (6) State what the trend direction implies for near-term investor perception. (7) Comment on the neutral cohort conviction level. (8) Conclude with the single most important thing the sentiment distribution tells a portfolio manager about {{ticker}} that the quantitative data alone would not reveal. No chunk citations — sentiment is from PostgreSQL, not documents."
   },
+  "qualitative_analysis": {
+    "narrative": "MINIMUM 20-25 sentences synthesising all retrieved evidence about {{ticker}} into a cohesive investment thesis. Structure: (1) OPENING THESIS (2-3 sentences): state the single most important finding about {{ticker}}'s competitive position, earnings quality, or risk profile. (2) COMPETITIVE POSITION & MOAT DEPTH (4-5 sentences): analyse the primary moat source in depth. (3) BUSINESS MODEL DURABILITY (4-5 sentences): break down the revenue mix for {{ticker}}. (4) MARGIN TRAJECTORY (3-4 sentences): state direction of gross and EBIT margins and identify the specific driver. (5) CAPITAL ALLOCATION (3-4 sentences): evaluate how {{ticker}} management is deploying free cash flow. (6) STRATEGIC POSITIONING (3-4 sentences): the single most important strategic bet for {{ticker}} over the next 2-3 years. Cite verbatim chunk_ids from the Valid chunk IDs list for every factual claim.",
+    "sentiment_signal": "MINIMUM 6 sentences: (1) Does the {{ticker}} sentiment distribution corroborate or contradict the documentary evidence? (2) Identify at least one specific tension. (3) What is the most plausible explanation for any gap? (4) How does the trend direction align with the fundamental evidence? (5) What does this imply about where the next re-rating catalyst is most likely to come from? (6) The single most actionable implication for a portfolio manager from this comparison. No chunk citations — sentiment is from PostgreSQL.",
+    "strategic_implication": "MINIMUM 5-6 sentences on the single most important strategic implication for {{ticker}} over the next 2-3 years, grounded entirely in retrieved evidence. (1) State the strategic implication in one declarative sentence. (2) Explain the mechanism in detail. (3) State the bull case conditions. (4) State the bear case conditions. (5) Identify the single most important leading indicator to watch. (6) Cite at least one chunk_id verbatim from the Valid chunk IDs list — omit if you cannot find an exact match.",
+    "data_quality_note": "MINIMUM 4 sentences: (1) How many chunks were retrieved and what was the relevance score distribution? (2) Which analytical questions were well-served by the retrieved content? (3) Which questions were poorly served — name the pillars where evidence was absent or ambiguous? (4) What is the aggregate impact of the data gaps on the reliability of this analysis?"
+  },
+  "sentiment_verdict": {
+    "signal": "CONSTRUCTIVE|CAUTIOUS|NEUTRAL|DETERIORATING",
+    "rationale": "MINIMUM 5 sentences about {{ticker}} combining the sentiment % data, trend direction, and document evidence. (1) State the signal and justify it referencing both the {{ticker}} sentiment % and the document evidence. (2) Expand on what the dominant sentiment cohort is seeing for {{ticker}}. (3) Expand on what the minority cohort fears about {{ticker}}. (4) State whether the document evidence validates the bull or bear case — and which specific piece of evidence is most decisive. (5) State the conditions under which this verdict would change direction. Signal definitions: CONSTRUCTIVE = bullish_pct >60% AND trend improving or stable AND documents support the bull case; CAUTIOUS = bearish_pct >30% OR trend deteriorating OR documents show elevated risk despite high bullish %; NEUTRAL = balanced distribution with no clear trend; DETERIORATING = bearish_pct >40% AND trend deteriorating AND document evidence supports bear case. Do NOT use the words buy, sell, or hold.",
+    "confidence": "HIGH|MEDIUM|LOW — with a 1-sentence justification about the {{ticker}} evidence quality"
+  },
   "competitive_moat": {
     "rating": "wide|narrow|none — choose the single most defensible rating given all retrieved evidence about {{ticker}}",
     "key_strengths": [
@@ -135,25 +152,6 @@ Return ONLY a valid JSON object matching this structure (no markdown, no extra k
     "sources": ["List ONLY chunk_ids verbatim from the Valid chunk IDs list that directly support the moat assessment. Do NOT invent IDs. Use empty list if none apply."],
     "moat_trajectory": "2-3 sentences: is {{ticker}}'s moat widening, stable, or narrowing? What is the primary force driving the trajectory? What would need to happen to reverse it? Cite at least one chunk_id from the Valid chunk IDs list if available."
   },
-  "key_risks": [
-    {
-      "risk": "MINIMUM 4 sentences per risk entry about {{ticker}}. (1) Name the risk precisely — specific named mechanisms, not generic categories. (2) Explain the exact mechanism: the specific chain from trigger to financial impact — which revenue line or margin is affected and how. (3) Quantify the financial magnitude where context provides evidence; if no magnitude is in the documents, say so explicitly. (4) Identify the observed mitigation — quote or paraphrase the specific management action from retrieved context. Cite the chunk_id verbatim from the Valid chunk IDs list. If no mitigation is present in the context, state that explicitly. Provide up to 5 risks covering: (A) competitive/market share, (B) regulatory/legal, (C) macro/cycle, (D) operational/execution, (E) financial/balance sheet.",
-      "severity": "HIGH|MEDIUM|LOW",
-      "mitigation_observed": "Specific evidence of management response from retrieved context. Use null only if no mitigation evidence exists.",
-      "source": "exact_chunk_id_from_valid_list_only_or_null"
-    }
-  ],
-  "qualitative_analysis": {
-    "narrative": "MINIMUM 20-25 sentences synthesising all retrieved evidence about {{ticker}} into a cohesive investment thesis. Structure: (1) OPENING THESIS (2-3 sentences): state the single most important finding about {{ticker}}'s competitive position, earnings quality, or risk profile. (2) COMPETITIVE POSITION & MOAT DEPTH (4-5 sentences): analyse the primary moat source in depth. (3) BUSINESS MODEL DURABILITY (4-5 sentences): break down the revenue mix for {{ticker}}. (4) MARGIN TRAJECTORY (3-4 sentences): state direction of gross and EBIT margins and identify the specific driver. (5) CAPITAL ALLOCATION (3-4 sentences): evaluate how {{ticker}} management is deploying free cash flow. (6) STRATEGIC POSITIONING (3-4 sentences): the single most important strategic bet for {{ticker}} over the next 2-3 years. Cite verbatim chunk_ids from the Valid chunk IDs list for every factual claim.",
-    "sentiment_signal": "MINIMUM 6 sentences: (1) Does the {{ticker}} sentiment distribution corroborate or contradict the documentary evidence? (2) Identify at least one specific tension. (3) What is the most plausible explanation for any gap? (4) How does the trend direction align with the fundamental evidence? (5) What does this imply about where the next re-rating catalyst is most likely to come from? (6) The single most actionable implication for a portfolio manager from this comparison. No chunk citations — sentiment is from PostgreSQL.",
-    "strategic_implication": "MINIMUM 5-6 sentences on the single most important strategic implication for {{ticker}} over the next 2-3 years, grounded entirely in retrieved evidence. (1) State the strategic implication in one declarative sentence. (2) Explain the mechanism in detail. (3) State the bull case conditions. (4) State the bear case conditions. (5) Identify the single most important leading indicator to watch. (6) Cite at least one chunk_id verbatim from the Valid chunk IDs list — omit if you cannot find an exact match.",
-    "data_quality_note": "MINIMUM 4 sentences: (1) How many chunks were retrieved and what was the relevance score distribution? (2) Which analytical questions were well-served by the retrieved content? (3) Which questions were poorly served — name the pillars where evidence was absent or ambiguous? (4) What is the aggregate impact of the data gaps on the reliability of this analysis?"
-  },
-  "sentiment_verdict": {
-    "signal": "CONSTRUCTIVE|CAUTIOUS|NEUTRAL|DETERIORATING",
-    "rationale": "MINIMUM 5 sentences about {{ticker}} combining the sentiment % data, trend direction, and document evidence. (1) State the signal and justify it referencing both the {{ticker}} sentiment % and the document evidence. (2) Expand on what the dominant sentiment cohort is seeing for {{ticker}}. (3) Expand on what the minority cohort fears about {{ticker}}. (4) State whether the document evidence validates the bull or bear case — and which specific piece of evidence is most decisive. (5) State the conditions under which this verdict would change direction. Signal definitions: CONSTRUCTIVE = bullish_pct >60% AND trend improving or stable AND documents support the bull case; CAUTIOUS = bearish_pct >30% OR trend deteriorating OR documents show elevated risk despite high bullish %; NEUTRAL = balanced distribution with no clear trend; DETERIORATING = bearish_pct >40% AND trend deteriorating AND document evidence supports bear case. Do NOT use the words buy, sell, or hold.",
-    "confidence": "HIGH|MEDIUM|LOW — with a 1-sentence justification about the {{ticker}} evidence quality"
-  },
   "management_guidance": {
     "most_recent_guidance": "MINIMUM 3 sentences about {{ticker}}. (1) Quote or paraphrase the most recent quantitative guidance figures for {{ticker}} from any retrieved chunk. (2) Identify any changes from prior guidance periods. (3) Note the tone of {{ticker}} management. Cite the chunk_id verbatim from the Valid chunk IDs list.",
     "earnings_call_highlights": ["MINIMUM 4 items if earnings call content is present for {{ticker}}. Prioritise: (1) Q&A SESSION insights; (2) CFO remarks; (3) CEO strategic priorities; (4) Metric emphasis. Each item MUST paraphrase the specific statement in 2-3 sentences and include verbatim chunk_id from the Valid chunk IDs list."],
@@ -168,6 +166,14 @@ Return ONLY a valid JSON object matching this structure (no markdown, no extra k
     ],
     "forward_outlook_summary": "MINIMUM 5 sentences synthesising {{ticker}} management's total forward-looking stance. (1) Is {{ticker}} management guiding higher, lower, or in-line? (2) Capital allocation priorities. (3) Segments/initiatives flagged as growth drivers. (4) Risks/headwinds acknowledged. (5) What management communication reveals about execution confidence. Cite chunk_ids verbatim from the Valid chunk IDs list."
   },
+  "key_risks": [
+    {
+      "risk": "MINIMUM 4 sentences per risk entry about {{ticker}}. (1) Name the risk precisely — specific named mechanisms, not generic categories. (2) Explain the exact mechanism: the specific chain from trigger to financial impact — which revenue line or margin is affected and how. (3) Quantify the financial magnitude where context provides evidence; if no magnitude is in the documents, say so explicitly. (4) Identify the observed mitigation — quote or paraphrase the specific management action from retrieved context. Cite the chunk_id verbatim from the Valid chunk IDs list. If no mitigation is present in the context, state that explicitly. Provide up to 5 risks covering: (A) competitive/market share, (B) regulatory/legal, (C) macro/cycle, (D) operational/execution, (E) financial/balance sheet.",
+      "severity": "HIGH|MEDIUM|LOW",
+      "mitigation_observed": "Specific evidence of management response from retrieved context. Use null only if no mitigation evidence exists.",
+      "source": "exact_chunk_id_from_valid_list_only_or_null"
+    }
+  ],
   "missing_context": [
     {
       "gap": "MINIMUM 2 sentences per gap. (1) Name the specific data type absent from retrieved context for {{ticker}}. (2) Explain the specific analytical decision this data would have informed. Provide up to 4 gaps.",

@@ -18,11 +18,13 @@ Design choices
                      after every real HTTP call (cached calls don’t count).
 * Retry logic:       _fetch() retries up to 3x with exponential backoff using
                      tenacity (graceful fallback if not installed).
-* Sentiment source:  sentiment_trends → EODHD endpoint
-                     https://eodhd.com/api/sentiments?s={ticker}&api_token=...&fmt=json
-                     Described as “Bullish/bearish/neutral sentiment scores”.
-                     A post-processing step computes a daily net_sentiment_score
-                     = (bullish - bearish) / total for downstream agent use.
+* Sentiment source:  sentiment_trends → aggregated from /api/news per-article
+                     sentiment fields (pos / neg / neu).  After financial_news is
+                     saved, _aggregate_news_sentiment() groups articles by date,
+                     averages pos/neg/neu, and writes sentiment_trends.csv so the
+                     PostgreSQL loader upserts real bullish/bearish/neutral rows.
+                     The old /api/sentiments "normalized" scalar endpoint has been
+                     removed — it did not provide bullish/bearish/neutral data.
 * Timeouts:          scrape task   → 20 min  (fundamentals endpoint is large)
                      load tasks    →  8 min
                      summary task  →  2 min
@@ -45,7 +47,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import math
 import os
 import pathlib
 import sys
@@ -155,7 +156,7 @@ DATA_ENDPOINTS: list[tuple] = [
     # ── Row 6: Intraday / Live Quotes (shared HTTP call) ───────────────────────
     ("realtime_quote",            "real-time/{ticker}",          {},                                                        "postgresql", "Real-time / delayed stock quote"),
     ("live_stock_price",          "real-time/{ticker}",          {},                                                        "postgresql", "Alias of realtime_quote — live price snapshot"),
-    ("intraday_1m",               "intraday/{ticker}",           {"interval": "1m", "from": "{date_7d}", "to": "{ts_now}"},  "postgresql", "1-minute intraday bars (current trading day)"),
+    ("intraday_1m",               "intraday/{ticker}",           {"interval": "1m", "from": "{ts_7d}", "to": "{ts_now}"},   "postgresql", "1-minute intraday bars (last 7 days)"),
     # ── Row 7: Technicals (13 indicators from data_needed.txt) ───────────────────
     ("technical_rsi",             "technical/{ticker}",          {"function": "rsi",      "period": 14},                      "postgresql", "RSI-14 technical indicator"),
     ("technical_macd",            "technical/{ticker}",          {"function": "macd",     "fast_period": 12, "slow_period": 26, "signal_period": 9}, "postgresql", "MACD line/signal/histogram"),
@@ -174,11 +175,11 @@ DATA_ENDPOINTS: list[tuple] = [
     ("dividends_history",         "div/{ticker}",                {},                                                        "postgresql", "Historical dividend payments"),
     ("splits_history",            "splits/{ticker}",             {},                                                        "postgresql", "Historical stock splits"),
     # ── Row 16: Financial Calendar (per-ticker) ─────────────────────────────────
-    ("financial_calendar",        "calendar/earnings",           {"symbols": "{ticker}", "from": "{date_365d}", "to": "{date_future_90d}"}, "postgresql", "Upcoming and recent earnings dates per ticker"),
+    ("financial_calendar",        "calendar/earnings",           {"symbols": "{ticker_symbol}", "from": "{date_365d}", "to": "{date_future_90d}"}, "postgresql", "Upcoming and recent earnings dates per ticker"),
     # ── Row 18: Financial Calendar macro — global IPO / splits / dividends ───────
     ("calendar_ipo",              "calendar/ipos",               {"from": "{date_today}", "to": "{date_future_90d}"},                    "postgresql", "Upcoming IPO calendar (global)"),
     ("calendar_splits",           "calendar/splits",             {"from": "{date_today}", "to": "{date_future_90d}"},                    "postgresql", "Upcoming stock split calendar"),
-    ("calendar_dividends",        "calendar/dividends",          {"filter[date_eq]": "{date_today}"},                                "postgresql", "Global dividend calendar for today (filter[date_eq] required by EODHD)"),
+    ("calendar_dividends",        "calendar/dividends",          {"from": "{date_today}", "to": "{date_future_90d}"},                     "postgresql", "Global dividend calendar for next 90 days"),
     # ── Row 18: Financial Statements (Income, Balance, Cash Flow) ───────────────
     ("financial_statements",      "fundamentals/{ticker}",       {"filter": "Financials"},                                  "postgresql", "Income statement, balance sheet, cash flow (quarterly + annual)"),
     # ── Row 21: Earnings History & Surprises ─────────────────────────────────
@@ -187,21 +188,17 @@ DATA_ENDPOINTS: list[tuple] = [
     ("short_interest",            "fundamentals/{ticker}",       {"filter": "SharesStats"},                                 "postgresql", "Short interest, float, insider/institution ownership %"),
     # ── Row 22: Outstanding Shares History ──────────────────────────────────
     ("outstanding_shares",        "fundamentals/{ticker}",       {"filter": "outstandingShares"},                           "postgresql", "Historical outstanding shares count (annual + quarterly)"),
-    # ── Row 7 (sentiment) ────────────────────────────────────────────────────────────
-    # Source: https://eodhd.com/api/sentiments?s={ticker}&api_token=...&fmt=json
-    # Description: Bullish/bearish/neutral sentiment scores per ticker per date.
-    # Post-processing: net_sentiment_score = (bullish - bearish) / total
-    ("sentiment_trends",          "sentiments",                  {"s": "{ticker_symbol}"},                                   "postgresql", "Bullish/bearish/neutral sentiment scores from EODHD sentiments API"),
+    # ── Row 7 (sentiment) — derived from financial_news aggregation ─────────────
+    # sentiment_trends is populated by _aggregate_news_sentiment() called inside
+    # _save_data() when data_name == "financial_news".  It groups the per-article
+    # pos/neg/neu fields by date and writes sentiment_trends.csv / .json.
+    # The old /api/sentiments endpoint (scalar "normalized") has been removed.
+    # ── Row 8: News Word Weights ─────────────────────────────────────────────────
+    ("news_word_weights",         "news-word-weights",           {"s": "{ticker_symbol}", "filter[date_from]": "{date_30d}", "filter[date_to]": "{date_today}", "page[limit]": 100}, "postgresql", "Top news word weights per ticker (last 30 days)"),
     # ── Macro / global (fetched once, stored under _MACRO) ───────────────────────
     ("screener_bulk",             "screener",                    {"limit": 100},                                            "postgresql", "Bulk market screener — top 100 stocks"),
-    ("treasury_rates",            "eod/US10Y.GBOND",             {"from": "{date_30d}"},                                    "postgresql", "US 10-year Treasury yield (GBOND)"),
-    ("treasury_rates_3m",         "eod/US3M.GBOND",              {"from": "{date_30d}"},                                    "postgresql", "US 3-month Treasury yield"),
-    ("treasury_rates_6m",         "eod/US6M.GBOND",              {"from": "{date_30d}"},                                    "postgresql", "US 6-month Treasury yield"),
-    ("treasury_rates_1y",         "eod/US1Y.GBOND",              {"from": "{date_30d}"},                                    "postgresql", "US 1-year Treasury yield"),
-    ("treasury_rates_2y",         "eod/US2Y.GBOND",              {"from": "{date_30d}"},                                    "postgresql", "US 2-year Treasury yield"),
-    ("treasury_rates_5y",         "eod/US5Y.GBOND",              {"from": "{date_30d}"},                                    "postgresql", "US 5-year Treasury yield"),
-    ("treasury_rates_20y",        "eod/US20Y.GBOND",             {"from": "{date_30d}"},                                    "postgresql", "US 20-year Treasury yield"),
-    ("treasury_rates_30y",        "eod/US30Y.GBOND",             {"from": "{date_30d}"},                                    "postgresql", "US 30-year Treasury yield"),
+    ("treasury_bill_rates",       "ust/bill-rates",              {"from": "{date_30d}", "to": "{date_today}"},              "postgresql", "UST bill rates (4-week, 3M, 6M, 1Y) from dedicated UST API"),
+    ("treasury_yield_curve",      "ust/yield-rates",             {"from": "{date_30d}", "to": "{date_today}"},              "postgresql", "Full UST par yield curve (2Y, 3Y, 5Y, 7Y, 10Y, 20Y, 30Y) from UST API"),
     ("economic_indicators_gdp",   "macro-indicator/USA",         {"indicator": "gdp_growth_annual"},                        "postgresql", "US GDP growth rate macro indicator"),
     ("economic_indicators_cpi",   "macro-indicator/USA",         {"indicator": "consumer_price_index"},                     "postgresql", "US CPI inflation macro indicator"),
     ("economic_indicators_unemployment", "macro-indicator/USA",  {"indicator": "unemployment_total_percent"},               "postgresql", "US unemployment rate macro indicator"),
@@ -217,14 +214,8 @@ DATA_ENDPOINTS: list[tuple] = [
 # These data_names are global/macro — fetched only once for the first ticker
 MACRO_DATA_NAMES: set[str] = {
     "screener_bulk",
-    "treasury_rates",
-    "treasury_rates_3m",
-    "treasury_rates_6m",
-    "treasury_rates_1y",
-    "treasury_rates_2y",
-    "treasury_rates_5y",
-    "treasury_rates_20y",
-    "treasury_rates_30y",
+    "treasury_bill_rates",
+    "treasury_yield_curve",
     "economic_indicators_gdp",
     "economic_indicators_cpi",
     "economic_indicators_unemployment",
@@ -352,23 +343,74 @@ def _fetch(endpoint: str, params: dict | None = None) -> object | None:
         return None
 
 
-def _compute_net_sentiment(data: list[dict]) -> list[dict]:
+def _aggregate_news_sentiment(ticker_symbol: str, articles: list[dict], ticker_dir: "Path") -> None:
     """
-    Post-process raw sentiment_trends data to add a net_sentiment_score column.
-    Formula: net_sentiment_score = (bullish - bearish) / total
-    Handles zero-total gracefully (score = 0.0).
-    """
-    for row in data:
-        try:
-            bullish = float(row.get("bullish") or row.get("positive") or 0)
-            bearish = float(row.get("bearish") or row.get("negative") or 0)
-            neutral = float(row.get("neutral") or 0)
-            total = bullish + bearish + neutral
-            row["net_sentiment_score"] = round((bullish - bearish) / total, 6) if total > 0 else 0.0
-        except (TypeError, ValueError, ZeroDivisionError):
-            row["net_sentiment_score"] = 0.0
-    return data
+    Aggregate per-article sentiment (pos/neg/neu) from a list of news articles
+    into daily averages, then write sentiment_trends.json + sentiment_trends.csv
+    so the PostgreSQL loader can upsert them into sentiment_trends.
 
+    Each article is expected to have a 'sentiment' sub-dict:
+        {"polarity": 0.98, "neg": 0.054, "neu": 0.851, "pos": 0.095}
+    and a 'date' field like "2026-03-09T09:20:00+00:00".
+    """
+    if not articles:
+        return
+
+    # Accumulate pos/neg/neu per calendar date
+    buckets: dict[str, list[dict]] = {}
+    for article in articles:
+        raw_date = article.get("date") or ""
+        # Extract YYYY-MM-DD from ISO timestamp
+        date_str = str(raw_date)[:10]
+        if not date_str or date_str == "None":
+            continue
+        sentiment = article.get("sentiment")
+        if not isinstance(sentiment, dict):
+            continue
+        try:
+            pos = float(sentiment.get("pos") or 0)
+            neg = float(sentiment.get("neg") or 0)
+            neu = float(sentiment.get("neu") or 0)
+        except (TypeError, ValueError):
+            continue
+        if date_str not in buckets:
+            buckets[date_str] = []
+        buckets[date_str].append({"pos": pos, "neg": neg, "neu": neu})
+
+    if not buckets:
+        print(f"    ⊘ no sentiment data to aggregate for {ticker_symbol}")
+        return
+
+    rows = []
+    for date_str, sentiments in sorted(buckets.items()):
+        n = len(sentiments)
+        avg_pos = round(sum(s["pos"] for s in sentiments) / n, 6)
+        avg_neg = round(sum(s["neg"] for s in sentiments) / n, 6)
+        avg_neu = round(sum(s["neu"] for s in sentiments) / n, 6)
+        rows.append({
+            "date":    date_str,
+            "pos":     avg_pos,
+            "neg":     avg_neg,
+            "neu":     avg_neu,
+            "article_count": n,
+        })
+
+    if not rows:
+        return
+
+    # Write JSON
+    json_path = ticker_dir / "sentiment_trends.json"
+    with open(json_path, "w") as f:
+        json.dump(rows, f, indent=2)
+
+    # Write CSV
+    csv_path = ticker_dir / "sentiment_trends.csv"
+    try:
+        pd.DataFrame(rows).to_csv(csv_path, index=False)
+    except Exception as exc:
+        print(f"    ⚠ sentiment_trends CSV write warning: {exc}")
+
+    print(f"    ✓ sentiment_trends aggregated: {len(rows)} date-rows from {sum(len(v) for v in buckets.values())} articles  → {ticker_dir}")
 
 def _flatten_fundamentals(data: dict) -> dict:
     """Flatten EODHD fundamentals response to one CSV row."""
@@ -428,12 +470,30 @@ def _save_data(
         print(f"    ⊘ no data for {data_name}")
         return False
 
-    # Post-process sentiment data to add net_sentiment_score
-    if data_name == "sentiment_trends" and isinstance(data, list):
-        data = _compute_net_sentiment(data)
-
     ticker_dir = Path(BASE_OUTPUT_DIR) / ticker_symbol
     ticker_dir.mkdir(parents=True, exist_ok=True)
+
+    # After saving financial_news, aggregate per-article sentiment into sentiment_trends
+    if data_name == "financial_news" and isinstance(data, list):
+        _aggregate_news_sentiment(ticker_symbol, data, ticker_dir)
+        # Write a metadata entry for sentiment_trends so the PG loader picks it up
+        st_csv = ticker_dir / "sentiment_trends.csv"
+        if st_csv.exists():
+            metadata["sentiment_trends"] = {
+                "hash":                _md5(data),
+                "last_updated":        datetime.now().isoformat(),
+                "last_checked":        datetime.now().isoformat(),
+                "record_count":        len(data),
+                "source":              "eodhd",
+                "storage_destination": "postgresql",
+                "description":         "Daily sentiment (bullish/bearish/neutral) aggregated from news articles",
+                "api_endpoint":        "news",
+                "json_file":           "sentiment_trends.json",
+                "csv_file":            "sentiment_trends.csv",
+                "ticker":              ticker_symbol,
+                "data_type":           "structured",
+                "incremental":         True,
+            }
 
     new_hash = _md5(data)
     existing = metadata.get(data_name, {})
@@ -581,9 +641,11 @@ def scrape_ticker(ticker: str, ticker_symbol: str, **context) -> int:
       - exponential-backoff retry via _fetch()
       - macro-data deduplication (only first ticker fetches macro endpoints)
       - response caching within one run (financial_news ↔ realtime_news_feed, etc.)
-      - sentiment post-processing (net_sentiment_score column)
+      - sentiment aggregation: after financial_news is saved, per-article pos/neg/neu
+        fields are averaged by date and written to sentiment_trends.csv/json
     """
     now_ts = int(time.time())
+    ts_7d  = int((datetime.now() - timedelta(days=7)).timestamp())
     date_7d  = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
     date_30d = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
     date_365d = (datetime.now() - timedelta(days=365)).strftime("%Y-%m-%d")
@@ -634,6 +696,7 @@ def scrape_ticker(ticker: str, ticker_symbol: str, **context) -> int:
                         date_future_90d=date_future_90d,
                         date_today=date_today,
                         ts_now=now_ts,
+                        ts_7d=ts_7d,
                     )
                     if isinstance(v, str) else v
                 )
@@ -654,6 +717,7 @@ def scrape_ticker(ticker: str, ticker_symbol: str, **context) -> int:
                         date_future_90d=date_future_90d,
                         date_today=date_today,
                         ts_now=now_ts,
+                        ts_7d=ts_7d,
                     )
                     if isinstance(v, str) else v
                 )
@@ -689,9 +753,10 @@ def scrape_ticker(ticker: str, ticker_symbol: str, **context) -> int:
 
     _save_metadata(ticker_symbol, metadata)
 
-    print(f"\n{'\u2500'*70}")
+    _divider = "\u2500" * 70
+    print(f"\n{_divider}")
     print(f"[EODHD] {ticker_symbol}: {updates} updated, {errors} failed/empty")
-    print(f"{'\u2500'*70}")
+    print(_divider)
 
     context["task_instance"].xcom_push(
         key=f"{ticker_symbol}_updates", value=updates
@@ -728,12 +793,17 @@ def validate_loaded_data(**context) -> dict:
 
     Checks performed:
       - sentiment_trends:       must have rows for each ticker
-      - historical_prices_eod:  must have rows for each ticker
+      - raw_timeseries:         must have rows for each ticker
       - financial_statements:   must have rows for each ticker
 
     Non-critical checks (log warning only):
       - earnings_surprises
       - insider_transactions
+      - treasury_yield_curve    (macro table — no per-ticker filter)
+
+    Post-checks:
+      - sentiment_trends:  warns if any rows have net_sentiment_score=0
+                           (indicates upstream field-mapping bug)
     """
     import psycopg2
 
@@ -744,13 +814,14 @@ def validate_loaded_data(**context) -> dict:
     pg_pass = os.getenv("POSTGRES_PASSWORD", "airflow")
 
     # Table → (column, critical)
-    # column = ticker column name in that table
-    CHECKS: list[tuple[str, str, bool]] = [
+    # column = ticker column name in that table; None = macro table (no ticker filter)
+    CHECKS: list[tuple[str, str | None, bool]] = [
         ("sentiment_trends",      "ticker", True),
-        ("raw_timeseries",        "ticker", True),
+        ("raw_timeseries",        "ticker_symbol", True),
         ("financial_statements",  "ticker", True),
         ("earnings_surprises",    "ticker", False),
         ("insider_transactions",  "ticker", False),
+        ("treasury_yield_curve",  None,     False),  # macro table — no ticker col, non-critical
     ]
 
     failures: list[str] = []
@@ -764,6 +835,26 @@ def validate_loaded_data(**context) -> dict:
         with conn:
             with conn.cursor() as cur:
                 for table, col, critical in CHECKS:
+                    if col is None:
+                        # Macro table — just check total row count, no per-ticker loop
+                        try:
+                            cur.execute(f"SELECT COUNT(*) FROM {table}")
+                            row_count = cur.fetchone()[0]
+                        except Exception:
+                            row_count = 0
+                        key = table
+                        report[key] = {"rows": row_count, "critical": critical}
+                        if row_count == 0:
+                            msg = f"[VALIDATE] {table} is EMPTY"
+                            if critical:
+                                print(f"  ❌ {msg}")
+                                failures.append(msg)
+                            else:
+                                print(f"  ⚠️ {msg} (non-critical)")
+                        else:
+                            print(f"  ✓ {table}: {row_count} rows")
+                        continue
+
                     for ticker_sym in TICKER_SYMBOLS:
                         try:
                             cur.execute(
@@ -787,6 +878,25 @@ def validate_loaded_data(**context) -> dict:
                                 print(f"  ⚠️ {msg} (non-critical)")
                         else:
                             print(f"  ✓ {table}/{ticker_sym}: {row_count} rows")
+
+                # Post-check: warn if sentiment_trends rows all have zero scores
+                # (indicates a field-mapping bug upstream in the aggregation logic)
+                for ticker_sym in TICKER_SYMBOLS:
+                    try:
+                        cur.execute(
+                            "SELECT COUNT(*) FROM sentiment_trends "
+                            "WHERE net_sentiment_score = 0.0 AND ticker = %s",
+                            (ticker_sym,),
+                        )
+                        zero_count = cur.fetchone()[0]
+                        if zero_count > 0:
+                            print(
+                                f"  ⚠️ sentiment_trends has {zero_count} rows with "
+                                f"net_sentiment_score=0 for {ticker_sym} — possible field mapping bug"
+                            )
+                    except Exception:
+                        pass  # Column may not exist on first run
+
         conn.close()
     except Exception as exc:
         # Don’t block the pipeline if Postgres is unreachable during validation

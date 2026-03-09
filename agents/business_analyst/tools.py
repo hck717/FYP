@@ -1,4 +1,15 @@
-"""Connectors and helper utilities for the Business Analyst agent."""
+"""Connectors and helper utilities for the Business Analyst agent.
+
+Changes vs original:
+  - fetch_sentiment_with_fallback(): if PostgreSQL sentiment_trends is empty,
+    falls back to (1) VADER local scoring over recent Neo4j chunks, then
+    (2) TextBlob if VADER unavailable, then (3) raw chunk-count heuristic.
+    Result is returned as a SentimentSnapshot with source annotation.
+  - get_sentiment_snapshot() added as a clean single-call entry point that
+    orchestrates pg → local fallback → logs clearly.
+  - Rule-based query pre-classifier added (_rule_based_classify) to cheaply
+    detect COMPLEX queries before calling the LLM classifier.
+"""
 
 from __future__ import annotations
 
@@ -21,21 +32,6 @@ from neo4j import GraphDatabase, basic_auth
 from psycopg2.extras import RealDictCursor
 import requests
 
-try:
-    from orchestration.data_availability import check_all, ticker_data_profile
-    _ORCHESTRATION_AVAILABLE = True
-except ModuleNotFoundError:
-    # orchestration package not on sys.path (e.g. running outside the repo root).
-    # The metadata profile degrades gracefully: has_pg_fundamentals / has_pg_timeseries
-    # will be False, but all other pipeline functionality is unaffected.
-    _ORCHESTRATION_AVAILABLE = False
-
-    def check_all(*args, **kwargs):  # type: ignore[misc]
-        return {}
-
-    def ticker_data_profile(*args, **kwargs):  # type: ignore[misc]
-        return {}
-
 from .config import BusinessAnalystConfig
 from .schema import Chunk, CRAGStatus, MetadataProfile, RetrievalResult, SentimentSnapshot
 
@@ -54,9 +50,97 @@ def _get_cross_encoder_class():
 logger = logging.getLogger(__name__)
 
 
-# ----------------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
+# Chunk content-quality filter
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Legal/disclaimer phrases that flag boilerplate broker-report chunks.
+_BOILERPLATE_PHRASES = (
+    "standardized options",
+    "characteristics and risks of standardized options",
+    "important disclosures",
+    "this report has been prepared by",
+    "for important disclosures",
+    "analyst certification",
+    "reg ac certification",
+    "ubs securities llc",
+    "ubs ag",
+    "barclays capital",
+    "morgan stanley & co",
+    "as of the date of this report",
+    "past performance is not",
+    "conflicts of interest",
+    "the information contained herein",
+    "this material is not a product of",
+    "please refer to important disclosures",
+    "additional information is available upon request",
+    "redistribution or reproduction is prohibited",
+    "all rights reserved",
+)
+
+
+def _is_boilerplate(text: str) -> bool:
+    """
+    Return True if *text* is likely garbled OCR output or a legal-disclaimer
+    boilerplate chunk that should be excluded from retrieval.
+
+    Two checks:
+      1. Garbled-text: more than 40 % of whitespace-separated tokens are a
+         single character (space-separated chars from bad PDF font encoding).
+      2. Boilerplate: the chunk begins with or contains a known legal
+         disclaimer phrase.
+    """
+    if not text:
+        return True
+
+    # ── Garbled-text check ────────────────────────────────────────────────────
+    tokens = text.split()
+    if tokens:
+        single_char_ratio = sum(1 for t in tokens if len(t) == 1) / len(tokens)
+        if single_char_ratio > 0.40:
+            return True
+
+    # ── Boilerplate-phrase check ──────────────────────────────────────────────
+    lower = text.lower()
+    for phrase in _BOILERPLATE_PHRASES:
+        if phrase in lower:
+            return True
+
+    return False
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Rule-based pre-classifier (fast, no LLM call needed)
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Keywords that reliably indicate a COMPLEX (analytical) query.
+_COMPLEX_KEYWORDS = frozenset([
+    "moat", "competitive advantage", "risk", "threat", "guidance",
+    "sentiment trend", "outlook", "strategy", "valuation", "forecast",
+    "why", "explain", "compare", "versus", "vs", "analysis",
+    "long-term", "short-term", "catalyst", "headwind", "tailwind",
+    "margin", "growth rate", "dcf", "intrinsic value",
+])
+
+def rule_based_classify(query: str) -> Optional[str]:
+    """
+    Fast rule-based pre-classifier that returns 'complex' when the query
+    contains analytical keywords, or None to fall through to the LLM classifier.
+
+    Returning None means "no strong signal — let the LLM decide".
+    This runs before any LLM call so it adds zero latency on obvious cases.
+    """
+    q_lower = query.lower()
+    for kw in _COMPLEX_KEYWORDS:
+        if kw in q_lower:
+            logger.debug("[rule_based_classify] keyword=%r → complex", kw)
+            return "complex"
+    return None  # Fall through to LLM classifier
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Process-level metadata cache (singleton, thread-safe)
-# ----------------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
 
 @dataclass(slots=True)
 class _MetadataCacheEntry:
@@ -65,12 +149,7 @@ class _MetadataCacheEntry:
 
 
 class _MetadataCache:
-    """Thread-safe in-process TTL cache for MetadataProfile objects.
-
-    A single instance is shared across all toolkit instances within a
-    process so repeated calls within the same pipeline run hit the cache
-    rather than re-querying Neo4j / PostgreSQL.
-    """
+    """Thread-safe in-process TTL cache for MetadataProfile objects."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -94,13 +173,12 @@ class _MetadataCache:
             )
 
 
-# Singleton — one per process
 _METADATA_CACHE = _MetadataCache()
 
 
-# ----------------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
 # Process-level semantic cache (LRU + TTL)
-# ----------------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
 
 @dataclass(slots=True)
 class _SemanticCacheEntry:
@@ -109,12 +187,7 @@ class _SemanticCacheEntry:
 
 
 class _SemanticCache:
-    """Thread-safe LRU + TTL cache keyed on (ticker, query_hash).
-
-    A cache hit returns a previously computed RetrievalResult so the
-    pipeline can skip the embedding + vector-search round-trip for
-    repeated or near-identical queries (e.g. hot tickers like AAPL).
-    """
+    """Thread-safe LRU + TTL cache keyed on (ticker, query_hash)."""
 
     def __init__(self, max_entries: int = 128) -> None:
         self._lock = threading.Lock()
@@ -135,7 +208,6 @@ class _SemanticCache:
             if time.monotonic() > entry.expires_at:
                 del self._store[key]
                 return None
-            # LRU: move to end
             self._store.move_to_end(key)
             return entry.retrieval
 
@@ -148,19 +220,16 @@ class _SemanticCache:
                 retrieval=retrieval,
                 expires_at=time.monotonic() + ttl,
             )
-            # Evict LRU entry if over capacity
             while len(self._store) > self._max:
                 self._store.popitem(last=False)
 
 
-# Singleton — one per process (max_entries updated on first toolkit init)
 _SEMANTIC_CACHE = _SemanticCache(max_entries=128)
 
 
-
-# ----------------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
 # Embeddings
-# ----------------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
 class EmbeddingClient:
     """Thin wrapper around Ollama's embedding endpoint."""
 
@@ -170,12 +239,6 @@ class EmbeddingClient:
         self.timeout = timeout
 
     def embed(self, text: str) -> List[float]:
-        # Try new /api/embed endpoint first (Ollama >= 0.1.26, e.g. nomic-embed-text).
-        # Only fall back to the legacy /api/embeddings endpoint if the primary call
-        # fails with a non-404 error (e.g. empty vector returned).  A 404 on
-        # /api/embed means the Ollama instance is too old or the model is not loaded;
-        # in that case /api/embeddings will also 404 (it was removed in Ollama ≥ 0.2),
-        # so we surface the original error immediately instead of masking it.
         primary_exc: Optional[Exception] = None
         try:
             resp = requests.post(
@@ -188,17 +251,15 @@ class EmbeddingClient:
             embeddings = data.get("embeddings")
             if embeddings and len(embeddings) > 0 and embeddings[0]:
                 return embeddings[0]
-            # Endpoint responded but returned an empty vector — note and fall through
             primary_exc = RuntimeError(
                 f"/api/embed returned empty embeddings for model '{self.model}'. "
                 "Ensure the model is pulled: `ollama pull {self.model}`"
             )
         except requests.exceptions.HTTPError as exc:
             if exc.response is not None and exc.response.status_code == 404:
-                # 404 on /api/embed → do NOT try /api/embeddings (also absent in modern Ollama)
                 raise RuntimeError(
                     f"Ollama embedding endpoint /api/embed returned 404 for model '{self.model}'. "
-                    "Ensure Ollama ≥ 0.1.26 is running and the model is pulled: "
+                    "Ensure Ollama >= 0.1.26 is running and the model is pulled: "
                     f"`ollama pull {self.model}`"
                 ) from exc
             primary_exc = exc
@@ -210,7 +271,6 @@ class EmbeddingClient:
                 "EmbeddingClient /api/embed failed (%s), trying legacy /api/embeddings", primary_exc
             )
 
-        # Fallback to legacy /api/embeddings endpoint (Ollama < 0.1.26)
         try:
             resp = requests.post(
                 f"{self.base_url}/api/embeddings",
@@ -224,19 +284,126 @@ class EmbeddingClient:
             return embedding
         except requests.exceptions.HTTPError as exc:
             if exc.response is not None and exc.response.status_code == 404:
-                # Both endpoints returned 404 — surface the original /api/embed error
                 if primary_exc is not None:
                     raise RuntimeError(
                         f"Both /api/embed and /api/embeddings returned 404 for model '{self.model}'. "
-                        "Ensure Ollama ≥ 0.1.26 is running and the model is pulled: "
+                        "Ensure Ollama >= 0.1.26 is running and the model is pulled: "
                         f"`ollama pull {self.model}`"
                     ) from primary_exc
             raise
 
 
-# ----------------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
+# Local sentiment fallback helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _vader_sentiment(texts: List[str]) -> float:
+    """
+    Compute aggregate sentiment score using VADER (pip install vaderSentiment).
+    Returns mean compound score in [-1, +1]. Raises ImportError if not installed.
+    """
+    from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer  # type: ignore[import]
+    sia = SentimentIntensityAnalyzer()
+    scores = [sia.polarity_scores(t)["compound"] for t in texts if t.strip()]
+    return sum(scores) / len(scores) if scores else 0.0
+
+
+def _textblob_sentiment(texts: List[str]) -> float:
+    """
+    Compute aggregate sentiment polarity using TextBlob (pip install textblob).
+    Returns mean polarity in [-1, +1]. Raises ImportError if not installed.
+    """
+    from textblob import TextBlob  # type: ignore[import]
+    scores = [TextBlob(t).sentiment.polarity for t in texts if t.strip()]
+    return sum(scores) / len(scores) if scores else 0.0
+
+
+def _local_sentiment_from_chunks(chunks: List["Chunk"]) -> Optional["SentimentSnapshot"]:
+    """
+    Derive a SentimentSnapshot from a list of text chunks using local NLP.
+
+    Priority order:
+      1. VADER (vaderSentiment) — fastest, finance-aware lexicon
+      2. TextBlob              — fallback if VADER not installed
+      3. Word-count heuristic  — last resort, no external deps
+
+    Returns None only if the chunk list is empty.
+    """
+    if not chunks:
+        return None
+
+    texts = [c.text for c in chunks[:30]]  # Cap at 30 chunks for speed
+
+    score: Optional[float] = None
+    source_label = "local"
+
+    # Attempt 1: VADER
+    try:
+        score = _vader_sentiment(texts)
+        source_label = "vader"
+        logger.info("[SentimentFallback] Used VADER on %d chunks → score=%.3f", len(texts), score)
+    except ImportError:
+        pass
+    except Exception as exc:
+        logger.warning("[SentimentFallback] VADER failed: %s", exc)
+
+    # Attempt 2: TextBlob
+    if score is None:
+        try:
+            score = _textblob_sentiment(texts)
+            source_label = "textblob"
+            logger.info("[SentimentFallback] Used TextBlob on %d chunks → score=%.3f", len(texts), score)
+        except ImportError:
+            pass
+        except Exception as exc:
+            logger.warning("[SentimentFallback] TextBlob failed: %s", exc)
+
+    # Attempt 3: Simple positive/negative keyword ratio
+    if score is None:
+        _POS = frozenset(["growth", "strong", "beat", "record", "bullish", "profit", "gain", "surge", "positive"])
+        _NEG = frozenset(["loss", "miss", "decline", "weak", "risk", "bearish", "concern", "drop", "negative"])
+        pos = neg = 0
+        for text in texts:
+            tokens = set(text.lower().split())
+            pos += len(tokens & _POS)
+            neg += len(tokens & _NEG)
+        total = pos + neg
+        score = (pos - neg) / total if total > 0 else 0.0
+        source_label = "keyword_heuristic"
+        logger.info(
+            "[SentimentFallback] Used keyword heuristic (pos=%d neg=%d) → score=%.3f",
+            pos, neg, score,
+        )
+
+    # Convert scalar score to SentimentSnapshot percentages
+    # score ∈ [-1, +1] → map to bullish/bearish/neutral buckets
+    clamped = max(-1.0, min(1.0, score))
+    if clamped > 0.1:
+        bullish_pct = 50.0 + clamped * 50.0
+        bearish_pct = max(0.0, 50.0 - clamped * 50.0)
+        neutral_pct = max(0.0, 100.0 - bullish_pct - bearish_pct)
+        trend = "bullish"
+    elif clamped < -0.1:
+        bearish_pct = 50.0 + abs(clamped) * 50.0
+        bullish_pct = max(0.0, 50.0 - abs(clamped) * 50.0)
+        neutral_pct = max(0.0, 100.0 - bullish_pct - bearish_pct)
+        trend = "bearish"
+    else:
+        bullish_pct = bearish_pct = 25.0
+        neutral_pct = 50.0
+        trend = "neutral"
+
+    return SentimentSnapshot(
+        bullish_pct=round(bullish_pct, 2),
+        bearish_pct=round(bearish_pct, 2),
+        neutral_pct=round(neutral_pct, 2),
+        trend=f"{trend} (local/{source_label})",
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Neo4j
-# ----------------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
 class Neo4jConnector:
     def __init__(self, config: BusinessAnalystConfig) -> None:
         self.config = config
@@ -261,9 +428,6 @@ class Neo4jConnector:
     def fetch_graph_facts(self, ticker: Optional[str], limit: int = 25) -> List[Dict[str, Any]]:
         if not ticker:
             return []
-        # Only query relationship types that are guaranteed to exist (EODHD-ingested).
-        # FACES_RISK and COMPETES_WITH are FMP-sourced and absent when FMP DAG is paused;
-        # including them triggers Neo4j GqlStatusObject WARNING notifications.
         cypher = """
         MATCH (c:Company {ticker:$ticker})-[r:HAS_STRATEGY|HAS_FACT]->(n)
         RETURN type(r) AS rel_type, properties(n) AS node_props, properties(r) AS rel_props
@@ -300,6 +464,9 @@ class Neo4jConnector:
                node.section AS section,
                node.filing_date AS filing_date,
                node.ticker AS ticker_symbol,
+               node.institution AS institution,
+               node.source_file AS source_file,
+               node.source_name AS source_name,
                score
         LIMIT $top_k
         """
@@ -313,12 +480,36 @@ class Neo4jConnector:
             ).data()
         chunks: List[Chunk] = []
         for row in rows:
+            section = row.get("section") or ""
+            institution = row.get("institution") or ""
+            source_file = row.get("source_file") or ""
+            filing_date = row.get("filing_date") or ""
+            ticker_sym = row.get("ticker_symbol") or ""
+
+            # Prefer the stored source_name (populated during ingestion).
+            # Fall back to deriving one from source_file when the node pre-dates
+            # the ingestion fix (source_name not yet populated).
+            stored_source_name = row.get("source_name") or ""
+            if stored_source_name:
+                source_name = stored_source_name
+            elif source_file:
+                # Strip one or two .pdf extensions from the filename stem
+                stem = source_file
+                for _ in range(2):
+                    if stem.lower().endswith(".pdf"):
+                        stem = stem[:-4]
+                source_name = stem.strip() or source_file
+            else:
+                source_name = section.replace("_", " ").title() if section else "document"
             metadata = {
-                "section": row.get("section"),
-                "filing_date": row.get("filing_date"),
-                "ticker": row.get("ticker_symbol"),
+                "section": section,
+                "filing_date": filing_date,
+                "ticker": ticker_sym,
+                "institution": institution,
+                "source_file": source_file,
+                "source_name": source_name,
             }
-            chunk_id = row.get("chunk_id") or f"neo4j::{metadata['ticker']}::{metadata['section']}::{len(chunks)}"
+            chunk_id = row.get("chunk_id") or f"neo4j::{ticker_sym}::{section}::{len(chunks)}"
             score = self._normalise_score(row.get("score"))
             chunks.append(
                 Chunk(
@@ -337,7 +528,6 @@ class Neo4jConnector:
             return 0.0
         if 0 <= raw <= 1:
             return raw
-        # Neo4j returns cosine distance (0 good) → convert to similarity
         if raw >= 0:
             return max(0.0, 1.0 - raw)
         return 0.0
@@ -347,10 +537,25 @@ class Neo4jConnector:
         ticker: str,
         chunks: List[Dict[str, Any]],
         embedding_client: Optional["EmbeddingClient"] = None,
+        embedding_model_version: Optional[str] = None,
     ) -> int:
+        """Insert or update Chunk nodes in Neo4j.
+
+        Args:
+            ticker: Company ticker symbol.
+            chunks: List of chunk dicts (must contain at least ``chunk_id``,
+                ``text``, ``section``, ``filing_date``).
+            embedding_client: If provided, embeddings are computed on-the-fly
+                for chunks that do not already have an ``embedding`` key.
+            embedding_model_version: Version string stamped onto each Chunk node
+                as ``chunk.embedding_version`` so retrieval can filter by version.
+                Defaults to the config value (``EMBEDDING_MODEL_VERSION`` env var).
+        """
+        version = embedding_model_version or self.config.embedding_model_version
         rows = []
         for chunk in chunks:
             row = dict(chunk)
+            row.setdefault("embedding_version", version)
             if embedding_client is not None and "embedding" not in row:
                 try:
                     row["embedding"] = embedding_client.embed(row["text"])
@@ -367,7 +572,8 @@ class Neo4jConnector:
               chunk.section = row.section,
               chunk.filing_date = row.filing_date,
               chunk.ticker = row.ticker,
-              chunk.embedding = row.embedding
+              chunk.embedding = row.embedding,
+              chunk.embedding_version = row.embedding_version
         MERGE (c)-[:HAS_CHUNK]->(chunk)
         """
         with self.driver.session(database=None) as session:
@@ -375,19 +581,7 @@ class Neo4jConnector:
         return len(rows)
 
     def fetch_community_summary(self, ticker: Optional[str]) -> Optional[str]:
-        """Build a graph-community summary for *ticker* using relationship-count centrality.
-
-        Avoids GDS PageRank (community edition has no GDS plugin).  Instead we
-        count outgoing relationship types from the Company node and collect a
-        few sample neighbour property snippets to characterise the local
-        community.
-
-        Returns a human-readable string like:
-            "Apple (AAPL) is most centrally connected via HAS_STRATEGY (12 edges),
-             FACES_RISK (8 edges), COMPETES_WITH (5 edges).  Top connected entities:
-             [{'name': 'AI Integration', 'type': 'Strategy'}, ...]"
-        or *None* if Neo4j is unreachable or no Company node exists.
-        """
+        """Build a graph-community summary for *ticker* using relationship-count centrality."""
         if not ticker:
             return None
         cypher = """
@@ -403,21 +597,19 @@ class Neo4jConnector:
             with self.driver.session(database=None) as session:
                 result = session.run(cypher, ticker=ticker)
                 rows = [dict(rec) for rec in result]
-        except Exception as exc:  # pragma: no cover
+        except Exception as exc:
             logger.warning("[Neo4j] community summary query failed for %s: %s", ticker, exc)
             return None
 
         if not rows:
             return None
 
-        # Build a compact, readable summary string
         rel_parts: List[str] = []
         all_samples: List[Dict[str, Any]] = []
         for row in rows:
             rel_type = row.get("rel_type", "UNKNOWN")
             count = row.get("rel_count", 0)
             rel_parts.append(f"{rel_type} ({count} edges)")
-            # Flatten sample neighbour nodes, dropping embedding/vector fields
             for node in row.get("sample_nodes") or []:
                 clean = {
                     k: v for k, v in node.items()
@@ -426,8 +618,7 @@ class Neo4jConnector:
                 if clean:
                     all_samples.append(clean)
 
-        company_name = ticker  # fallback to ticker symbol
-        # Try to fetch the Company node name for a friendlier label
+        company_name = ticker
         try:
             with self.driver.session(database=None) as session:
                 name_result = session.run(
@@ -437,7 +628,7 @@ class Neo4jConnector:
                 name_row = name_result.single()
                 if name_row and name_row.get("name"):
                     company_name = name_row["name"]
-        except Exception:  # pragma: no cover
+        except Exception:
             pass
 
         rel_summary = ", ".join(rel_parts[:5]) if rel_parts else "no outgoing relationships found"
@@ -460,12 +651,7 @@ class Neo4jConnector:
             return [dict(row["insider"]) for row in result]
 
     def fetch_etf_constituents(self, ticker: str, limit: int = 50) -> List[Dict]:
-        """Fetch ETF/index constituent holdings for the given ETF ticker (Row 15).
-
-        Queries Neo4j for ETF_HOLDS_CONSTITUENT relationships from the ETF node.
-        Returns a list of constituent dicts with keys: constituent_ticker, weight,
-        shares, name (where available).
-        """
+        """Fetch ETF/index constituent holdings for the given ETF ticker."""
         cypher = """
         MATCH (etf:ETF {ticker: $ticker})-[r:ETF_HOLDS_CONSTITUENT]->(c)
         RETURN properties(c) AS constituent, properties(r) AS holding
@@ -489,7 +675,7 @@ class Neo4jConnector:
             return []
 
     def fetch_chunk_count(self, ticker: Optional[str]) -> int:
-        """Return the number of Chunk nodes for *ticker* in Neo4j (fast COUNT query)."""
+        """Return the number of Chunk nodes for *ticker* in Neo4j."""
         if not ticker:
             return 0
         cypher = """
@@ -503,6 +689,36 @@ class Neo4jConnector:
         except Exception as exc:
             logger.warning("[Neo4j] chunk count query failed for %s: %s", ticker, exc)
             return 0
+
+    def fetch_recent_chunks(self, ticker: str, limit: int = 30) -> List["Chunk"]:
+        """
+        Fetch the most recent text chunks for *ticker* from Neo4j.
+        Used by the sentiment fallback to get recent document text without
+        a vector search (no query embedding needed).
+        """
+        cypher = """
+        MATCH (c:Company {ticker: $ticker})-[:HAS_CHUNK]->(ch:Chunk)
+        RETURN ch.chunk_id AS chunk_id, ch.text AS text,
+               ch.section AS section, ch.filing_date AS filing_date
+        ORDER BY ch.filing_date DESC
+        LIMIT $limit
+        """
+        try:
+            with self.driver.session(database=None) as session:
+                rows = session.run(cypher, ticker=ticker, limit=limit).data()
+            return [
+                Chunk(
+                    chunk_id=row["chunk_id"] or f"neo4j::{ticker}::{i}",
+                    text=row.get("text", ""),
+                    score=0.0,
+                    source="neo4j",
+                    metadata={"section": row.get("section"), "filing_date": row.get("filing_date"), "ticker": ticker},
+                )
+                for i, row in enumerate(rows)
+            ]
+        except Exception as exc:
+            logger.warning("[Neo4j] fetch_recent_chunks failed for %s: %s", ticker, exc)
+            return []
 
     def is_vector_index_online(self) -> bool:
         """Return True when the chunk_embedding vector index is ONLINE."""
@@ -520,20 +736,35 @@ class Neo4jConnector:
         self.driver.close()
 
 
-# ----------------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
 # PostgreSQL
-# ----------------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
 class PostgresConnector:
     def __init__(self, config: BusinessAnalystConfig) -> None:
         self.config = config
 
-    def fetch_sentiment(self, ticker: Optional[str]) -> Optional[SentimentSnapshot]:
+    def fetch_sentiment(
+        self,
+        ticker: Optional[str],
+        max_age_days: int = 7,
+    ) -> Optional["SentimentSnapshot"]:
+        """Fetch the most recent sentiment row from PostgreSQL.
+
+        Args:
+            ticker: Ticker symbol (case-insensitive).
+            max_age_days: If the latest row is older than this many days the
+                method returns ``None`` so the caller can fall back to local NLP.
+                Defaults to 7 days.  Set to 0 to disable the age check.
+
+        Returns a ``SentimentSnapshot`` whose ``source`` field is annotated with
+        the as_of_date so callers can display data freshness.
+        """
         if not ticker:
             return None
-        # NOTE: live DB uses 'as_of_date' column; 'trend' added via migration when present
         sql = """
         SELECT bullish_pct, bearish_pct, neutral_pct,
-               COALESCE(trend, 'unknown') AS trend
+               COALESCE(trend, 'unknown') AS trend,
+               as_of_date
         FROM sentiment_trends
         WHERE ticker = %s
         ORDER BY as_of_date DESC
@@ -551,11 +782,32 @@ class PostgresConnector:
             row = cur.fetchone()
             if not row:
                 return None
+
+            as_of_date = row.get("as_of_date")
+            # Recency check: if the data is stale, signal caller to use fallback
+            if max_age_days > 0 and as_of_date is not None:
+                try:
+                    if isinstance(as_of_date, str):
+                        from datetime import date as _date
+                        as_of_date = _date.fromisoformat(as_of_date[:10])
+                    age_days = (datetime.now(timezone.utc).date() - as_of_date).days
+                    if age_days > max_age_days:
+                        logger.warning(
+                            "[Sentiment] PostgreSQL row for %s is %d days old "
+                            "(max_age_days=%d) — treating as stale, activating local fallback.",
+                            ticker, age_days, max_age_days,
+                        )
+                        return None
+                except Exception as age_exc:
+                    logger.debug("[Sentiment] Could not parse as_of_date for %s: %s", ticker, age_exc)
+
+            date_str = str(as_of_date) if as_of_date else "unknown"
             return SentimentSnapshot(
                 bullish_pct=float(row.get("bullish_pct", 0.0)),
                 bearish_pct=float(row.get("bearish_pct", 0.0)),
                 neutral_pct=float(row.get("neutral_pct", 0.0)),
                 trend=row.get("trend", "unknown"),
+                source=f"postgresql:sentiment_trends (as_of={date_str})",
             )
 
     def fetch_esg(self, ticker: str) -> Optional[Dict]:
@@ -612,10 +864,6 @@ class PostgresConnector:
         )
 
     def fetch_company_profile(self, ticker: str) -> Optional[Dict]:
-        """Fetch latest company profile for the ticker (Row 3: Company Profiles).
-
-        Queries raw_fundamentals WHERE data_name = 'company_profile'.
-        """
         sql = """
         SELECT payload, as_of_date
         FROM raw_fundamentals
@@ -639,10 +887,6 @@ class PostgresConnector:
         return payload if isinstance(payload, dict) else {}
 
     def fetch_news(self, ticker: str, limit: int = 20) -> List[Dict]:
-        """Fetch recent news items for the ticker (Rows 4/17: Financial News).
-
-        Queries raw_fundamentals WHERE data_name = 'news'.
-        """
         sql = """
         SELECT payload, as_of_date
         FROM raw_fundamentals
@@ -663,7 +907,6 @@ class PostgresConnector:
                     payload = json.loads(payload)
                 except json.JSONDecodeError:
                     pass
-            # News payload is typically a list of articles; flatten it
             if isinstance(payload, list):
                 results.extend(payload)
             elif isinstance(payload, dict):
@@ -671,7 +914,6 @@ class PostgresConnector:
         return results[:limit]
 
     def fetch_insider_transactions(self, ticker: str, limit: int = 20) -> List[Dict]:
-        """Fetch insider transactions for the ticker (Row 5: Insider Transactions)."""
         sql = """
         SELECT ticker, insider_name, transaction_type, shares, price, transaction_date
         FROM insider_transactions
@@ -686,7 +928,6 @@ class PostgresConnector:
         return [dict(r) for r in rows]
 
     def fetch_institutional_holders(self, ticker: str, limit: int = 20) -> List[Dict]:
-        """Fetch major institutional/mutual fund holders (Row 6)."""
         sql = """
         SELECT ticker, holder_name, shares, shares_change, ownership_pct, as_of_date
         FROM institutional_holders
@@ -701,7 +942,6 @@ class PostgresConnector:
         return [dict(r) for r in rows]
 
     def fetch_financial_calendar(self, ticker: str, limit: int = 10) -> List[Dict]:
-        """Fetch financial calendar events for the ticker (Row 16: Financial Calendar)."""
         sql = """
         SELECT ticker, event_type, event_date, eps_estimate, revenue_estimate
         FROM financial_calendar
@@ -716,7 +956,6 @@ class PostgresConnector:
         return [dict(r) for r in rows]
 
     def fetch_textual_documents(self, ticker: str, limit: int = 20) -> List[Dict]:
-        """Fetch textual document metadata for the ticker (Row 24: Textual Documents Metadata)."""
         sql = """
         SELECT ticker, doc_type, filename, filepath, institution, date_approx,
                file_size_bytes, md5_hash
@@ -732,16 +971,11 @@ class PostgresConnector:
         return [dict(r) for r in rows]
 
 
-# ----------------------------------------------------------------------------
-# Keyword scorer (BM25-lite)
-# ----------------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
+# PgVector connector
+# ──────────────────────────────────────────────────────────────────────────────
 class PgVectorConnector:
-    """Semantic search over the text_chunks table using pgvector cosine similarity.
-
-    Requires the pgvector extension and the text_chunks table (created by
-    load_postgres.py / docker/init-db.sql).  Gracefully returns [] if the
-    table or extension is not available.
-    """
+    """Semantic search over the text_chunks table using pgvector cosine similarity."""
 
     def __init__(self, config: BusinessAnalystConfig) -> None:
         self.config = config
@@ -761,15 +995,8 @@ class PgVectorConnector:
         ticker: Optional[str],
         top_k: int = 10,
     ) -> List[Chunk]:
-        """Return the *top_k* most similar chunks from text_chunks for *ticker*."""
-        # Build the query embedding as a Postgres vector literal
         emb_str = "[" + ",".join(f"{x:.8f}" for x in vector) + "]"
         ticker_filter = "AND ticker = %s" if ticker else ""
-        # params order must match placeholder order in SQL:
-        # 1) emb_str  → score calc  (SELECT)
-        # 2) ticker   → ticker filter (WHERE, only if present)
-        # 3) emb_str  → ORDER BY
-        # 4) top_k    → LIMIT
         params: list = [emb_str]
         if ticker:
             params.append(ticker)
@@ -815,7 +1042,6 @@ class PgVectorConnector:
         return chunks
 
     def chunk_count(self, ticker: Optional[str]) -> int:
-        """Return the number of embedded rows in text_chunks for *ticker*."""
         if not ticker:
             return 0
         sql = "SELECT COUNT(*) AS n FROM text_chunks WHERE ticker = %s AND embedding IS NOT NULL"
@@ -830,7 +1056,6 @@ class PgVectorConnector:
             return 0
 
     def has_embedding_index(self) -> bool:
-        """Return True when an ivfflat/hnsw index exists on text_chunks.embedding."""
         sql = """
         SELECT indexname FROM pg_indexes
         WHERE tablename = 'text_chunks'
@@ -847,9 +1072,9 @@ class PgVectorConnector:
             return False
 
 
-# ----------------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
 # Keyword scorer (BM25-lite)
-# ----------------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
 def keyword_overlap_score(text: str, query: str) -> float:
     text_tokens = set(_tokenise(text))
     query_tokens = set(_tokenise(query))
@@ -864,7 +1089,6 @@ def _tokenise(text: str) -> List[str]:
 
 
 def _sigmoid_normalise(scores: List[float]) -> List[float]:
-    """Map raw cross-encoder logits to [0, 1] via sigmoid."""
     import math as _math
     return [1.0 / (1.0 + _math.exp(-s)) for s in scores]
 
@@ -873,23 +1097,7 @@ def _rrf_fuse(
     ranked_lists: List[List[Chunk]],
     k: int = 60,
 ) -> List[Chunk]:
-    """Reciprocal Rank Fusion over multiple ranked chunk lists.
-
-    For each list, the RRF score for a chunk at rank ``r`` (1-indexed) is
-    ``1 / (k + r)``.  Scores are summed across lists so a chunk appearing
-    in multiple lists gets a composite boost.
-
-    Args:
-        ranked_lists: Each element is an ordered list of Chunk objects
-                      (best first).  Duplicate chunk_ids across lists are
-                      merged — the chunk text/metadata from the first
-                      occurrence is kept.
-        k:            RRF constant (default 60, from the original paper).
-
-    Returns:
-        A single deduplicated list sorted by descending RRF score, with
-        ``chunk.score`` updated to the normalised RRF composite score.
-    """
+    """Reciprocal Rank Fusion over multiple ranked chunk lists."""
     rrf_scores: Dict[str, float] = {}
     chunk_map: Dict[str, Chunk] = {}
 
@@ -900,8 +1108,6 @@ def _rrf_fuse(
             if cid not in chunk_map:
                 chunk_map[cid] = chunk
 
-    # Normalise RRF scores to [0, 1] by dividing by the theoretical maximum
-    # (a chunk appearing at rank 1 in every list: n_lists * 1/(k+1))
     n = max(len(ranked_lists), 1)
     max_score = n / (k + 1)
     result: List[Chunk] = []
@@ -920,34 +1126,21 @@ def _rrf_fuse(
     return result
 
 
-# ----------------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
 # Ticker identity helper
-# ----------------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
 
 def _chunk_ticker_matches(chunk: "Chunk", ticker: str) -> bool:
-    """Return True if the chunk provably belongs to *ticker*.
-
-    Checks (in priority order):
-    1. ``chunk.metadata["ticker"]``       — set by Neo4jConnector
-    2. ``chunk.metadata["ticker_symbol"]`` — set by source connector
-    3. ``chunk.chunk_id`` prefix heuristic — e.g. ``neo4j::AAPL::…``
-
-    Returns True when the ticker is *unknown* (missing from all three
-    sources) to avoid silently discarding potentially valid chunks.
-    """
     meta = chunk.metadata or {}
     for key in ("ticker", "ticker_symbol"):
         val = meta.get(key)
         if val:
             return str(val).upper() == ticker.upper()
-    # Fallback: parse chunk_id  (format: <source>::<TICKER>::<rest>)
     parts = chunk.chunk_id.split("::")
     if len(parts) >= 2:
         candidate = parts[1].upper()
-        # Only trust the heuristic when it looks like a real ticker symbol
         if 1 <= len(candidate) <= 6 and candidate.isalpha():
             return candidate == ticker.upper()
-    # Cannot determine ticker from available metadata — let it through
     return True
 
 
@@ -966,12 +1159,10 @@ class CRAGEvaluator:
         chunks: Sequence[Chunk],
         ticker: Optional[str] = None,
     ) -> CRAGEvaluation:
-        """Score retrieval quality.
-
-        When *ticker* is provided, only chunks that provably belong to that
-        ticker are considered.  A chunk that belongs to a *different* company
-        is never counted as evidence of a CORRECT retrieval — it would
-        downstream contaminate the LLM context with off-ticker information.
+        """
+        Score retrieval quality against CRAG thresholds.
+        Thresholds are now configurable via env vars (CRAG_CORRECT_THRESHOLD,
+        CRAG_AMBIGUOUS_THRESHOLD) — no code change needed to tune them.
         """
         if not chunks:
             return CRAGEvaluation(CRAGStatus.INCORRECT, 0.0)
@@ -979,8 +1170,6 @@ class CRAGEvaluator:
         if ticker:
             ticker_chunks = [c for c in chunks if _chunk_ticker_matches(c, ticker)]
             if not ticker_chunks:
-                # Every retrieved chunk belongs to a different company — treat as
-                # INCORRECT so the pipeline falls back to web search.
                 logger.warning(
                     "[CRAGEvaluator] All %d retrieved chunk(s) are off-ticker for ticker=%s "
                     "— classifying as INCORRECT.",
@@ -992,16 +1181,26 @@ class CRAGEvaluator:
         else:
             top_score = chunks[0].score
 
+        # Log every CRAG judgment for debugging and threshold calibration
         if top_score >= self.config.crag_correct_threshold:
-            return CRAGEvaluation(CRAGStatus.CORRECT, top_score)
-        if top_score >= self.config.crag_ambiguous_threshold:
-            return CRAGEvaluation(CRAGStatus.AMBIGUOUS, top_score)
-        return CRAGEvaluation(CRAGStatus.INCORRECT, top_score)
+            status = CRAGStatus.CORRECT
+        elif top_score >= self.config.crag_ambiguous_threshold:
+            status = CRAGStatus.AMBIGUOUS
+        else:
+            status = CRAGStatus.INCORRECT
+
+        logger.info(
+            "[CRAG] score=%.3f → %s (thresholds: correct≥%.2f, ambiguous≥%.2f)",
+            top_score, status.value,
+            self.config.crag_correct_threshold,
+            self.config.crag_ambiguous_threshold,
+        )
+        return CRAGEvaluation(status, top_score)
 
 
-# ----------------------------------------------------------------------------
-# Toolkit façade used by the agent + health checks
-# ----------------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
+# Toolkit façade
+# ──────────────────────────────────────────────────────────────────────────────
 class BusinessAnalystToolkit:
     def __init__(self, config: Optional[BusinessAnalystConfig] = None) -> None:
         self.config = config or BusinessAnalystConfig()
@@ -1014,7 +1213,6 @@ class BusinessAnalystToolkit:
         self.pg = PostgresConnector(self.config)
         self.pgvec = PgVectorConnector(self.config)
         self.evaluator = CRAGEvaluator(self.config)
-        # Update singleton semantic cache size from config (idempotent on repeated init)
         global _SEMANTIC_CACHE
         _SEMANTIC_CACHE._max = self.config.semantic_cache_max_entries
 
@@ -1023,16 +1221,6 @@ class BusinessAnalystToolkit:
     # ------------------------------------------------------------------
 
     def get_metadata_profile(self, ticker: str) -> MetadataProfile:
-        """Return a cached MetadataProfile for *ticker*.
-
-        The profile captures:
-        - Neo4j Chunk node count + vector index readiness
-        - pgvector row count + embedding index presence
-        - Sentiment data availability
-
-        Results are cached in-process for ``config.metadata_cache_ttl`` seconds
-        (default 60 s) to avoid repeated DB round-trips within a single run.
-        """
         cached = _METADATA_CACHE.get(ticker)
         if cached is not None:
             logger.debug("[MetadataCache] HIT for ticker=%s", ticker)
@@ -1040,7 +1228,6 @@ class BusinessAnalystToolkit:
 
         logger.debug("[MetadataCache] MISS for ticker=%s — querying backends", ticker)
 
-        # Neo4j
         neo4j_chunk_count = 0
         neo4j_index_ready = False
         try:
@@ -1049,7 +1236,6 @@ class BusinessAnalystToolkit:
         except Exception as exc:
             logger.warning("[MetadataProfile] Neo4j query failed for %s: %s", ticker, exc)
 
-        # pgvector
         pgvec_count = 0
         pgvec_table_ready = False
         pgvec_index = False
@@ -1060,23 +1246,48 @@ class BusinessAnalystToolkit:
         except Exception as exc:
             logger.warning("[MetadataProfile] pgvector query failed for %s: %s", ticker, exc)
 
-        # Sentiment
         has_sentiment = False
         sentiment_last_updated: Optional[str] = None
         try:
-            snap = self.pg.fetch_sentiment(ticker)
+            # Use max_age_days=0 to skip the recency gate here — we just want
+            # to know if *any* row exists and when it was last updated.
+            snap = self.pg.fetch_sentiment(ticker, max_age_days=0)
             has_sentiment = snap is not None
+            if snap is not None and snap.source:
+                # Extract date from source annotation, e.g. "postgresql:sentiment_trends (as_of=2025-01-15)"
+                import re as _re_local
+                _m = _re_local.search(r"as_of=(\S+)\)", snap.source)
+                if _m:
+                    sentiment_last_updated = _m.group(1)
         except Exception as exc:
             logger.warning("[MetadataProfile] sentiment check failed for %s: %s", ticker, exc)
 
-        # Fundamentals / timeseries flags (reuse check_all from data_availability)
         has_pg_fundamentals = False
         has_pg_timeseries = False
         try:
-            avail_all = check_all(tickers=[ticker])
-            av = ticker_data_profile(avail_all, ticker)
-            has_pg_fundamentals = bool(av.get("has_fundamentals", False))
-            has_pg_timeseries = bool(av.get("has_timeseries", False))
+            # Lightweight direct SQL — avoids check_all()'s ThreadPoolExecutor
+            # which opens new Neo4j + Postgres connections and can hang on the
+            # host due to Docker NAT latency (8-12 s).  The existing self.pg
+            # connection config is already proven to work by the sentiment check
+            # above, so reuse the same pattern.
+            _avail_conn = psycopg2.connect(
+                host=self.config.postgres_host,
+                port=self.config.postgres_port,
+                dbname=self.config.postgres_db,
+                user=self.config.postgres_user,
+                password=self.config.postgres_password,
+            )
+            with closing(_avail_conn), _avail_conn.cursor() as _cur:
+                _cur.execute(
+                    "SELECT EXISTS(SELECT 1 FROM financial_statements WHERE ticker = %s LIMIT 1)",
+                    (ticker,),
+                )
+                has_pg_fundamentals = bool((_cur.fetchone() or [False])[0])
+                _cur.execute(
+                    "SELECT EXISTS(SELECT 1 FROM raw_timeseries WHERE ticker_symbol = %s LIMIT 1)",
+                    (ticker,),
+                )
+                has_pg_timeseries = bool((_cur.fetchone() or [False])[0])
         except Exception as exc:
             logger.debug("[MetadataProfile] data_availability profile failed for %s: %s", ticker, exc)
 
@@ -1103,17 +1314,68 @@ class BusinessAnalystToolkit:
         return profile
 
     # ------------------------------------------------------------------
-    # Fast-path retrieval (vector + BM25, no full graph traversal)
+    # Sentiment: PostgreSQL → local NLP fallback
+    # ------------------------------------------------------------------
+
+    def get_sentiment_snapshot(self, ticker: str) -> Optional[SentimentSnapshot]:
+        """
+        Main entry point for sentiment data.
+
+        Flow:
+          1. Query PostgreSQL sentiment_trends (primary source, EODHD data).
+             If the latest row is older than 7 days it is treated as stale and
+             we fall through to the local fallback immediately.
+          2. If empty/stale/unavailable → fetch recent Neo4j text chunks and score
+             locally using VADER → TextBlob → keyword heuristic (in that order).
+          3. If Neo4j also has no chunks → return None.
+
+        The fallback is logged clearly so you can diagnose ingestion lag.
+        """
+        # Primary: PostgreSQL (with 7-day recency gate)
+        try:
+            snap = self.pg.fetch_sentiment(ticker, max_age_days=7)
+            if snap is not None:
+                logger.info(
+                    "[Sentiment] ticker=%s → source=postgresql trend=%s",
+                    ticker, snap.trend,
+                )
+                return snap
+            logger.warning(
+                "[Sentiment] sentiment_trends is EMPTY or STALE (>7 days) for "
+                "ticker=%s — activating local chunk-based fallback.",
+                ticker,
+            )
+        except Exception as exc:
+            logger.warning(
+                "[Sentiment] PostgreSQL query failed for %s: %s — activating fallback.",
+                ticker, exc,
+            )
+
+        # Fallback: local NLP over recent Neo4j chunks
+        try:
+            recent_chunks = self.neo4j.fetch_recent_chunks(ticker, limit=30)
+            if not recent_chunks:
+                logger.warning(
+                    "[Sentiment] No Neo4j chunks found for ticker=%s — cannot compute local sentiment.",
+                    ticker,
+                )
+                return None
+            snap = _local_sentiment_from_chunks(recent_chunks)
+            if snap:
+                logger.info(
+                    "[Sentiment] ticker=%s → source=local_fallback trend=%s (used %d chunks)",
+                    ticker, snap.trend, len(recent_chunks),
+                )
+            return snap
+        except Exception as exc:
+            logger.error("[Sentiment] Local fallback failed for %s: %s", ticker, exc)
+            return None
+
+    # ------------------------------------------------------------------
+    # Fast-path retrieval
     # ------------------------------------------------------------------
 
     def retrieve_fast(self, query: str, ticker: Optional[str]) -> RetrievalResult:
-        """Stage-1 fast hybrid retrieval for SIMPLE and NUMERICAL query paths.
-
-        Uses a smaller top_k budget (``config.fast_path_top_k``) and skips
-        graph traversal / cross-encoder reranking to minimise latency.
-        Checks the semantic cache first; populates it on miss.
-        """
-        # Semantic cache check
         cached = _SEMANTIC_CACHE.get(ticker, query)
         if cached is not None:
             logger.info("[SemanticCache] HIT for ticker=%s (fast path)", ticker)
@@ -1123,7 +1385,15 @@ class BusinessAnalystToolkit:
             vector = self.embedding.embed(query)
             chunks = self.neo4j.vector_search(vector, ticker, top_k=self.config.fast_path_top_k)
 
-            # BM25 re-scoring blend
+            # Filter out garbled / boilerplate chunks before scoring
+            before = len(chunks)
+            chunks = [c for c in chunks if not _is_boilerplate(c.text)]
+            if len(chunks) < before:
+                logger.info(
+                    "[retrieve_fast] Filtered %d boilerplate/garbled chunks (kept %d)",
+                    before - len(chunks), len(chunks),
+                )
+
             for i, chunk in enumerate(chunks):
                 bm25 = keyword_overlap_score(chunk.text, query)
                 chunks[i] = Chunk(
@@ -1143,29 +1413,10 @@ class BusinessAnalystToolkit:
         return result
 
     # ------------------------------------------------------------------
-    # Multi-stage retrieval (Stage 1 recall → Stage 2 rerank + graph → RRF)
+    # Multi-stage retrieval
     # ------------------------------------------------------------------
 
     def retrieve_multi_stage(self, query: str, ticker: Optional[str]) -> RetrievalResult:
-        """Two-stage retrieval for COMPLEX query paths.
-
-        Stage 1 — Fast bi-encoder recall:
-            - Neo4j vector search top-``multi_stage_recall_k`` (dense)
-            - pgvector vector search top-``multi_stage_recall_k`` (dense)
-            - BM25 keyword scoring over Neo4j results
-
-        Stage 2 — Cross-encoder precision rerank + graph traversal:
-            - Cross-encoder (ms-marco-MiniLM-L-6-v2) re-scores the Stage-1
-              recall pool; degrades gracefully if sentence-transformers absent.
-            - Graph-traversal facts (HAS_STRATEGY / HAS_FACT) appended as
-              supplementary context.
-
-        Fusion — Reciprocal Rank Fusion (RRF) merges all scored lists into a
-        single ordered result, returning the top ``config.top_k`` chunks.
-
-        Results are cached in the semantic cache (TTL = ``config.semantic_cache_ttl``).
-        """
-        # Semantic cache check
         cached = _SEMANTIC_CACHE.get(ticker, query)
         if cached is not None:
             logger.info("[SemanticCache] HIT for ticker=%s (multi-stage path)", ticker)
@@ -1180,7 +1431,6 @@ class BusinessAnalystToolkit:
             logger.error("Embedding failed in multi-stage retrieval: %s", exc)
             return RetrievalResult(chunks=[], graph_facts=[], bm25_debug={})
 
-        # --- Stage 1: Bi-encoder recall ---
         neo4j_chunks: List[Chunk] = []
         pgvec_chunks: List[Chunk] = []
         try:
@@ -1192,7 +1442,18 @@ class BusinessAnalystToolkit:
         except Exception as exc:
             logger.warning("[MultiStage] pgvector recall failed: %s", exc)
 
-        # BM25 re-scoring on Neo4j results
+        # Filter out garbled / boilerplate chunks before reranking
+        _n4j_before = len(neo4j_chunks)
+        _pgv_before = len(pgvec_chunks)
+        neo4j_chunks = [c for c in neo4j_chunks if not _is_boilerplate(c.text)]
+        pgvec_chunks = [c for c in pgvec_chunks if not _is_boilerplate(c.text)]
+        _filtered = (_n4j_before - len(neo4j_chunks)) + (_pgv_before - len(pgvec_chunks))
+        if _filtered:
+            logger.info(
+                "[MultiStage] Filtered %d boilerplate/garbled chunks (neo4j kept %d, pg kept %d)",
+                _filtered, len(neo4j_chunks), len(pgvec_chunks),
+            )
+
         bm25_ranked: List[Chunk] = []
         for chunk in neo4j_chunks:
             bm25 = keyword_overlap_score(chunk.text, query)
@@ -1207,8 +1468,6 @@ class BusinessAnalystToolkit:
             )
         bm25_ranked.sort(key=lambda c: -c.score)
 
-        # --- Stage 2: Cross-encoder rerank ---
-        # Merge recall pool (deduplicated by chunk_id)
         recall_pool: List[Chunk] = []
         seen_ids: set = set()
         for chunk in neo4j_chunks + pgvec_chunks:
@@ -1243,15 +1502,47 @@ class BusinessAnalystToolkit:
                 logger.warning("[MultiStage] Cross-encoder rerank failed: %s", exc)
                 ce_ranked = sorted(recall_pool, key=lambda c: -c.score)
         else:
-            # Degrade gracefully: sort recall pool by bi-encoder score
             ce_ranked = sorted(recall_pool, key=lambda c: -c.score)
 
-        # --- RRF Fusion ---
         ranked_lists = [neo4j_chunks, pgvec_chunks, bm25_ranked, ce_ranked]
         fused = _rrf_fuse([lst for lst in ranked_lists if lst], k=60)
         fused = fused[:final_k]
 
-        # --- Graph traversal facts (supplementary context) ---
+        # Section-diversity guarantee: ensure at least min_chunks_per_section
+        # chunks from each key section (earnings_call, broker_report) appear in
+        # the final result, even when their RRF scores are lower than other sections.
+        _min_sec = self.config.min_chunks_per_section
+        if _min_sec > 0 and recall_pool:
+            _key_sections = ("earnings_call", "broker_report")
+            _fused_ids = {c.chunk_id for c in fused}
+            _section_counts: Dict[str, int] = {}
+            for c in fused:
+                sec = (c.metadata or {}).get("section") or ""
+                _section_counts[sec] = _section_counts.get(sec, 0) + 1
+
+            # Fallback pool sorted by raw vector score (best from recall_pool)
+            _fallback_pool = sorted(recall_pool, key=lambda c: -c.score)
+            _added = 0
+            for _sec in _key_sections:
+                _deficit = _min_sec - _section_counts.get(_sec, 0)
+                if _deficit <= 0:
+                    continue
+                _candidates = [
+                    c for c in _fallback_pool
+                    if c.chunk_id not in _fused_ids
+                    and (c.metadata or {}).get("section") == _sec
+                ]
+                for c in _candidates[:_deficit]:
+                    fused.append(c)
+                    _fused_ids.add(c.chunk_id)
+                    _added += 1
+            if _added:
+                logger.info(
+                    "[MultiStage] Section-diversity: injected %d chunk(s) to satisfy "
+                    "min_chunks_per_section=%d for sections %s",
+                    _added, _min_sec, _key_sections,
+                )
+
         graph_facts: List[Dict[str, Any]] = []
         try:
             graph_facts = self.neo4j.fetch_graph_facts(ticker, limit=25)
@@ -1266,16 +1557,11 @@ class BusinessAnalystToolkit:
         _SEMANTIC_CACHE.set(ticker, query, result, ttl=self.config.semantic_cache_ttl)
         return result
 
-    # ------------------------------------------------------------------
-    # Existing retrieval (kept as default / backward compat)
-    # ------------------------------------------------------------------
-
     def retrieve(self, query: str, ticker: Optional[str]) -> RetrievalResult:
         """Default retrieval (wraps retrieve_multi_stage for the complex path)."""
         return self.retrieve_multi_stage(query, ticker)
 
     def fetch_community_summary(self, ticker: Optional[str]) -> Optional[str]:
-        """Return graph-community summary string for *ticker* (see Neo4jConnector)."""
         try:
             return self.neo4j.fetch_community_summary(ticker)
         except Exception as exc:
@@ -1283,7 +1569,6 @@ class BusinessAnalystToolkit:
             return None
 
     def fetch_company_overview(self, ticker: Optional[str]) -> Optional[Dict[str, Any]]:
-        """Return the Neo4j Company node properties for *ticker*."""
         try:
             return self.neo4j.fetch_company_overview(ticker)
         except Exception as exc:
@@ -1291,14 +1576,12 @@ class BusinessAnalystToolkit:
             return None
 
     def fetch_sentiment(self, ticker: Optional[str]) -> Optional[SentimentSnapshot]:
-        try:
-            return self.pg.fetch_sentiment(ticker)
-        except Exception as exc:
-            logger.warning("Postgres sentiment fetch failed: %s", exc)
+        """Backward-compat wrapper — prefer get_sentiment_snapshot() for new code."""
+        if not ticker:
             return None
+        return self.get_sentiment_snapshot(ticker)
 
     def fetch_esg(self, ticker: str) -> Optional[Dict]:
-        """Fetch latest ESG scores for the ticker."""
         try:
             return self.pg.fetch_esg(ticker)
         except Exception as exc:
@@ -1306,7 +1589,6 @@ class BusinessAnalystToolkit:
             return None
 
     def fetch_social_sentiment(self, ticker: str, limit: int = 10) -> List[Dict]:
-        """Fetch recent social sentiment data for the ticker."""
         try:
             return self.pg.fetch_social_sentiment(ticker, limit)
         except Exception as exc:
@@ -1314,7 +1596,6 @@ class BusinessAnalystToolkit:
             return []
 
     def fetch_insider_signals(self, ticker: str, limit: int = 20) -> List[Dict]:
-        """Fetch insider trading signals from Neo4j."""
         try:
             return self.neo4j.fetch_insider_signals(ticker, limit)
         except Exception as exc:
@@ -1322,7 +1603,6 @@ class BusinessAnalystToolkit:
             return []
 
     def fetch_company_profile(self, ticker: str) -> Optional[Dict]:
-        """Fetch latest company profile for the ticker (Row 3)."""
         try:
             return self.pg.fetch_company_profile(ticker)
         except Exception as exc:
@@ -1330,7 +1610,6 @@ class BusinessAnalystToolkit:
             return None
 
     def fetch_news(self, ticker: str, limit: int = 20) -> List[Dict]:
-        """Fetch recent news items for the ticker (Rows 4/17)."""
         try:
             return self.pg.fetch_news(ticker, limit)
         except Exception as exc:
@@ -1338,7 +1617,6 @@ class BusinessAnalystToolkit:
             return []
 
     def fetch_insider_transactions(self, ticker: str, limit: int = 20) -> List[Dict]:
-        """Fetch insider transactions for the ticker from PostgreSQL (Row 5)."""
         try:
             return self.pg.fetch_insider_transactions(ticker, limit)
         except Exception as exc:
@@ -1346,7 +1624,6 @@ class BusinessAnalystToolkit:
             return []
 
     def fetch_institutional_holders(self, ticker: str, limit: int = 20) -> List[Dict]:
-        """Fetch major institutional/mutual fund holders (Row 6)."""
         try:
             return self.pg.fetch_institutional_holders(ticker, limit)
         except Exception as exc:
@@ -1354,7 +1631,6 @@ class BusinessAnalystToolkit:
             return []
 
     def fetch_financial_calendar(self, ticker: str, limit: int = 10) -> List[Dict]:
-        """Fetch financial calendar events for the ticker (Row 16)."""
         try:
             return self.pg.fetch_financial_calendar(ticker, limit)
         except Exception as exc:
@@ -1362,7 +1638,6 @@ class BusinessAnalystToolkit:
             return []
 
     def fetch_etf_constituents(self, ticker: str, limit: int = 50) -> List[Dict]:
-        """Fetch ETF/index constituent holdings from Neo4j (Row 15)."""
         try:
             return self.neo4j.fetch_etf_constituents(ticker, limit)
         except Exception as exc:
@@ -1370,7 +1645,6 @@ class BusinessAnalystToolkit:
             return []
 
     def fetch_textual_documents(self, ticker: str, limit: int = 20) -> List[Dict]:
-        """Fetch textual document metadata for the ticker (Row 24)."""
         try:
             return self.pg.fetch_textual_documents(ticker, limit)
         except Exception as exc:
@@ -1421,4 +1695,5 @@ __all__ = [
     "CRAGEvaluation",
     "Neo4jConnector",
     "PostgresConnector",
+    "rule_based_classify",
 ]

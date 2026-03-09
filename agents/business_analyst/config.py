@@ -3,6 +3,17 @@
 This module normalises environment variables so that every other component
 can rely on a single source of truth. The defaults match the values already
 documented inside docker-compose.yml, .env, and agents/business_analyst/README.md.
+
+Changes vs original:
+  - LLM provider switched from Ollama to DeepSeek API (deepseek-reasoner model).
+  - ollama_base_url retained for embeddings only (nomic-embed-text:v1.5 via Ollama).
+  - deepseek_api_key field added (reads DEEPSEEK_API_KEY env var).
+  - llm_num_ctx removed (Ollama-only; DeepSeek API uses max_tokens instead).
+  - CRAG thresholds (crag_correct_threshold, crag_ambiguous_threshold) are
+    now configurable via env vars CRAG_CORRECT_THRESHOLD / CRAG_AMBIGUOUS_THRESHOLD.
+  - max_rewrite_loops default raised to 3 (env: BA_MAX_REWRITE_LOOPS).
+  - embedding_model default updated to nomic-embed-text:v1.5 (locked version).
+  - embedding_model_version field added to track version in Neo4j Chunk nodes.
 """
 
 from __future__ import annotations
@@ -22,9 +33,12 @@ def _env(key: str, default: str | None = None) -> str:
     return value
 
 
-# Determine if running inside Docker for Ollama URL
+# Determine if running inside Docker
 _IN_DOCKER = Path("/.dockerenv").exists()
-_DEFAULT_OLLAMA = "http://host.docker.internal:11434" if _IN_DOCKER else "http://localhost:11434"
+# Ollama is kept for embeddings only (nomic-embed-text:v1.5, 768-dim).
+# Inside Docker, Ollama is a named service reachable via http://ollama:11434.
+# Outside Docker (local dev), use localhost.
+_DEFAULT_OLLAMA = "http://ollama:11434" if _IN_DOCKER else "http://localhost:11434"
 
 
 @dataclass(slots=True)
@@ -43,20 +57,28 @@ class BusinessAnalystConfig:
     postgres_user: str = field(default_factory=lambda: _env("POSTGRES_USER", "airflow"))
     postgres_password: str = field(default_factory=lambda: _env("POSTGRES_PASSWORD", "airflow"))
 
-    # Models
-    llm_provider: str = field(default_factory=lambda: os.getenv("BUSINESS_ANALYST_LLM_PROVIDER", "ollama"))
-    llm_model: str = field(default_factory=lambda: os.getenv("BUSINESS_ANALYST_MODEL", os.getenv("LLM_MODEL_BUSINESS_ANALYST", "deepseek-r1:8b")))
+    # LLM — DeepSeek API (deepseek-reasoner) for all generation.
+    # Ollama is NOT used for LLM generation; see ollama_base_url below for embeddings.
+    llm_provider: str = field(default_factory=lambda: os.getenv("BUSINESS_ANALYST_LLM_PROVIDER", "deepseek"))
+    llm_model: str = field(default_factory=lambda: os.getenv("BUSINESS_ANALYST_MODEL", os.getenv("LLM_MODEL_BUSINESS_ANALYST", "deepseek-reasoner")))
     llm_temperature: float = field(default_factory=lambda: float(os.getenv("BUSINESS_ANALYST_TEMPERATURE", "0.2")))
-    llm_max_tokens: int = field(default_factory=lambda: int(os.getenv("BUSINESS_ANALYST_MAX_TOKENS", "16000")))
-    # num_ctx: Ollama context window size.  The default Ollama value is 4096 which is
-    # smaller than our prompt alone (~4500–8000 tokens).  We must set this explicitly
-    # or the prompt is silently truncated and the model generates garbage.
-    llm_num_ctx: int = field(default_factory=lambda: int(os.getenv("BUSINESS_ANALYST_NUM_CTX", "32768")))
+    # max_tokens controls DeepSeek API output budget (replaces Ollama's num_predict/num_ctx).
+    llm_max_tokens: int = field(default_factory=lambda: int(os.getenv("BUSINESS_ANALYST_MAX_TOKENS", "8000")))
+
+    # DeepSeek API key — required for LLM generation.
+    deepseek_api_key: str = field(default_factory=lambda: _env("DEEPSEEK_API_KEY", ""))
+
+    # Ollama base URL — kept for embeddings only (nomic-embed-text:v1.5).
+    # For local development outside Docker, set OLLAMA_BASE_URL=http://localhost:11434
     ollama_base_url: str = field(default_factory=lambda: os.getenv("OLLAMA_BASE_URL", _DEFAULT_OLLAMA))
 
-    # Embedding model — all vectors use Ollama nomic-embed-text (768-dim).
-    embedding_model: str = field(default_factory=lambda: os.getenv("EMBEDDING_MODEL", "nomic-embed-text"))
+    # Embedding model — locked to tagged version to prevent silent model drift.
+    # Use EMBEDDING_MODEL env var to override (e.g. nomic-embed-text:latest for dev).
+    embedding_model: str = field(default_factory=lambda: os.getenv("EMBEDDING_MODEL", "nomic-embed-text:v1.5"))
     embedding_dimension: int = field(default_factory=lambda: int(os.getenv("EMBEDDING_DIMENSION", "768")))
+    # Track which embedding model version produced the vectors stored in Neo4j.
+    # Bump this when you pull a new model to invalidate old vectors.
+    embedding_model_version: str = field(default_factory=lambda: os.getenv("EMBEDDING_MODEL_VERSION", "1.0"))
 
     reranker_model: str = field(default_factory=lambda: os.getenv("RERANKER_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2"))
 
@@ -67,8 +89,9 @@ class BusinessAnalystConfig:
     business_analyst_chunk_size: int = field(default_factory=lambda: int(os.getenv("BUSINESS_ANALYST_CHUNK_SIZE", "512")))
     business_analyst_overlap: int = field(default_factory=lambda: int(os.getenv("BUSINESS_ANALYST_OVERLAP", "50")))
 
-    # CRAG thresholds — updated for Optimized Adaptive pipeline
-    # CORRECT > 0.6, AMBIGUOUS 0.4-0.6, INCORRECT < 0.4
+    # CRAG thresholds — now fully configurable via environment variables.
+    # Tune these without code changes: set CRAG_CORRECT_THRESHOLD / CRAG_AMBIGUOUS_THRESHOLD in .env
+    # Recommended starting point: CORRECT > 0.6, AMBIGUOUS 0.4–0.6, INCORRECT < 0.4
     crag_correct_threshold: float = field(default_factory=lambda: float(os.getenv("CRAG_CORRECT_THRESHOLD", "0.6")))
     crag_ambiguous_threshold: float = field(default_factory=lambda: float(os.getenv("CRAG_AMBIGUOUS_THRESHOLD", "0.4")))
 
@@ -76,15 +99,12 @@ class BusinessAnalystConfig:
     repo_root: Path = field(default_factory=lambda: Path(__file__).resolve().parents[2])
     agent_data_dir: Path = field(default_factory=lambda: Path(__file__).resolve().parents[2] / "ingestion" / "etl" / "agent_data" / "business_analyst")
 
-    # Networking / timeouts — no hard cap by default; quality over speed.
-    # deepseek-r1:8b generates ~10-15 tok/s; at 5000 max tokens that is ~5-8 min.
-    # Set BUSINESS_ANALYST_REQUEST_TIMEOUT=<seconds> env var to add a cap if needed.
-    # Default: None (no timeout) - important for deep analysis
+    # Networking / timeouts — 120s default suits DeepSeek API round-trips.
     request_timeout: Optional[int] = field(
         default_factory=lambda: (
             int(os.getenv("BUSINESS_ANALYST_REQUEST_TIMEOUT"))  # type: ignore[arg-type]
             if os.getenv("BUSINESS_ANALYST_REQUEST_TIMEOUT", "").strip()
-            else None  # No timeout by default - removed previous default
+            else 120
         )
     )
     neo4j_verify: bool = field(default_factory=lambda: os.getenv("NEO4J_ENCRYPT", "false").lower() == "true")
@@ -96,14 +116,19 @@ class BusinessAnalystConfig:
     semantic_cache_max_entries: int = field(default_factory=lambda: int(os.getenv("BUSINESS_ANALYST_SEMANTIC_CACHE_MAX_ENTRIES", "128")))
 
     # Adaptive routing knobs
-    # fast_path_top_k: smaller recall budget for simple/fast queries (<= 15 is safe)
     fast_path_top_k: int = field(default_factory=lambda: int(os.getenv("BA_FAST_PATH_TOP_K", "15")))
-    # multi_stage_recall_k: Stage-1 bi-encoder recall count before cross-encoder rerank
     multi_stage_recall_k: int = field(default_factory=lambda: int(os.getenv("BA_MULTI_STAGE_RECALL_K", "100")))
-    # max_rewrite_loops: up to 2 query rewrites on AMBIGUOUS path
-    max_rewrite_loops: int = field(default_factory=lambda: int(os.getenv("BA_MAX_REWRITE_LOOPS", "2")))
-    # query_classifier_model: lightweight model used for fast query classification
-    query_classifier_model: str = field(default_factory=lambda: os.getenv("BA_QUERY_CLASSIFIER_MODEL", os.getenv("ORCHESTRATION_PLANNER_MODEL", "llama3.2:latest")))
+    # Minimum chunks per section in the final fused result for section-diversity guarantee.
+    # Ensures earnings_call and broker_report sections are always represented even when
+    # their RRF scores are lower than other sections for a given query.
+    # Set to 0 to disable. Override via BA_MIN_CHUNKS_PER_SECTION env var.
+    min_chunks_per_section: int = field(default_factory=lambda: int(os.getenv("BA_MIN_CHUNKS_PER_SECTION", "3")))
+    # max_rewrite_loops: hard cap on CRAG rewrite cycles to prevent infinite loops.
+    # Configurable via BA_MAX_REWRITE_LOOPS env var. Default: 3.
+    max_rewrite_loops: int = field(default_factory=lambda: int(os.getenv("BA_MAX_REWRITE_LOOPS", "3")))
+    # query_classifier_model: retained for reference but the classifier is rule-based only.
+    # No LLM call is made for classification. This field is a no-op.
+    query_classifier_model: str = field(default_factory=lambda: os.getenv("BA_QUERY_CLASSIFIER_MODEL", "rule-based"))
 
     def as_dict(self) -> Dict[str, Any]:
         data = asdict(self)
@@ -114,7 +139,6 @@ class BusinessAnalystConfig:
 
 def load_config() -> BusinessAnalystConfig:
     """Helper used by modules that want a one-liner config."""
-
     return BusinessAnalystConfig()
 
 

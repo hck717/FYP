@@ -8,6 +8,12 @@ Architecture:
     metadata_precheck         ←  Neo4j chunk counts, pgvector status, sentiment availability
         │
         ▼
+    precheck_data_coverage    ←  Coverage warnings, sentiment freshness, sentiment-query short-circuit
+        │
+        ▼
+    fetch_sentiment_data      ←  PostgreSQL sentiment snapshot (with 7-day recency gate + NLP fallback)
+        │
+        ▼
     classify_query            ←  LLM (lightweight): SIMPLE / NUMERICAL / COMPLEX
         │
         ├─ SIMPLE     → fast_path_retrieval  (vector + BM25, small top_k) → generate_analysis
@@ -45,7 +51,17 @@ import time
 import unicodedata
 import warnings
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional, TypedDict, cast
+
+# Load .env early so DEEPSEEK_API_KEY and other env vars are available
+# before config.py dataclass field factories run.  This is a no-op inside
+# Docker (vars are injected by docker-compose) and safe to call multiple times.
+try:
+    from dotenv import load_dotenv as _load_dotenv
+    _load_dotenv(Path(__file__).resolve().parents[2] / ".env", override=False)
+except ImportError:
+    pass  # python-dotenv not installed — rely on env vars being set externally
 
 from langgraph.graph import END, StateGraph
 
@@ -57,7 +73,7 @@ from langgraph.graph import END, StateGraph
 from .config import BusinessAnalystConfig, load_config
 from .llm import LLMClient
 from .schema import CRAGStatus, MetadataProfile, RetrievalResult, SentimentSnapshot, serialise_chunk
-from .tools import BusinessAnalystToolkit
+from .tools import BusinessAnalystToolkit, rule_based_classify
 from .web_search_interface import web_search_fallback as _call_web_search
 
 logger = logging.getLogger(__name__)
@@ -112,6 +128,11 @@ class AgentState(TypedDict, total=False):
     # Metadata pre-check profile (Neo4j counts, pgvector status, sentiment flag)
     metadata_profile: Optional[MetadataProfile]
 
+    # Pre-check layer results (populated by _node_precheck_data_coverage)
+    data_coverage_warning: Optional[str]   # human-readable warning if data is thin/stale
+    use_sentiment_db: bool                 # True → use PostgreSQL snapshot; skip heavy retrieval for sentiment queries
+    sentiment_is_fresh: bool               # True → PostgreSQL sentiment is within 7-day freshness window
+
     # Enrichment
     sentiment: Optional[SentimentSnapshot]
     company_node: Optional[Dict[str, Any]]   # raw Neo4j Company node properties
@@ -159,7 +180,165 @@ def _node_metadata_precheck(state: AgentState, toolkit: BusinessAnalystToolkit) 
         f"({elapsed:.2f}s)",
         symbol="  OK",
     )
-    return {**state, "metadata_profile": profile}
+    state_update = {**state, "metadata_profile": profile}
+    # Log any pre-existing data_coverage_warning set by an earlier run (defensive).
+    existing_warning: Optional[str] = state.get("data_coverage_warning")
+    if existing_warning:
+        logger.warning(
+            "[MetadataPrecheck] Existing data_coverage_warning for ticker=%s: %s",
+            ticker, existing_warning,
+        )
+    return cast(AgentState, state_update)
+
+
+def _node_precheck_data_coverage(state: AgentState) -> AgentState:
+    """Pre-check data coverage and freshness before the main pipeline.
+
+    Reads the ``metadata_profile`` (populated by ``_node_metadata_precheck``)
+    and sets three state flags:
+
+    * ``data_coverage_warning`` — human-readable warning string when chunk
+      coverage or sentiment data is thin/stale; ``None`` when everything looks
+      healthy.
+    * ``use_sentiment_db`` — ``True`` when the PostgreSQL sentiment snapshot is
+      within the 7-day freshness window.  The ``_node_fetch_sentiment`` step
+      will still hit the DB; this flag lets later routing logic skip heavy RAG
+      for sentiment-only queries.
+    * ``sentiment_is_fresh`` — mirrors ``use_sentiment_db``; exposed separately
+      so the final output and downstream tools can reason about freshness
+      without rechecking the raw date string.
+
+    For queries that are primarily sentiment/news-focused AND the DB snapshot
+    is fresh, the CRAG evaluation is short-circuited by pre-setting
+    ``crag_status=CORRECT`` and ``confidence=1.0``.  This avoids wasting
+    bi-encoder recall and cross-encoder rerranking cycles when PostgreSQL
+    already provides a definitive answer.
+
+    All warnings are logged at WARNING level so they surface in production
+    logs without requiring DEBUG verbosity.
+    """
+    profile: Optional[MetadataProfile] = state.get("metadata_profile")
+    query: str = state.get("task", "")
+    ticker: Optional[str] = state.get("ticker")
+    _print_progress("PRECHECK DATA COVERAGE", f"ticker={ticker}")
+
+    if profile is None:
+        # No profile yet (ticker was None or metadata_precheck failed) — skip.
+        _print_progress("PRECHECK DATA COVERAGE", "no profile — skipping", symbol="  --")
+        return {**state, "data_coverage_warning": None, "use_sentiment_db": False, "sentiment_is_fresh": False}
+
+    warnings_parts: List[str] = []
+
+    # -----------------------------------------------------------------------
+    # 1. Chunk coverage check
+    # -----------------------------------------------------------------------
+    MIN_NEO4J_CHUNKS = 20
+    MIN_PG_CHUNKS = 5
+
+    if profile.neo4j_chunk_count < MIN_NEO4J_CHUNKS:
+        msg = (
+            f"Neo4j chunk count for {ticker} is low "
+            f"({profile.neo4j_chunk_count} < {MIN_NEO4J_CHUNKS}). "
+            "Run the FMP ingestion DAG to populate the knowledge base."
+        )
+        warnings_parts.append(msg)
+        logger.warning("[PreCheck] %s", msg)
+
+    if profile.pgvector_chunk_count < MIN_PG_CHUNKS:
+        msg = (
+            f"pgvector chunk count for {ticker} is low "
+            f"({profile.pgvector_chunk_count} < {MIN_PG_CHUNKS}). "
+            "Run the pgvector ingestion step to populate embeddings."
+        )
+        warnings_parts.append(msg)
+        logger.warning("[PreCheck] %s", msg)
+
+    # -----------------------------------------------------------------------
+    # 2. Sentiment freshness check (7-day window)
+    # -----------------------------------------------------------------------
+    sentiment_fresh = False
+    if profile.sentiment_last_updated:
+        try:
+            from datetime import date
+            last_date = datetime.strptime(profile.sentiment_last_updated, "%Y-%m-%d").date()
+            age_days = (datetime.now(timezone.utc).date() - last_date).days
+            if age_days <= 7:
+                sentiment_fresh = True
+                logger.info(
+                    "[PreCheck] Sentiment for %s is FRESH (age=%d days, last_updated=%s).",
+                    ticker, age_days, profile.sentiment_last_updated,
+                )
+            else:
+                msg = (
+                    f"Sentiment data for {ticker} is stale "
+                    f"(last_updated={profile.sentiment_last_updated}, age={age_days} days > 7). "
+                    "PostgreSQL DB will be skipped; local NLP fallback will be used."
+                )
+                warnings_parts.append(msg)
+                logger.warning("[PreCheck] %s", msg)
+        except (ValueError, TypeError) as exc:
+            logger.warning(
+                "[PreCheck] Could not parse sentiment_last_updated=%r for ticker=%s: %s",
+                profile.sentiment_last_updated, ticker, exc,
+            )
+    elif not profile.has_sentiment:
+        msg = (
+            f"No sentiment data found for {ticker} in PostgreSQL. "
+            "Local NLP fallback will be used during analysis."
+        )
+        warnings_parts.append(msg)
+        logger.warning("[PreCheck] %s", msg)
+
+    data_coverage_warning: Optional[str] = "; ".join(warnings_parts) if warnings_parts else None
+
+    # -----------------------------------------------------------------------
+    # 3. Query-type-aware short-circuit for sentiment-only queries
+    # -----------------------------------------------------------------------
+    # If the query is primarily about sentiment/news AND the DB snapshot is
+    # fresh, pre-set crag_status=CORRECT so the complex retrieval path is
+    # skipped entirely for this lightweight query type.
+    _SENTIMENT_KEYWORDS = (
+        "sentiment", "bullish", "bearish", "market view", "investor sentiment",
+        "analyst sentiment", "news sentiment", "how is the market feeling",
+        "what does the market think", "crowd sentiment", "wall street view",
+    )
+    query_lower = query.lower()
+    is_sentiment_query = any(kw in query_lower for kw in _SENTIMENT_KEYWORDS)
+
+    base: Dict[str, Any] = {
+        **cast(dict, state),
+        "data_coverage_warning": data_coverage_warning,
+        "use_sentiment_db": sentiment_fresh,
+        "sentiment_is_fresh": sentiment_fresh,
+    }
+
+    if is_sentiment_query and sentiment_fresh:
+        logger.info(
+            "[PreCheck] Sentiment-focused query with fresh DB snapshot for %s — "
+            "pre-setting crag_status=CORRECT to skip complex RAG.",
+            ticker,
+        )
+        _print_progress(
+            "PRECHECK DATA COVERAGE done",
+            f"sentiment_fresh=True  query_type=sentiment-focused  → crag_status=CORRECT  "
+            f"warning={'yes' if data_coverage_warning else 'no'}",
+            symbol="  OK",
+        )
+        base = {
+            **base,
+            "crag_status": CRAGStatus.CORRECT,
+            "confidence": 1.0,
+        }
+    else:
+        _print_progress(
+            "PRECHECK DATA COVERAGE done",
+            f"sentiment_fresh={sentiment_fresh}  "
+            f"neo4j={profile.neo4j_chunk_count}  pgvec={profile.pgvector_chunk_count}  "
+            f"warning={'yes' if data_coverage_warning else 'no'}",
+            symbol="  OK" if not data_coverage_warning else "  !?",
+        )
+
+    return cast(AgentState, base)
 
 
 def _node_classify_query(
@@ -168,6 +347,9 @@ def _node_classify_query(
     llm: LLMClient,
 ) -> AgentState:
     """Classify the query as SIMPLE, NUMERICAL, or COMPLEX using a lightweight LLM.
+
+    A fast rule-based pre-classifier runs first (zero-latency keyword check).
+    If it produces a confident result, the LLM call is skipped entirely.
 
     - SIMPLE   → fast_path_retrieval (vector + BM25, small top_k, <3 s target)
     - NUMERICAL → numerical_path (Cypher time-series + sentiment metrics)
@@ -178,12 +360,29 @@ def _node_classify_query(
     query = state.get("task", "")
     _print_progress("CLASSIFY QUERY", f"query={query[:80]!r}")
     t0 = time.monotonic()
+
+    # --- Rule-based pre-classifier (no LLM call) ---
+    rule_result = rule_based_classify(query)
+    if rule_result is not None:
+        query_class = rule_result.upper()
+        elapsed = time.monotonic() - t0
+        logger.info(
+            "[ClassifyQuery] rule-based classifier → class=%s (skipped LLM)", query_class
+        )
+        _print_progress(
+            "CLASSIFY QUERY done",
+            f"class={query_class}  method=rule-based  ({elapsed:.2f}s)",
+            symbol="  OK",
+        )
+        return {**state, "query_class": query_class}
+
+    # --- LLM classifier (lightweight model) ---
     query_class = llm.classify_query(query)
     elapsed = time.monotonic() - t0
-    logger.info("[ClassifyQuery] query=%r → class=%s", query[:80], query_class)
+    logger.info("[ClassifyQuery] query=%r → class=%s (LLM)", query[:80], query_class)
     _print_progress(
         "CLASSIFY QUERY done",
-        f"class={query_class}  ({elapsed:.2f}s)",
+        f"class={query_class}  method=llm  ({elapsed:.2f}s)",
         symbol="  OK",
     )
     return {**state, "query_class": query_class}
@@ -332,6 +531,7 @@ def _node_crag_evaluate(state: AgentState, toolkit: BusinessAnalystToolkit) -> A
     retrieval: Optional[RetrievalResult] = state.get("retrieval")
     chunks = retrieval.chunks if retrieval else []
     ticker = state.get("ticker")
+    query = state.get("task", "")
     _print_progress("CRAG EVALUATE", f"ticker={ticker}  chunks_to_score={len(chunks)}")
     t0 = time.monotonic()
     evaluation = toolkit.evaluate(chunks, ticker=ticker)
@@ -340,6 +540,15 @@ def _node_crag_evaluate(state: AgentState, toolkit: BusinessAnalystToolkit) -> A
         "CRAG EVALUATE done",
         f"status={evaluation.status.value}  confidence={evaluation.confidence:.3f}  ({elapsed:.2f}s)",
         symbol="  OK",
+    )
+    # Structured per-query CRAG log — useful for threshold calibration and monitoring
+    logger.info(
+        "[CRAG] query=%r score=%.3f decision=%s chunks_retrieved=%d rewrite_count=%d",
+        query[:80],
+        evaluation.confidence,
+        evaluation.status.value,
+        len(chunks),
+        state.get("rewrite_count", 0),
     )
     return {
         **state,
@@ -380,9 +589,15 @@ def _node_generate_analysis(state: AgentState, llm: LLMClient) -> AgentState:
     )
 
     # --- No-data guard ---
-    # If there are no retrieved chunks at all, short-circuit immediately.
-    # The LLM must not be allowed to fabricate analysis from zero source material.
-    if not chunks:
+    # If there are no retrieved chunks at all, short-circuit immediately —
+    # UNLESS the precheck layer validated the data OR structured data (sentiment,
+    # company_node) is available.  In those cases the LLM can produce a meaningful
+    # analysis from structured DB data even without document chunks.
+    company_node: Optional[Dict[str, Any]] = state.get("company_node")
+    precheck_correct = state.get("crag_status") == CRAGStatus.CORRECT
+    has_structured_data = sentiment is not None or company_node is not None
+
+    if not chunks and not (precheck_correct or has_structured_data):
         logger.warning(
             "No chunks retrieved for ticker=%s — returning INSUFFICIENT_DATA without LLM call.", ticker
         )
@@ -402,11 +617,44 @@ def _node_generate_analysis(state: AgentState, llm: LLMClient) -> AgentState:
         }
         return {**state, "llm_output": raw, "fallback_triggered": False}
 
+    if not chunks:
+        logger.info(
+            "[GenerateAnalysis] No chunks but structured data available (sentiment=%s, company_node=%s) — "
+            "proceeding with structured-data-only LLM call for ticker=%s.",
+            sentiment is not None,
+            company_node is not None,
+            ticker,
+        )
+
+    # Inject company_node into context if retrieved chunks are thin
+    _company_context_prefix: Optional[str] = None
+    if company_node and (not chunks or len(chunks) < 3):
+        company_text = json.dumps(
+            {k: v for k, v in company_node.items()
+             if k in ("Name", "Sector", "Industry", "Description", "Country",
+                      "MarketCapitalization", "FullTimeEmployees",
+                      "Highlights_ProfitMargin", "Highlights_RevenueGrowth",
+                      "Highlights_EarningsShare", "Highlights_PERatio",
+                      "Highlights_52WeekHigh", "Highlights_52WeekLow",
+                      "AnalystRatings_Rating", "AnalystRatings_TargetPrice",
+                      "AnalystRatings_StrongBuy", "AnalystRatings_Buy",
+                      "AnalystRatings_Hold", "AnalystRatings_Sell",
+                      "AnalystRatings_StrongSell")},
+            indent=2, default=str,
+        )
+        _company_context_prefix = (
+            f"=== COMPANY OVERVIEW (Neo4j: Company node) ===\n{company_text}\n"
+        )
+
     # Build a rich context block for the LLM — ordered by relevance score
     context_parts: List[str] = []
 
     # Task question framed prominently so the LLM keeps it front-of-mind
     context_parts.append(f"=== ANALYST QUESTION ===\n{task}\n")
+
+    # Company overview from Neo4j Company node (prepended when chunks are thin/absent)
+    if _company_context_prefix:
+        context_parts.append(_company_context_prefix)
 
     # Sentiment data — framed as a signal to interpret, not just numbers
     if sentiment:
@@ -449,8 +697,10 @@ def _node_generate_analysis(state: AgentState, llm: LLMClient) -> AgentState:
         for chunk in chunks[:7]:
             band = (chunk.metadata or {}).get("temporal_band", "")
             band_label = f", temporal={band}" if band else ""
+            source_name = (chunk.metadata or {}).get("source_name", "")
+            source_label = f", source_name={source_name!r}" if source_name else f", source={chunk.source}"
             context_parts.append(
-                f"\n[chunk_id: {chunk.chunk_id}] (relevance={chunk.score:.3f}, source={chunk.source}{band_label})\n"
+                f"\n[chunk_id: {chunk.chunk_id}] (relevance={chunk.score:.3f}{source_label}{band_label})\n"
                 f"{chunk.text[:900]}"  # 900 chars per chunk
             )
 
@@ -524,11 +774,20 @@ def _check_citation_grounding(
         return
 
     output_text = json.dumps(llm_output, ensure_ascii=False)
-    # Strip trailing punctuation (], ]., ],) that the LLM appends when citing inside arrays/sentences
-    # Matches:  neo4j::TICKER::...  pgvec::...  qdrant::...  or bare  TICKER::...
-    _RAW_CITED = re.findall(r'(?:neo4j|pgvec|qdrant)::[^\s",\]]+', output_text)
-    _RAW_CITED += re.findall(r'\b[A-Z]{1,6}::[^\s",\]]+', output_text)
-    cited_ids = {cid.rstrip("].,;") for cid in _RAW_CITED}
+    # Extract cited IDs handling both old and new citation formats:
+    #   Old:  [TICKER::section::hash] or [neo4j::...]
+    #   New:  [source_name | TICKER::section::hash]
+    # Step 1: extract the full bracket content where :: is present
+    _bracket_contents = re.findall(r'\[([^\]]+::[^\]]+)\]', output_text)
+    cited_ids: set[str] = set()
+    for raw in _bracket_contents:
+        raw = raw.strip().rstrip("].,;")
+        # New format: "source_name | chunk_id"
+        if " | " in raw:
+            cid = raw.split(" | ", 1)[1].strip().rstrip("].,;")
+        else:
+            cid = raw
+        cited_ids.add(cid)
     # Use prefix matching with Unicode normalization: a cited ID is "grounded" if it
     # matches any real ID after normalising Unicode.
     def _norm(s: str) -> str:
@@ -589,10 +848,18 @@ def validate_citations(
     )
 
     output_text = json.dumps(output, ensure_ascii=False)
-    # Matches:  neo4j::TICKER::...  pgvec::...  qdrant::...  or bare  TICKER::...
-    raw_cited = re.findall(r'(?:neo4j|pgvec|qdrant)::[^\s",\]]+', output_text)
-    raw_cited += re.findall(r'\b[A-Z]{1,6}::[^\s",\]]+', output_text)
-    cited_ids = {cid.rstrip("].,;") for cid in raw_cited}
+    # Extract cited IDs handling both old and new citation formats:
+    #   Old:  [TICKER::section::hash] or [neo4j::...]
+    #   New:  [source_name | TICKER::section::hash]
+    _bracket_contents = re.findall(r'\[([^\]]+::[^\]]+)\]', output_text)
+    cited_ids: set[str] = set()
+    for raw in _bracket_contents:
+        raw = raw.strip().rstrip("].,;")
+        if " | " in raw:
+            cid = raw.split(" | ", 1)[1].strip().rstrip("].,;")
+        else:
+            cid = raw
+        cited_ids.add(cid)
     # Exclude source-level citations like "neo4j::TSLA::sentiment_trends"
     cited_ids = {cid for cid in cited_ids if "sentiment_trends" not in cid and "postgresql" not in cid}
 
@@ -680,17 +947,26 @@ def _strip_ungrounded_inline_citations(
 
     def _sanitise_str(s: str) -> str:
         def _replace_match(m: re.Match) -> str:
-            cid = m.group(1).rstrip("].,;")
+            raw = m.group(1).strip().rstrip("].,;")
             # Preserve PostgreSQL / sentiment citations — they aren't Neo4j chunks
-            if "sentiment_trends" in cid or "postgresql" in cid:
+            if "sentiment_trends" in raw or "postgresql" in raw:
                 return m.group(0)
+            # New format: [source_name | chunk_id] — extract the chunk_id part
+            if " | " in raw:
+                cid = raw.split(" | ", 1)[1].strip().rstrip("].,;")
+            else:
+                cid = raw
             if _is_grounded(cid):
                 return m.group(0)
-            logger.debug("Stripping ungrounded inline citation from prose: %s", cid)
+            logger.debug("Stripping ungrounded inline citation from prose: %s", raw)
             return ""
 
-        # Matches [neo4j::...], [pgvec::...], [qdrant::...], or bare [TICKER::...]
-        return re.sub(r'\[((?:neo4j|pgvec|qdrant)::[^\]]+|[A-Z]{1,6}::[^\]]+)\]', _replace_match, s)
+        # Matches:
+        #   [SomeName | TICKER::section::hash]   (new format with source_name)
+        #   [TICKER::section::hash]              (old bare format)
+        #   [neo4j::...], [pgvec::...], [qdrant::...]  (legacy prefixed format)
+        # The inner group allows any characters except ] to catch spaces in invented IDs.
+        return re.sub(r'\[([^\]]+::[^\]]+)\]', _replace_match, s)
     if isinstance(obj, str):
         # Also clean up any literal "[source unavailable]" the LLM wrote directly
         cleaned = _sanitise_str(obj)
@@ -931,7 +1207,10 @@ def _node_format_json_output(state: AgentState) -> AgentState:
             competitive_moat = {**competitive_moat, "sources": grounded_sources}
     
     # Fallback: if LLM put moat analysis in qualitative_summary instead of competitive_moat
-    if not competitive_moat and qualitative_summary and not qualitative_summary.startswith("INSUFFICIENT_DATA"):
+    # Use llm_output directly so the guard isn't blocked by the INSUFFICIENT_DATA default
+    # that may have already been assigned to the local `qualitative_summary` variable.
+    _raw_qs = llm_output.get("qualitative_summary") or ""
+    if not competitive_moat and _raw_qs and not _raw_qs.startswith("INSUFFICIENT_DATA"):
         competitive_moat = {"narrative": qualitative_summary, "sources": [], "rating": "unknown"}
 
     # Fallback: when competitive_moat is still null, derive a minimal entry from
@@ -1062,6 +1341,8 @@ def _node_format_json_output(state: AgentState) -> AgentState:
         "confidence": round(confidence, 4),
         "fallback_triggered": fallback_triggered,
         "qualitative_summary": qualitative_summary or "INSUFFICIENT_DATA: No analysis generated.",
+        # Pre-check layer diagnostics (None when data is healthy)
+        "data_coverage_warning": state.get("data_coverage_warning"),
     }
 
     # Option B backstop: strip any remaining ungrounded inline citations from all
@@ -1178,7 +1459,19 @@ def _route_after_crag(state: AgentState, toolkit: BusinessAnalystToolkit) -> str
     if crag_status == CRAGStatus.AMBIGUOUS and rewrite_count < max_loops:
         return "rewrite_query"
 
-    # INCORRECT or AMBIGUOUS-exhausted: check whether any local data exists at all
+    # AMBIGUOUS loop exhausted or INCORRECT — log the outcome
+    if crag_status == CRAGStatus.AMBIGUOUS and rewrite_count >= max_loops:
+        logger.warning(
+            "[CRAG] Max rewrite loops reached (%d/%d) for ticker=%s — "
+            "proceeding to generate from available local data or web fallback.",
+            rewrite_count, max_loops, state.get("ticker"),
+        )
+    elif crag_status == CRAGStatus.INCORRECT:
+        logger.warning(
+            "[CRAG] INCORRECT verdict (confidence=%.3f) for ticker=%s — "
+            "checking for local data before triggering web fallback.",
+            state.get("confidence", 0.0), state.get("ticker"),
+        )
     retrieval: Optional[RetrievalResult] = state.get("retrieval")
     has_chunks = bool(retrieval and retrieval.chunks)
     has_graph = bool(retrieval and retrieval.graph_facts)
@@ -1202,7 +1495,20 @@ def _route_after_rewrite(state: AgentState) -> str:
 
 
 def _route_after_classification(state: AgentState) -> str:
-    """Route to the appropriate retrieval path based on query_class."""
+    """Route to the appropriate retrieval path based on query_class.
+
+    Short-circuit: if a precheck node already set crag_status=CORRECT (e.g.
+    fresh sentiment data for a sentiment-focused query), skip all retrieval and
+    jump straight to generate_analysis.  This prevents crag_evaluate from
+    overwriting the CORRECT status with INCORRECT (0 chunks scored).
+    """
+    if state.get("crag_status") == CRAGStatus.CORRECT:
+        logger.info(
+            "[Router] crag_status=CORRECT pre-set by precheck — skipping retrieval, "
+            "routing directly to generate_analysis."
+        )
+        return "generate_analysis"
+
     query_class = (state.get("query_class") or "COMPLEX").upper()
     if query_class == "SIMPLE":
         return "fast_path_retrieval"
@@ -1223,10 +1529,14 @@ def build_graph(
 
     graph = StateGraph(AgentState)
 
-    # --- Phase 1: Metadata pre-check + sentiment enrichment ---
+    # --- Phase 1: Metadata pre-check + data-coverage pre-check + sentiment enrichment ---
     graph.add_node(
         "metadata_precheck",
         lambda state: _node_metadata_precheck(cast(AgentState, state), toolkit),
+    )
+    graph.add_node(
+        "precheck_data_coverage",
+        lambda state: _node_precheck_data_coverage(cast(AgentState, state)),
     )
     graph.add_node(
         "fetch_sentiment_data",
@@ -1287,10 +1597,12 @@ def build_graph(
     graph.set_entry_point("metadata_precheck")
 
     # Phase 1 → Phase 2
-    graph.add_edge("metadata_precheck", "fetch_sentiment_data")
+    graph.add_edge("metadata_precheck", "precheck_data_coverage")
+    graph.add_edge("precheck_data_coverage", "fetch_sentiment_data")
     graph.add_edge("fetch_sentiment_data", "classify_query")
 
     # Phase 2 → Phase 3: three-way adaptive routing
+    # Note: "generate_analysis" is also a valid target when precheck pre-sets crag_status=CORRECT.
     graph.add_conditional_edges(
         "classify_query",
         lambda state: _route_after_classification(cast(AgentState, state)),
@@ -1298,6 +1610,7 @@ def build_graph(
             "fast_path_retrieval": "fast_path_retrieval",
             "numerical_path": "numerical_path",
             "complex_retrieval": "complex_retrieval",
+            "generate_analysis": "generate_analysis",
         },
     )
 

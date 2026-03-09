@@ -105,6 +105,34 @@ def _pg_ticker_counts(cur, table: str, ticker_col: str = "ticker") -> dict[str, 
     return {row[0]: row[1] for row in cur.fetchall()}
 
 
+def _pg_sample_rows(cur, table: str, where: str = "", limit: int = 2) -> list[tuple]:
+    """Fetch up to `limit` sample rows from a table, optionally filtered."""
+    sql = f"SELECT * FROM {table}"
+    if where:
+        sql += f" WHERE {where}"
+    sql += f" ORDER BY 1 DESC LIMIT {limit}"
+    try:
+        cur.execute(sql)
+        return cur.fetchall()
+    except Exception:
+        return []
+
+
+def _print_sample_rows(cur, table: str, where: str = "", label: str = "") -> None:
+    """Print 2 sample rows from a table if any exist."""
+    rows = _pg_sample_rows(cur, table, where=where, limit=2)
+    if not rows:
+        return
+    tag = label or table
+    for i, row in enumerate(rows, 1):
+        # Truncate long values for readability
+        display = tuple(
+            str(v)[:80] + "…" if isinstance(v, str) and len(str(v)) > 80 else v
+            for v in row
+        )
+        print(f"    sample {i}: {display}")
+
+
 def check_postgres() -> bool:
     print("\n" + "=" * 60)
     print("PostgreSQL checks")
@@ -118,6 +146,8 @@ def check_postgres() -> bool:
 
     with conn, conn.cursor() as cur:
         # ── Core timeseries tables ───────────────────────────────────────────
+        # sentiment_trends is now populated from real per-article news aggregation
+        # (pos/neg/neu averaged per day), NOT from the old /api/sentiments endpoint.
         for table, ticker_col, min_rows in [
             ("raw_timeseries",         "ticker_symbol", 1000),
             ("financial_statements",   "ticker",        100),
@@ -130,9 +160,11 @@ def check_postgres() -> bool:
                 covered = [t for t in TRACKED_TICKERS if counts.get(t, 0) > 0]
                 if total >= min_rows and len(covered) == len(TRACKED_TICKERS):
                     print(_ok(f"{table}: {total} total rows, all {len(TRACKED_TICKERS)} tickers covered"))
+                    _print_sample_rows(cur, table)
                 elif total >= min_rows:
                     missing = [t for t in TRACKED_TICKERS if t not in covered]
                     print(_warn(f"{table}: {total} rows, but missing tickers: {missing}"))
+                    _print_sample_rows(cur, table)
                     all_pass = False
                 else:
                     print(_fail(f"{table}: only {total} rows (expected >= {min_rows})"))
@@ -149,8 +181,10 @@ def check_postgres() -> bool:
             missing = [t for t in TRACKED_TICKERS if t not in covered]
             if total >= 10 and not missing:
                 print(_ok(f"dividends_history: {total} total rows, all {len(TRACKED_TICKERS)} tickers covered"))
+                _print_sample_rows(cur, "dividends_history")
             elif total >= 10:
                 print(_warn(f"dividends_history: {total} rows, missing tickers (may not pay dividends): {missing}"))
+                _print_sample_rows(cur, "dividends_history")
             else:
                 print(_warn(f"dividends_history: only {total} rows"))
         except Exception as exc:
@@ -161,6 +195,7 @@ def check_postgres() -> bool:
             n = _pg_count(cur, "market_eod_us")
             if n >= 100:
                 print(_ok(f"market_eod_us: {n} rows (S&P 500 benchmark)"))
+                _print_sample_rows(cur, "market_eod_us")
             else:
                 print(_warn(f"market_eod_us: only {n} rows (expected >= 100)"))
                 all_pass = False
@@ -175,6 +210,7 @@ def check_postgres() -> bool:
                 n = _pg_count(cur, table)
                 if n > 0:
                     print(_ok(f"{table}: {n} rows"))
+                    _print_sample_rows(cur, table)
                 else:
                     print(_warn(f"{table}: 0 rows (optional — may be empty if not scraped)"))
             except Exception as exc:
@@ -185,10 +221,57 @@ def check_postgres() -> bool:
             n = _pg_count(cur, "raw_fundamentals")
             if n > 0:
                 print(_ok(f"raw_fundamentals: {n} rows"))
+                _print_sample_rows(cur, "raw_fundamentals")
             else:
                 print(_warn("raw_fundamentals: 0 rows (FMP DAG not ingested — acceptable)"))
         except Exception as exc:
             print(_warn(f"raw_fundamentals: {exc}"))
+
+        # ── news_articles (EODHD /api/news, full content + pgvector embedding) ──────
+        try:
+            total = _pg_count(cur, "news_articles")
+            counts = _pg_ticker_counts(cur, "news_articles", "ticker")
+            covered = [t for t in TRACKED_TICKERS if counts.get(t, 0) > 0]
+            missing = [t for t in TRACKED_TICKERS if t not in covered]
+            # Check embedding coverage
+            cur.execute(
+                "SELECT COUNT(*) FROM news_articles WHERE embedding IS NOT NULL"
+            )
+            _emb_row = cur.fetchone()
+            embedded_count = _emb_row[0] if _emb_row else 0
+            if total > 0 and not missing:
+                embed_pct = round(100 * embedded_count / total) if total else 0
+                embed_note = f", {embedded_count}/{total} embedded ({embed_pct}%)"
+                print(_ok(f"news_articles: {total} total rows, all {len(TRACKED_TICKERS)} tickers covered{embed_note}"))
+                _print_sample_rows(cur, "news_articles")
+            elif total > 0:
+                print(_warn(f"news_articles: {total} rows, missing tickers: {missing}"))
+                _print_sample_rows(cur, "news_articles")
+                all_pass = False
+            else:
+                print(_fail("news_articles: 0 rows (expected >= 1 per ticker)"))
+                all_pass = False
+        except Exception as exc:
+            print(_fail(f"news_articles: query error — {exc}"))
+            all_pass = False
+
+        # ── news_word_weights (EODHD /api/news-word-weights, keyed by ticker+date+word) ──
+        # 0 rows is acceptable if the DAG hasn't run the news-word-weights scrape yet.
+        try:
+            total = _pg_count(cur, "news_word_weights")
+            counts = _pg_ticker_counts(cur, "news_word_weights", "ticker")
+            covered = [t for t in TRACKED_TICKERS if counts.get(t, 0) > 0]
+            if total > 0 and len(covered) == len(TRACKED_TICKERS):
+                print(_ok(f"news_word_weights: {total} total rows, all {len(TRACKED_TICKERS)} tickers covered"))
+                _print_sample_rows(cur, "news_word_weights")
+            elif total > 0:
+                missing = [t for t in TRACKED_TICKERS if t not in covered]
+                print(_warn(f"news_word_weights: {total} rows, missing tickers: {missing}"))
+                _print_sample_rows(cur, "news_word_weights")
+            else:
+                print(_warn("news_word_weights: 0 rows (DAG scrape not yet run for this endpoint)"))
+        except Exception as exc:
+            print(_warn(f"news_word_weights: query error — {exc}"))
 
         # ── text_chunks (pgvector) ────────────────────────────────────────────
         check_pgvector(cur)
@@ -257,6 +340,7 @@ def check_pgvector(cur) -> bool:
                     print(_ok(f"text_chunks [{ticker}]: {total} chunks, all embedded"))
                 else:
                     print(_warn(f"text_chunks [{ticker}]: {total} chunks, {embedded} embedded ({total - embedded} missing)"))
+                _print_sample_rows(cur, "text_chunks", where=f"ticker = '{ticker}'")
         else:
             print(_warn("text_chunks: 0 rows — run DAG or load_postgres.py to populate"))
             all_pass = False

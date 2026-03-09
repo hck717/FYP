@@ -94,6 +94,7 @@ def _check_neo4j() -> Dict[str, Any]:
             auth=basic_auth(_NEO4J_USER, _NEO4J_PASSWORD),
             encrypted=False,
             connection_timeout=5,
+            max_connection_lifetime=10,
         )
         with driver.session(database=None) as session:
             # Company count
@@ -235,15 +236,37 @@ def check_all(tickers: Optional[List[str]] = None) -> Dict[str, Any]:
     """
     tickers = tickers or _SUPPORTED_TICKERS
 
+    # Timeout for each backend check.  Each individual connector already has a
+    # 5-second socket connect_timeout, but DNS stalls or OS TCP retries can
+    # still cause the thread to hang well beyond that.  This hard ceiling
+    # ensures check_all() always returns within ~15 seconds even when a backend
+    # is completely unreachable.
+    _CHECK_TIMEOUT = 10  # seconds per future
+
     # Run all three checks concurrently
     with ThreadPoolExecutor(max_workers=3, thread_name_prefix="avail_check") as pool:
         fut_neo4j    = pool.submit(_check_neo4j)
         fut_postgres = pool.submit(_check_postgres)
         fut_ollama   = pool.submit(_check_ollama)
 
-        neo4j    = fut_neo4j.result()
-        postgres = fut_postgres.result()
-        ollama   = fut_ollama.result()
+        def _safe_result(fut, name: str) -> Dict[str, Any]:
+            """Return future result or a safe error dict if it times out."""
+            from concurrent.futures import TimeoutError as FutTimeoutError
+            try:
+                return fut.result(timeout=_CHECK_TIMEOUT)
+            except FutTimeoutError:
+                logger.warning(
+                    "[data_availability] %s check timed out after %ds — treating as unreachable.",
+                    name, _CHECK_TIMEOUT,
+                )
+                return {"reachable": False, "error": f"timeout after {_CHECK_TIMEOUT}s"}
+            except Exception as exc:
+                logger.warning("[data_availability] %s check raised: %s", name, exc)
+                return {"reachable": False, "error": str(exc)}
+
+        neo4j    = _safe_result(fut_neo4j,    "neo4j")
+        postgres = _safe_result(fut_postgres, "postgres")
+        ollama   = _safe_result(fut_ollama,   "ollama")
 
     # Derive per-ticker readiness
     tickers_with_chunks  = set(neo4j.get("tickers_with_chunks") or [])

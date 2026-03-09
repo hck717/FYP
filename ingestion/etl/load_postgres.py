@@ -497,6 +497,45 @@ def ensure_tables() -> None:
     );
     CREATE INDEX IF NOT EXISTS idx_text_chunks_ticker
         ON text_chunks (ticker);
+
+    -- News word weights (from /api/news-word-weights endpoint)
+    -- Stores the top keyword weights for each ticker over a rolling window.
+    CREATE TABLE IF NOT EXISTS news_word_weights (
+        id             SERIAL PRIMARY KEY,
+        ticker         TEXT      NOT NULL,
+        as_of_date     DATE      NOT NULL,
+        word           TEXT      NOT NULL,
+        weight         NUMERIC   NOT NULL,
+        news_processed INTEGER,
+        news_found     INTEGER,
+        ingested_at    TIMESTAMP DEFAULT NOW(),
+        UNIQUE (ticker, as_of_date, word)
+    );
+    CREATE INDEX IF NOT EXISTS idx_news_word_weights_ticker_date
+        ON news_word_weights (ticker, as_of_date DESC);
+
+    -- News articles (from /api/news endpoint)
+    -- Full article content with per-article embedding for semantic search.
+    -- embedding column is added via migration (requires pgvector extension).
+    CREATE TABLE IF NOT EXISTS news_articles (
+        id              SERIAL PRIMARY KEY,
+        ticker          TEXT      NOT NULL,
+        article_date    TIMESTAMP NOT NULL,
+        title           TEXT,
+        content         TEXT,
+        link            TEXT      NOT NULL,
+        tags            JSONB,
+        sentiment_polarity NUMERIC,
+        sentiment_neg   NUMERIC,
+        sentiment_neu   NUMERIC,
+        sentiment_pos   NUMERIC,
+        ingested_at     TIMESTAMP DEFAULT NOW(),
+        UNIQUE (ticker, article_date, link)
+    );
+    CREATE INDEX IF NOT EXISTS idx_news_articles_ticker_date
+        ON news_articles (ticker, article_date DESC);
+    CREATE INDEX IF NOT EXISTS idx_news_articles_link
+        ON news_articles (link);
     """
     with get_pg_conn() as conn:
         with conn.cursor() as cur:
@@ -571,6 +610,9 @@ def _run_migrations() -> None:
         # (will silently fail if vector extension is not installed yet)
         "ALTER TABLE text_chunks ADD COLUMN IF NOT EXISTS embedding vector(768)",
         "CREATE INDEX IF NOT EXISTS text_chunks_embedding_idx ON text_chunks USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 64)",
+        # 2026-03: news_articles - add embedding column for semantic search
+        "ALTER TABLE news_articles ADD COLUMN IF NOT EXISTS embedding vector(768)",
+        "CREATE INDEX IF NOT EXISTS news_articles_embedding_idx ON news_articles USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 64)",
     ]
     with get_pg_conn() as conn:
         with conn.cursor() as cur:
@@ -646,6 +688,11 @@ def _normalise_date_col(df: pd.DataFrame, date_col: str) -> pd.DataFrame:
 # ── Specialty insert functions ────────────────────────────────────────────────
 
 def _insert_sentiment(ticker_symbol: str, df: pd.DataFrame) -> int:
+    """
+    Insert aggregated daily sentiment rows into sentiment_trends.
+    Expects columns: date, pos, neg, neu  (averages across news articles per day).
+    Values are fractions [0, 1]; they are multiplied by 100 to store as percentages.
+    """
     if df.empty:
         return 0
     rows = []
@@ -655,30 +702,22 @@ def _insert_sentiment(ticker_symbol: str, df: pd.DataFrame) -> int:
         d = row.to_dict()
         row_date = _safe_date(d.get("date") or d.get("datetime") or d.get("timestamp")) or today
 
-        if "normalized" in d and "pos" not in d:
+        def _pct(key: str) -> float:
+            raw = d.get(key) or d.get(f"sentiment_{key}") or d.get(f"sentiment.{key}")
             try:
-                norm = float(d["normalized"])
+                v = float(raw)
+                return round(v * 100, 4) if v <= 1.0 else round(v, 4)
             except (TypeError, ValueError):
-                continue
-            bullish = round(max(0.0, norm - 0.5) * 200, 4)
-            bearish = round(max(0.0, 0.5 - norm) * 200, 4)
-            neutral = round(100.0 - bullish - bearish, 4)
-        else:
-            def _pct(key: str) -> float:
-                raw = d.get(key) or d.get(f"sentiment_{key}") or d.get(f"sentiment.{key}")
-                try:
-                    v = float(raw)
-                    return round(v * 100, 4) if v <= 1.0 else round(v, 4)
-                except (TypeError, ValueError):
-                    return 0.0
-            bullish = _pct("pos")
-            bearish = _pct("neg")
-            neutral = _pct("neu")
+                return 0.0
+
+        bullish = _pct("pos")
+        bearish = _pct("neg")
+        neutral = _pct("neu")
 
         if bullish == 0.0 and bearish == 0.0 and neutral == 0.0:
             continue
         trend = (
-            "improving"    if bullish > bearish + 10 else
+            "improving"     if bullish > bearish + 10 else
             "deteriorating" if bearish > bullish + 10 else
             "stable"
         )
@@ -698,6 +737,188 @@ def _insert_sentiment(ticker_symbol: str, df: pd.DataFrame) -> int:
                     neutral_pct = EXCLUDED.neutral_pct,
                     trend       = EXCLUDED.trend,
                     ingested_at = NOW()
+            """, rows)
+        conn.commit()
+    return len(rows)
+
+
+def _insert_news_articles(ticker_symbol: str, articles: list) -> int:
+    """
+    Upsert a list of news article dicts into the news_articles table.
+
+    Each article dict (from EODHD /api/news) has the shape:
+        {
+            "date":    "2026-03-09T09:20:00+00:00",
+            "title":   "...",
+            "content": "...",
+            "link":    "https://...",
+            "symbols": ["AAPL.US"],
+            "tags":    ["TAG1", ...],
+            "sentiment": {"polarity": 0.98, "neg": 0.054, "neu": 0.851, "pos": 0.095}
+        }
+
+    Embedding is generated by concatenating title + " " + content and calling
+    Ollama.  If Ollama is unreachable the row is still inserted with NULL embedding.
+
+    Unique constraint: (ticker, article_date, link).
+    """
+    import logging as _logging
+    _log = _logging.getLogger(__name__)
+
+    if not articles:
+        return 0
+
+    rows_meta = []
+    texts_for_embed: list[str] = []
+    row_indices_needing_embed: list[int] = []
+
+    for art in articles:
+        if not isinstance(art, dict):
+            continue
+        link = str(art.get("link") or "").strip()
+        if not link:
+            continue
+        art_date = str(art.get("date") or "").strip()
+        if not art_date:
+            continue
+        # Normalise to "YYYY-MM-DD HH:MM:SS" for the TIMESTAMP column
+        art_date_ts = art_date[:19].replace("T", " ")
+
+        title   = str(art.get("title")   or "").strip()
+        content = str(art.get("content") or "").strip()
+        tags    = art.get("tags")
+        sent    = art.get("sentiment") or {}
+
+        rows_meta.append({
+            "ticker":             ticker_symbol,
+            "article_date":       art_date_ts,
+            "title":              title or None,
+            "content":            content or None,
+            "link":               link,
+            "tags":               json.dumps(tags) if tags is not None else None,
+            "sentiment_polarity": _safe_numeric(sent.get("polarity")),
+            "sentiment_neg":      _safe_numeric(sent.get("neg")),
+            "sentiment_neu":      _safe_numeric(sent.get("neu")),
+            "sentiment_pos":      _safe_numeric(sent.get("pos")),
+        })
+
+        combined = (title + " " + content).strip()
+        if combined:
+            # nomic-embed-text has a ~2048 token context window; truncate to 8 000 chars
+            # to stay safely within the limit for all content types
+            combined = combined[:8_000]
+            row_indices_needing_embed.append(len(rows_meta) - 1)
+            texts_for_embed.append(combined)
+
+    if not rows_meta:
+        return 0
+
+    # ── Embed (gracefully degrade if Ollama is unreachable) ──────────────────
+    embeddings: list = [None] * len(rows_meta)
+    if texts_for_embed:
+        try:
+            raw_embs = _ollama_embed_batch(texts_for_embed, OLLAMA_EMBED_MODEL, OLLAMA_BASE_URL)
+            for list_pos, row_idx in enumerate(row_indices_needing_embed):
+                embeddings[row_idx] = raw_embs[list_pos]
+        except Exception as emb_exc:
+            _log.warning(
+                "[PG news_articles] Ollama embedding failed for %s (%d articles) — "
+                "inserting with NULL embeddings. Error: %s",
+                ticker_symbol, len(texts_for_embed), emb_exc,
+            )
+
+    # ── Build rows for execute_values ─────────────────────────────────────────
+    rows = []
+    for idx, meta in enumerate(rows_meta):
+        emb = embeddings[idx]
+        emb_str = ("[" + ",".join(f"{x:.8f}" for x in emb) + "]") if emb is not None else None
+        rows.append((
+            meta["ticker"],
+            meta["article_date"],
+            meta["title"],
+            meta["content"],
+            meta["link"],
+            meta["tags"],
+            meta["sentiment_polarity"],
+            meta["sentiment_neg"],
+            meta["sentiment_neu"],
+            meta["sentiment_pos"],
+            emb_str,
+        ))
+
+    sql = """
+        INSERT INTO news_articles
+            (ticker, article_date, title, content, link, tags,
+             sentiment_polarity, sentiment_neg, sentiment_neu, sentiment_pos,
+             embedding)
+        VALUES %s
+        ON CONFLICT (ticker, article_date, link) DO UPDATE SET
+            title              = EXCLUDED.title,
+            content            = EXCLUDED.content,
+            tags               = EXCLUDED.tags,
+            sentiment_polarity = EXCLUDED.sentiment_polarity,
+            sentiment_neg      = EXCLUDED.sentiment_neg,
+            sentiment_neu      = EXCLUDED.sentiment_neu,
+            sentiment_pos      = EXCLUDED.sentiment_pos,
+            embedding          = COALESCE(EXCLUDED.embedding, news_articles.embedding),
+            ingested_at        = NOW()
+    """
+    with get_pg_conn() as conn:
+        with conn.cursor() as cur:
+            execute_values(
+                cur, sql, rows,
+                template="(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::vector)",
+            )
+        conn.commit()
+    return len(rows)
+
+
+def _insert_news_word_weights(ticker_symbol: str, data: dict) -> int:
+    """
+    Insert news word weights from the /api/news-word-weights endpoint.
+
+    Expected format (JSON):
+        {
+          "data": {"apple": 0.019, "tariff": 0.018, ...},
+          "meta": {"news_processed": 300, "news_found": 5748},
+          "links": {"next": null}
+        }
+
+    Each word becomes one row keyed by (ticker, as_of_date, word).
+    as_of_date is set to today (the weights represent the rolling window
+    up to the fetch date; no per-word date is available from the API).
+    """
+    if not isinstance(data, dict):
+        return 0
+    word_data = data.get("data") or {}
+    meta = data.get("meta") or {}
+    if not word_data:
+        return 0
+
+    today = date.today().isoformat()
+    news_processed = int(meta.get("news_processed") or 0) or None
+    news_found = int(meta.get("news_found") or 0) or None
+
+    rows = []
+    for word, weight in word_data.items():
+        w = _safe_numeric(weight)
+        if w is None:
+            continue
+        rows.append((ticker_symbol, today, str(word), w, news_processed, news_found))
+
+    if not rows:
+        return 0
+    with get_pg_conn() as conn:
+        with conn.cursor() as cur:
+            execute_values(cur, """
+                INSERT INTO news_word_weights
+                    (ticker, as_of_date, word, weight, news_processed, news_found)
+                VALUES %s
+                ON CONFLICT (ticker, as_of_date, word) DO UPDATE SET
+                    weight         = EXCLUDED.weight,
+                    news_processed = EXCLUDED.news_processed,
+                    news_found     = EXCLUDED.news_found,
+                    ingested_at    = NOW()
             """, rows)
         conn.commit()
     return len(rows)
@@ -2138,6 +2359,43 @@ def load_postgres_for_ticker(ticker_symbol: str) -> int:
         if info.get("storage_destination") != "postgresql":
             continue
 
+        source = info.get("source", "eodhd")
+
+        # ── financial_news: loaded from JSON (list of article dicts), not CSV ─────
+        if data_name == "financial_news":
+            json_path = ticker_dir / f"{data_name}.json"
+            if not json_path.exists():
+                print(f"[PG Loader] {ticker_symbol}/{data_name}: no JSON — skipping")
+                continue
+            try:
+                with open(json_path) as jf:
+                    articles = json.load(jf)
+                if not isinstance(articles, list):
+                    print(f"[PG Loader] {ticker_symbol}/{data_name}: unexpected format (not a list) — skipping")
+                    continue
+                n = _insert_news_articles(ticker_symbol, articles)
+                total += n
+                print(f"[PG Loader] {ticker_symbol}/{data_name}: {n} rows upserted")
+            except Exception as exc:
+                print(f"[PG Loader] {ticker_symbol}/{data_name}: ERROR — {exc}")
+            continue
+
+        # ── news_word_weights: loaded from JSON (dict response), not CSV ──────────
+        if data_name == "news_word_weights":
+            json_path = ticker_dir / f"{data_name}.json"
+            if not json_path.exists():
+                print(f"[PG Loader] {ticker_symbol}/{data_name}: no JSON — skipping")
+                continue
+            try:
+                with open(json_path) as jf:
+                    ww_data = json.load(jf)
+                n = _insert_news_word_weights(ticker_symbol, ww_data)
+                total += n
+                print(f"[PG Loader] {ticker_symbol}/{data_name}: {n} rows upserted")
+            except Exception as exc:
+                print(f"[PG Loader] {ticker_symbol}/{data_name}: ERROR — {exc}")
+            continue
+
         csv_path = ticker_dir / f"{data_name}.csv"
         if not csv_path.exists():
             print(f"[PG Loader] {ticker_symbol}/{data_name}: no CSV — skipping")
@@ -2148,8 +2406,6 @@ def load_postgres_for_ticker(ticker_symbol: str) -> int:
         except Exception as exc:
             print(f"[PG Loader] {ticker_symbol}/{data_name}: read error — {exc}")
             continue
-
-        source = info.get("source", "eodhd")
 
         try:
             if data_name == "sentiment_trends":
@@ -2317,6 +2573,12 @@ def load_postgres_macro() -> int:
                     "treasury_rates_30y": "US30Y",
                 }
                 n = _insert_treasury_rates(df, indicator_override=_tenor_map.get(data_name, "US10Y"))
+            elif data_name == "treasury_bill_rates":
+                # UST short-term bill rates (1M, 2M, 3M, 6M columns or similar multi-column format)
+                n = _insert_treasury_rates(df)
+            elif data_name == "treasury_yield_curve":
+                # UST full yield curve (multi-column: date + tenor columns)
+                n = _insert_treasury_rates(df)
             elif data_name in ("economic_indicators_gdp",
                                "economic_indicators_cpi",
                                "economic_indicators_unemployment"):

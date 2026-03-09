@@ -1,4 +1,14 @@
-"""LLM interaction utilities for the Business Analyst agent."""
+"""LLM interaction utilities for the Business Analyst agent.
+
+LLM backend: DeepSeek API (deepseek-reasoner) via the openai-compatible SDK.
+Ollama is retained for embeddings only (nomic-embed-text:v1.5); it is NOT used
+for any generation in this module.
+
+One API call per agent run:
+  - generate()      → single chat.completions.create() call; no retry loops.
+  - classify_query() → rule-based only; never calls the API.
+  - rewrite_query() → one API call; only fires on AMBIGUOUS CRAG path (rare).
+"""
 
 from __future__ import annotations
 
@@ -7,13 +17,15 @@ import logging
 import re
 from typing import Any, Dict, List, Optional
 
-import requests
+from openai import OpenAI
 
 from .config import BusinessAnalystConfig
-from .prompts import SYSTEM_PROMPT, JSON_SCHEMA_PROMPT, QUERY_CLASSIFICATION_PROMPT, REWRITE_PROMPT
+from .prompts import SYSTEM_PROMPT, JSON_SCHEMA_PROMPT, REWRITE_PROMPT
 from .schema import SentimentSnapshot
 
 logger = logging.getLogger(__name__)
+
+_DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 
 
 def _sanitise_json_string_newlines(text: str) -> str:
@@ -54,6 +66,10 @@ def _sanitise_json_string_newlines(text: str) -> str:
 
 def _strip_think_tags(text: str) -> str:
     """Remove <think>...</think> reasoning blocks produced by deepseek-r1.
+
+    With deepseek-reasoner the reasoning is returned in a separate
+    ``reasoning_content`` field, so think tags should not appear in the
+    main ``content`` field.  This function is kept as a safety net.
 
     Handles two cases:
     1. Properly closed blocks: <think>...</think>  — stripped entirely.
@@ -213,16 +229,21 @@ def _extract_json(text: str) -> Dict[str, Any]:
 class LLMClient:
     def __init__(self, config: BusinessAnalystConfig) -> None:
         self.config = config
+        self._client = OpenAI(
+            api_key=config.deepseek_api_key,
+            base_url=_DEEPSEEK_BASE_URL,
+            timeout=float(config.request_timeout) if config.request_timeout else 120.0,
+        )
 
     def generate(self, query: str, ticker: Optional[str], context: str, sentiment: Optional[SentimentSnapshot] = None) -> Dict[str, Any]:
+        """Generate a structured analysis JSON via a single DeepSeek API call.
+
+        No retry loops, no format:json fallback — one call per agent run.
+        The system message carries SYSTEM_PROMPT; the user message carries
+        the context, chunk-ID guard, question, and JSON schema.
+        """
         # Extract real chunk IDs from context so we can inject them into the prompt
         # to prevent the LLM from constructing plausible-looking but wrong IDs.
-        # Matches:
-        #   neo4j::TICKER::...  (indexed with neo4j prefix)
-        #   pgvec::TICKER::...  (pgvector)
-        #   qdrant::TICKER::... (legacy)
-        #   TICKER::...         (bare format from Neo4jConnector — no prefix)
-        # The pattern captures everything from chunk_id: up to the first ']' or newline.
         real_chunk_ids = re.findall(
             r'chunk_id:\s*((?:neo4j|pgvec|qdrant)::[^\]\n]+|[A-Z]{1,6}::[^\]\n]+)',
             context,
@@ -230,152 +251,85 @@ class LLMClient:
         # Deduplicate while preserving order
         seen: set = set()
         real_chunk_ids = [c for c in real_chunk_ids if not (c in seen or seen.add(c))]  # type: ignore[func-returns-value]
-        prompt = self._build_prompt(query, ticker, context, sentiment, real_chunk_ids)
-        payload = {
-            "model": self.config.llm_model,
-            "prompt": prompt,
-            "temperature": self.config.llm_temperature,
-            "num_predict": self.config.llm_max_tokens,
-            # num_ctx MUST be set explicitly — Ollama's default (4096) is smaller
-            # than our prompt alone, causing silent truncation and garbage output.
-            "num_ctx": self.config.llm_num_ctx,
-            "stream": False,
-        }
-        resp = requests.post(
-            f"{self.config.ollama_base_url}/api/generate",
-            json=payload,
-            timeout=self.config.request_timeout,
+
+        system_msg, user_msg = self._build_messages(query, ticker, context, sentiment, real_chunk_ids)
+
+        response = self._client.chat.completions.create(
+            model=self.config.llm_model,
+            messages=[
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg},
+            ],
+            max_tokens=self.config.llm_max_tokens,
+            temperature=self.config.llm_temperature,
         )
-        resp.raise_for_status()
-        resp_data = resp.json()
-        content = resp_data.get("response", "")
-        # Log token usage for diagnosing context-window and generation-budget issues
+
+        message = response.choices[0].message
+        content = message.content or ""
+
+        # Log reasoning token count (deepseek-reasoner returns reasoning separately)
+        reasoning = getattr(message, "reasoning_content", None)
         logger.debug(
-            "Ollama generate stats: prompt_eval_count=%s eval_count=%s eval_duration_ms=%s",
-            resp_data.get("prompt_eval_count"),
-            resp_data.get("eval_count"),
-            int(resp_data.get("eval_duration", 0) / 1e6),
+            "DeepSeek generate stats: model=%s, input_tokens=%s, output_tokens=%s, reasoning_chars=%s",
+            self.config.llm_model,
+            getattr(response.usage, "prompt_tokens", "?"),
+            getattr(response.usage, "completion_tokens", "?"),
+            len(reasoning) if reasoning else 0,
         )
+        if reasoning:
+            logger.debug("DeepSeek reasoning snippet (first 500 chars): %.500s", reasoning)
 
-        # If the model returned an empty response (can happen when think=False
-        # conflicts with the model's generation mode), retry without that flag.
-        if not content.strip():
-            logger.warning("LLM returned empty response (think=False may have suppressed output) — retrying without think flag")
-            retry_payload = {k: v for k, v in payload.items() if k != "think"}
-            retry_resp = requests.post(
-                f"{self.config.ollama_base_url}/api/generate",
-                json=retry_payload,
-                timeout=self.config.request_timeout,
-            )
-            retry_resp.raise_for_status()
-            content = retry_resp.json().get("response", "")
-
-        # First parse attempt
         try:
             return _extract_json(content)
-        except json.JSONDecodeError:
-            logger.warning(
-                "LLM JSON decode failed on first attempt — retrying with format:json.\n"
-                "Raw response snippet: %.300s",
-                content,
-            )
-            # Log the full raw content at DEBUG level for diagnosis
-            logger.debug("LLM full raw response (first attempt):\n%s", content)
-
-        # --- Retry with Ollama's native JSON mode ---
-        # This forces the model to emit a valid JSON object regardless of its
-        # chain-of-thought tendencies.  We send the same prompt but add a
-        # concise reminder at the top so the model knows what schema to fill.
-        json_mode_prompt = (
-            "OUTPUT ONLY a valid JSON object. No markdown, no prose, no <think> blocks. "
-            "Start your response with '{' and end with '}'.\n\n"
-            + prompt
-        )
-        json_payload = {
-            "model": self.config.llm_model,
-            "prompt": json_mode_prompt,
-            "temperature": 0.0,          # deterministic for the retry
-            "num_predict": self.config.llm_max_tokens,
-            "num_ctx": self.config.llm_num_ctx,
-            "stream": False,
-            "format": "json",            # Ollama native JSON mode
-        }
-        retry_content = ""
-        try:
-            json_resp = requests.post(
-                f"{self.config.ollama_base_url}/api/generate",
-                json=json_payload,
-                timeout=self.config.request_timeout,
-            )
-            json_resp.raise_for_status()
-            retry_content = json_resp.json().get("response", "")
-            logger.debug("LLM format:json retry raw response snippet: %.500s", retry_content)
-            result = _extract_json(retry_content)
-            logger.info("LLM JSON retry (format:json) succeeded.")
-            return result
         except json.JSONDecodeError as exc:
             logger.error(
-                "LLM JSON decode failed after format:json retry: %s\nRaw response snippet: %.500s",
+                "LLM JSON decode failed: %s\nRaw response snippet: %.500s",
                 exc,
-                retry_content,
+                content,
             )
+            logger.debug("LLM full raw response:\n%s", content)
             raise
 
     def classify_query(self, query: str) -> str:
-        """Classify a query as SIMPLE, NUMERICAL, or COMPLEX using a lightweight model.
+        """Rule-based query classification — never calls the DeepSeek API.
 
-        Uses ``config.query_classifier_model`` (default: llama3.2:latest) for speed.
-        Returns one of the three class strings; falls back to "COMPLEX" on any error
-        so the full retrieval pipeline is always available as a safe default.
+        The real classification logic lives in agent.py's rule-based
+        pre-classifier which runs before this method is ever reached.
+        This method is a dead fallback that returns COMPLEX unconditionally
+        to preserve the one-API-call-per-run budget.
         """
-        prompt = QUERY_CLASSIFICATION_PROMPT.replace("{{query}}", query)
-        payload = {
-            "model": self.config.query_classifier_model,
-            "prompt": prompt,
-            "temperature": 0.0,
-            "num_predict": 10,
-            "stream": False,
-        }
-        try:
-            resp = requests.post(
-                f"{self.config.ollama_base_url}/api/generate",
-                json=payload,
-                timeout=30,  # short timeout — lightweight classification only
-            )
-            resp.raise_for_status()
-            raw = resp.json().get("response", "").strip().upper()
-            # Extract the first word to handle trailing punctuation/whitespace
-            word = raw.split()[0] if raw.split() else ""
-            if word in ("SIMPLE", "NUMERICAL", "COMPLEX"):
-                return word
-            logger.warning("[ClassifyQuery] unexpected response %r — defaulting to COMPLEX", raw)
-            return "COMPLEX"
-        except Exception as exc:
-            logger.warning("[ClassifyQuery] classification failed: %s — defaulting to COMPLEX", exc)
-            return "COMPLEX"
+        logger.debug("[ClassifyQuery] rule-based fallback → COMPLEX (query: %.80s)", query)
+        return "COMPLEX"
 
     def rewrite_query(self, query: str) -> str:
-        payload = {
-            "model": self.config.llm_model,
-            "prompt": REWRITE_PROMPT.replace("{{query}}", query),
-            "temperature": 0.2,
-            "num_predict": 200,
-            "stream": False,
-        }
-        resp = requests.post(
-            f"{self.config.ollama_base_url}/api/generate",
-            json=payload,
-            timeout=self.config.request_timeout,
+        """Rewrite an ambiguous query via one DeepSeek API call.
+
+        Only fires on the AMBIGUOUS CRAG path (rare). Counts against the
+        one-call budget (acceptable for this exceptional path).
+        """
+        response = self._client.chat.completions.create(
+            model=self.config.llm_model,
+            messages=[
+                {"role": "user", "content": REWRITE_PROMPT.replace("{{query}}", query)},
+            ],
+            max_tokens=200,
+            temperature=0.2,
         )
-        resp.raise_for_status()
-        raw = resp.json().get("response", query)
+        raw = response.choices[0].message.content or query
         return _strip_think_tags(raw).strip() or query
 
-    def _build_prompt(self, query: str, ticker: Optional[str], context: str, sentiment: Optional[SentimentSnapshot] = None, real_chunk_ids: Optional[list] = None) -> str:
+    def _build_messages(
+        self,
+        query: str,
+        ticker: Optional[str],
+        context: str,
+        sentiment: Optional[SentimentSnapshot] = None,
+        real_chunk_ids: Optional[list] = None,
+    ) -> tuple[str, str]:
+        """Return (system_message, user_message) for the DeepSeek chat API."""
         schema = JSON_SCHEMA_PROMPT.replace("{{ticker}}", ticker or "null").replace("{{today}}", self._today())
+
         # Pre-fill exact sentiment numbers so the LLM cannot hallucinate them.
-        # The schema template has placeholder zeros; we replace them with actual values
-        # when sentiment data is available, so the LLM just copies them.
         if sentiment:
             schema = schema.replace(
                 '"bullish_pct": 0,\n    "bearish_pct": 0,\n    "neutral_pct": 0,',
@@ -385,8 +339,8 @@ class LLMClient:
                 '"trend": "improving|deteriorating|stable|unknown",',
                 f'"trend": "{sentiment.trend}",',
             )
-        # Inject the exact retrieved chunk IDs to prevent the LLM from constructing
-        # plausible-looking but incorrect citation slugs.
+
+        # Inject exact retrieved chunk IDs to prevent hallucinated citation slugs.
         if real_chunk_ids:
             ids_list = "\n".join(f"  - {cid}" for cid in real_chunk_ids)
             chunk_id_note = (
@@ -394,7 +348,9 @@ class LLMClient:
             )
         else:
             chunk_id_note = ""
-        return f"{SYSTEM_PROMPT}\nContext:\n{context}\n{chunk_id_note}\nQuestion: {query}\n\n{schema}"
+
+        user_msg = f"Context:\n{context}\n{chunk_id_note}\nQuestion: {query}\n\n{schema}"
+        return SYSTEM_PROMPT, user_msg
 
     @staticmethod
     def _today() -> str:

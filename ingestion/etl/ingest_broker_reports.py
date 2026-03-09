@@ -41,7 +41,10 @@ if _env_path.exists():
                 os.environ.setdefault(_k.strip(), _v.strip())
 
 # ── Config ─────────────────────────────────────────────────────────────────────
-TEXTUAL_DATA_DIR = _REPO_ROOT / "data"
+# PDFs live under data/textual data/<TICKER>/broker/
+# Override with TEXTUAL_DATA_DIR env var if the layout differs (e.g. in Docker).
+_default_textual_dir = _REPO_ROOT / "data" / "textual data"
+TEXTUAL_DATA_DIR = Path(os.getenv("TEXTUAL_DATA_DIR", str(_default_textual_dir)))
 TRACKED_TICKERS = os.getenv("TRACKED_TICKERS", "AAPL,TSLA,NVDA,MSFT,GOOGL").split(",")
 
 NEO4J_URI = os.getenv("NEO4J_URI", "bolt://neo4j:7687")
@@ -94,6 +97,37 @@ except ImportError:
 def _content_hash(text: str) -> str:
     """MD5 hash of chunk text for deduplication key."""
     return hashlib.md5(text.encode("utf-8")).hexdigest()
+
+
+def _derive_source_name(pdf_path: Path) -> str:
+    """
+    Derive a human-readable source name from the PDF filename.
+
+    Two naming schemes are handled:
+
+    * TSLA-style (date-prefixed):
+        ``YYYYMMDD_InstitutionName_TICKER_TitleText.pdf``
+        → ``"InstitutionName TICKER TitleText (YYYY-MM-DD)"``
+
+    * AAPL-style (institution-prefixed, no leading date):
+        ``"Institution Name TICKER TitleText.pdf"``
+        → ``"Institution Name TICKER TitleText"`` (stem as-is)
+    """
+    stem = pdf_path.stem          # strips the outermost .pdf extension
+    if stem.endswith(".pdf"):
+        stem = stem[:-4]          # handle double-extension .pdf.pdf
+    stem = stem.strip()
+
+    # TSLA-style: starts with 8-digit date followed by _ or -
+    date_prefix = re.match(r'^(\d{8})[_\-](.+)$', stem)
+    if date_prefix:
+        date_str = date_prefix.group(1)                   # e.g. "20260205"
+        rest = date_prefix.group(2).replace('_', ' ')     # underscores → spaces
+        formatted_date = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:8]}"
+        return f"{rest} ({formatted_date})"
+
+    # AAPL-style: institution-prefixed, use stem as-is (already human-readable)
+    return stem
 
 
 def _cosine_similarity(a: list[float], b: list[float]) -> float:
@@ -193,7 +227,33 @@ def get_driver():
 
 
 def extract_text_from_pdf(pdf_path: Path) -> str:
-    """Extract text from a PDF file."""
+    """
+    Extract text from a PDF file.
+
+    Tries pymupdf (fitz) first — it handles character-map encoding issues
+    that cause pypdf to produce space-separated characters.  Falls back to
+    pypdf/PyPDF2 if pymupdf is not installed.
+    """
+    # ── pymupdf (preferred) ───────────────────────────────────────────────────
+    try:
+        import fitz  # pymupdf
+        doc = fitz.open(str(pdf_path))
+        text_parts = []
+        for page in doc:
+            text = page.get_text()
+            if text and text.strip():
+                text_parts.append(text)
+        doc.close()
+        full_text = "\n\n".join(text_parts)
+        full_text = re.sub(r'\n{3,}', '\n\n', full_text)
+        full_text = re.sub(r' {2,}', ' ', full_text)
+        return full_text
+    except ImportError:
+        pass  # fall through to pypdf
+    except Exception as e:
+        logger.warning("  [pymupdf Error] %s: %s — falling back to pypdf", pdf_path.name, e)
+
+    # ── pypdf fallback ────────────────────────────────────────────────────────
     try:
         reader = PdfReader(str(pdf_path))
         text_parts = []
@@ -202,11 +262,8 @@ def extract_text_from_pdf(pdf_path: Path) -> str:
             if text:
                 text_parts.append(text)
         full_text = "\n\n".join(text_parts)
-
-        # Clean up whitespace
         full_text = re.sub(r'\n{3,}', '\n\n', full_text)
         full_text = re.sub(r' {2,}', ' ', full_text)
-
         return full_text
     except Exception as e:
         logger.warning("  [PDF Error] %s: %s", pdf_path.name, e)
@@ -334,26 +391,14 @@ def load_broker_report_chunks(ticker: str, only_new: bool = False) -> int:
     for pdf_file in pdf_files:
         logger.info("  Processing: %s", pdf_file.name)
 
-        # Extract institution name from filename
+        # Derive human-readable source name from the full PDF filename stem.
+        # This is stored as source_name on the Chunk node and used for citations.
+        source_name = _derive_source_name(pdf_file)
+
+        # Keep institution as a best-effort short label (first word(s) before ticker)
         filename = pdf_file.stem
-        institution = "Unknown"
-        for part in filename.split():
-            if part in ["Barclays", "JP", "Morgan", "JPMorgan", "Ameriprise", "UBS", "Wells", "Fargo", "Phillip", "Securities", "Goldman", "Sachs", "Morgan Stanley", "Citi", "Citigroup", "Deutsche", "Bank"]:
-                if part in ["JP", "Morgan"]:
-                    institution = "JP Morgan"
-                elif part in ["Wells", "Fargo"]:
-                    institution = "Wells Fargo"
-                elif part in ["Phillip", "Securities"]:
-                    institution = "Phillip Securities"
-                elif part in ["Ameriprise"]:
-                    institution = "Ameriprise Advisor Services"
-                else:
-                    institution = part
-                break
-        else:
-            match = re.match(r'^([A-Za-z\s]+)', filename)
-            if match:
-                institution = match.group(1).strip()
+        inst_match = re.match(r'^(?:\d{8}[_\-])?([A-Za-z][\w\s,\.\-]+?)(?:\s+[A-Z]{2,5}\s)', filename)
+        institution = inst_match.group(1).replace('_', ' ').strip() if inst_match else filename.split()[0]
 
         # Extract date from filename
         date_match = re.search(r'(\d{4})[_\-]?(\d{2})[_\-]?(\d{2})', pdf_file.name)
@@ -383,11 +428,12 @@ def load_broker_report_chunks(ticker: str, only_new: bool = False) -> int:
                 "section": "broker_report",
                 "filing_date": filing_date,
                 "source_file": pdf_file.name,
+                "source_name": source_name,
                 "institution": institution,
                 "embedding_version": EMBEDDING_MODEL_VERSION,
             })
 
-        logger.info("    Created %d chunks from %s", len(chunks), institution)
+        logger.info("    Created %d chunks from %s", len(chunks), source_name)
 
     if not all_chunks:
         logger.info("[%s] No chunks created", ticker)
@@ -417,11 +463,14 @@ def load_broker_report_chunks(ticker: str, only_new: bool = False) -> int:
           chunk.section           = row.section,
           chunk.filing_date       = row.filing_date,
           chunk.source_file       = row.source_file,
+          chunk.source_name       = row.source_name,
           chunk.institution       = row.institution,
           chunk.embedding         = row.embedding,
           chunk.embedding_version = row.embedding_version,
           chunk.created_at        = datetime()
       ON MATCH SET
+          chunk.source_name       = row.source_name,
+          chunk.institution       = row.institution,
           chunk.embedding         = row.embedding,
           chunk.embedding_version = row.embedding_version,
           chunk.updated_at        = datetime()

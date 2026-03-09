@@ -41,7 +41,10 @@ if _env_path.exists():
                 os.environ.setdefault(_k.strip(), _v.strip())
 
 # ── Config ─────────────────────────────────────────────────────────────────────
-TEXTUAL_DATA_DIR = _REPO_ROOT / "data"
+# PDFs live under data/textual data/<TICKER>/earning_call/
+# Override with TEXTUAL_DATA_DIR env var if the layout differs (e.g. in Docker).
+_default_textual_dir = _REPO_ROOT / "data" / "textual data"
+TEXTUAL_DATA_DIR = Path(os.getenv("TEXTUAL_DATA_DIR", str(_default_textual_dir)))
 TRACKED_TICKERS = os.getenv("TRACKED_TICKERS", "AAPL,TSLA,NVDA,MSFT,GOOGL").split(",")
 
 NEO4J_URI = os.getenv("NEO4J_URI", "bolt://neo4j:7687")
@@ -94,6 +97,44 @@ except ImportError:
 def _content_hash(text: str) -> str:
     """MD5 hash of chunk text for deduplication key."""
     return hashlib.md5(text.encode("utf-8")).hexdigest()
+
+
+def _derive_source_name(pdf_path: Path) -> str:
+    """
+    Derive a human-readable source name from an earnings-call PDF filename.
+
+    Typical filename:
+        ``Apple Inc Earnings Call 20251030 RT000000003082837405.pdf.pdf``
+
+    Steps:
+      1. Strip one or two ``.pdf`` extensions.
+      2. Strip trailing random identifier (long alphanumeric token, e.g.
+         ``RT000000003082837405`` or ``DN000000003094489278``).
+      3. Reformat any embedded 8-digit date ``YYYYMMDD`` → ``YYYY-MM-DD``.
+
+    Result example:
+        ``"Apple Inc Earnings Call 2025-10-30"``
+    """
+    stem = pdf_path.stem          # strips outermost .pdf
+    if stem.endswith(".pdf"):
+        stem = stem[:-4]          # handle double-extension .pdf.pdf
+    stem = stem.strip()
+
+    # Strip trailing random ID: two uppercase letters followed by ≥10 digits
+    stem = re.sub(r'\s+[A-Z]{2}\d{10,}\s*$', '', stem).strip()
+
+    # Reformat 8-digit dates embedded in the stem: YYYYMMDD → YYYY-MM-DD
+    # Also handle 7-digit dates: YYYYMDD (single-digit month) → YYYY-MM-DD
+    def _fmt_date(m: re.Match) -> str:
+        d = m.group(0)
+        if len(d) == 8:
+            return f"{d[:4]}-{d[4:6]}-{d[6:8]}"
+        else:  # 7 digits: YYYYMDD
+            return f"{d[:4]}-0{d[4]}-{d[5:7]}"
+
+    stem = re.sub(r'\b(\d{7,8})\b', _fmt_date, stem)
+
+    return stem
 
 
 def _cosine_similarity(a: list[float], b: list[float]) -> float:
@@ -202,7 +243,34 @@ def get_driver():
 
 
 def extract_text_from_pdf(pdf_path: Path) -> str:
-    """Extract text from a PDF file."""
+    """
+    Extract text from a PDF file.
+
+    Tries pymupdf (fitz) first — it handles the character-map encoding issues
+    that cause pypdf to produce space-separated characters (e.g. 'V i c e
+    P r e s i d e n t').  Falls back to pypdf/PyPDF2 if pymupdf is not
+    installed.
+    """
+    # ── pymupdf (preferred) ───────────────────────────────────────────────────
+    try:
+        import fitz  # pymupdf
+        doc = fitz.open(str(pdf_path))
+        text_parts = []
+        for page in doc:
+            text = page.get_text()
+            if text and text.strip():
+                text_parts.append(text)
+        doc.close()
+        full_text = "\n\n".join(text_parts)
+        full_text = re.sub(r'\n{3,}', '\n\n', full_text)
+        full_text = re.sub(r' {2,}', ' ', full_text)
+        return full_text
+    except ImportError:
+        pass  # fall through to pypdf
+    except Exception as e:
+        logger.warning("  [pymupdf Error] %s: %s — falling back to pypdf", pdf_path.name, e)
+
+    # ── pypdf fallback ────────────────────────────────────────────────────────
     try:
         reader = PdfReader(str(pdf_path))
         text_parts = []
@@ -211,11 +279,8 @@ def extract_text_from_pdf(pdf_path: Path) -> str:
             if text:
                 text_parts.append(text)
         full_text = "\n\n".join(text_parts)
-
-        # Clean up whitespace
         full_text = re.sub(r'\n{3,}', '\n\n', full_text)
         full_text = re.sub(r' {2,}', ' ', full_text)
-
         return full_text
     except Exception as e:
         logger.warning("  [PDF Error] %s: %s", pdf_path.name, e)
@@ -356,6 +421,9 @@ def load_earnings_call_chunks(ticker: str, only_new: bool = False) -> int:
         else:
             filing_date = None
 
+        # Derive human-readable source name from the full PDF filename.
+        source_name = _derive_source_name(pdf_file)
+
         # Extract text
         text = extract_text_from_pdf(pdf_file)
         if not text.strip():
@@ -379,6 +447,7 @@ def load_earnings_call_chunks(ticker: str, only_new: bool = False) -> int:
                 "section": "earnings_call",
                 "filing_date": filing_date,
                 "source_file": pdf_file.name,
+                "source_name": source_name,
                 "embedding_version": EMBEDDING_MODEL_VERSION,
             })
 
@@ -412,10 +481,12 @@ def load_earnings_call_chunks(ticker: str, only_new: bool = False) -> int:
           chunk.section         = row.section,
           chunk.filing_date     = row.filing_date,
           chunk.source_file     = row.source_file,
+          chunk.source_name     = row.source_name,
           chunk.embedding       = row.embedding,
           chunk.embedding_version = row.embedding_version,
           chunk.created_at      = datetime()
       ON MATCH SET
+          chunk.source_name     = row.source_name,
           chunk.embedding       = row.embedding,
           chunk.embedding_version = row.embedding_version,
           chunk.updated_at      = datetime()
