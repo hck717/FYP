@@ -25,6 +25,50 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Data Boundary Enforcement — Fundamental Math Agent whitelist
+# ---------------------------------------------------------------------------
+
+ALLOWED_DATA_TYPES = [
+    # Price data
+    "historical_prices_eod",
+    "historical_prices_weekly",
+    "historical_price",
+    "eod_price",
+    # Intraday quotes
+    "intraday_1m",
+    "intraday_5m",
+    # Technical indicators
+    "technical_beta",
+    "technical_volatility",
+    "technical_rsi",
+    "technical_macd",
+    # Screener
+    "market_screener",
+    # Basic fundamentals
+    "key_metrics_ttm",
+    "ratios_ttm",
+    # Short interest & shares stats
+    "short_interest",
+    "shares_stats",
+    # Earnings
+    "earnings_history",
+    "earnings_surprises",
+]
+
+
+def validate_data_name(data_name: str) -> None:
+    """Validate that data_name is in the allowed whitelist.
+    
+    Raises ValueError if the data type is not allowed for the Fundamental Math Agent.
+    """
+    if not any(data_name == a or data_name.startswith(a) for a in ALLOWED_DATA_TYPES):
+        raise ValueError(
+            f"Data type not allowed for Fundamental Math Agent: {data_name}. "
+            f"Allowed types: {ALLOWED_DATA_TYPES}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Safe numeric helpers
 # ---------------------------------------------------------------------------
 
@@ -75,7 +119,11 @@ class PostgresConnector:
         """Fetch the latest `limit` rows of raw_fundamentals for a ticker + data_name.
 
         Returns a list of payload dicts, newest first.
+        
+        Raises ValueError if data_name is not in ALLOWED_DATA_TYPES.
         """
+        validate_data_name(data_name)
+        
         sql = """
         SELECT payload, as_of_date, source
         FROM raw_fundamentals
@@ -109,7 +157,12 @@ class PostgresConnector:
         data_name: str,
         limit: int = 400,
     ) -> List[Dict[str, Any]]:
-        """Fetch time-series rows for a ticker from raw_timeseries, newest first."""
+        """Fetch time-series rows for a ticker from raw_timeseries, newest first.
+        
+        Raises ValueError if data_name is not in ALLOWED_DATA_TYPES.
+        """
+        validate_data_name(data_name)
+        
         sql = """
         SELECT payload, ts_date, source
         FROM raw_timeseries
@@ -198,7 +251,10 @@ class PostgresConnector:
     def fetch_short_interest(self, ticker: str) -> Optional[Dict]:
         """Fetch latest short interest data for the ticker."""
         sql = """
-        SELECT ticker, short_interest_pct, days_to_cover, shares_short, as_of_date
+        SELECT ticker, as_of_date, shares_outstanding, shares_float,
+               percent_insiders, percent_institutions, shares_short,
+               shares_short_prior_month, short_ratio,
+               short_percent_outstanding, short_percent_float
         FROM short_interest
         WHERE ticker = %s
         ORDER BY as_of_date DESC
@@ -210,7 +266,9 @@ class PostgresConnector:
             row = cur.fetchone()
             if not row:
                 return None
-            return dict(row)
+            return {k: (float(v) if hasattr(v, '__float__') and k not in ("ticker", "as_of_date") else
+                        str(v) if v is not None else None)
+                    for k, v in dict(row).items()}
 
     def fetch_options_chain(self, ticker: str, limit: int = 50) -> List[Dict]:
         """Fetch recent options chain data for the ticker."""
@@ -228,13 +286,14 @@ class PostgresConnector:
             return [dict(r) for r in rows]
 
     def fetch_earnings_surprises(self, ticker: str, limit: int = 8) -> List[Dict]:
-        """Fetch recent earnings surprises for the ticker."""
+        """Fetch recent earnings surprises for the ticker from the dedicated table."""
         sql = """
-        SELECT payload, as_of_date
-        FROM raw_fundamentals
-        WHERE ticker_symbol = %s
-          AND data_name = 'earnings_surprises'
-        ORDER BY as_of_date DESC
+        SELECT ticker, period_date, eps_actual, eps_estimate, eps_surprise_pct,
+               revenue_actual, revenue_estimate, revenue_surprise_pct,
+               before_after_market, currency
+        FROM earnings_surprises
+        WHERE ticker = %s
+        ORDER BY period_date DESC
         LIMIT %s
         """
         conn = self._connect()
@@ -243,15 +302,17 @@ class PostgresConnector:
             rows = cur.fetchall()
         results = []
         for row in rows:
-            payload = row["payload"]
-            if isinstance(payload, str):
-                try:
-                    payload = json.loads(payload)
-                except json.JSONDecodeError:
-                    pass
+            d = dict(row)
+            # Convert Decimal/date to serialisable types
             results.append({
-                "payload": payload,
-                "as_of_date": str(row["as_of_date"])
+                "period_date": str(d.get("period_date") or ""),
+                "eps_actual": float(d["eps_actual"]) if d.get("eps_actual") is not None else None,
+                "eps_estimate": float(d["eps_estimate"]) if d.get("eps_estimate") is not None else None,
+                "eps_surprise_pct": float(d["eps_surprise_pct"]) if d.get("eps_surprise_pct") is not None else None,
+                "revenue_actual": float(d["revenue_actual"]) if d.get("revenue_actual") is not None else None,
+                "revenue_estimate": float(d["revenue_estimate"]) if d.get("revenue_estimate") is not None else None,
+                "revenue_surprise_pct": float(d["revenue_surprise_pct"]) if d.get("revenue_surprise_pct") is not None else None,
+                "before_after_market": d.get("before_after_market"),
             })
         return results
 
@@ -529,236 +590,63 @@ class FinancialDataFetcher:
     def fetch(self, ticker: str) -> FinancialsBundle:
         """Fetch all data needed for factor computation for a single ticker.
 
-        Primary source: FMP (raw_fundamentals data_names: income_statement,
-        balance_sheet, cash_flow, financial_ratios, key_metrics_ttm, ratios_ttm,
-        enterprise_values, financial_scores, shares_float).
-
-        EODHD fallback (same raw_fundamentals table, different data_names):
-          - income_statement  → EODHD financial_scores (has revenue, ebit, netIncome,
-                                totalAssets, totalLiabilities, workingCapital,
-                                retainedEarnings, marketCap, altmanZScore, piotroskiScore)
-          - balance_sheet     → same EODHD financial_scores payload
-          - cash_flow         → EODHD key_metrics_ttm (freeCashFlowToFirmTTM,
-                                freeCashFlowToEquityTTM, capexToRevenueTTM)
-          - financial_ratios  → EODHD ratios_ttm (same field-name convention)
-          - key_metrics_ttm   → EODHD key_metrics_ttm (same field-name convention)
-          - ratios_ttm        → EODHD ratios_ttm (same field-name convention)
-          - enterprise_values → derived from EODHD key_metrics_ttm
-            (enterpriseValueTTM, marketCap)
-          - financial_scores  → EODHD financial_scores (piotroskiScore, altmanZScore)
-
-        Last-resort fallback: financial_statements specialty table (EODHD-sourced,
-        always populated by the ingestion pipeline).
+        RESTRICTED TO FUNDAMENTAL MATH AGENT:
+        Only fetches data types in ALLOWED_DATA_TYPES:
+        - Price data: historical_prices_eod, historical_prices_weekly
+        - Technical indicators: technical_beta, technical_volatility, technical_rsi, technical_macd
+        - Basic fundamentals: key_metrics_ttm, ratios_ttm
+        - Short interest: short_interest, shares_stats
+        - Earnings: earnings_history, earnings_surprises
+        
+        Excluded (for Financial Modelling Agent): income_statement, balance_sheet,
+        cash_flow, financial_ratios, enterprise_values, financial_scores, shares_float.
         """
         bundle = FinancialsBundle(ticker=ticker)
 
-        # Income statement — most recent period (FMP → EODHD financial_scores → financial_statements)
-        try:
-            rows = self._latest_payload_list(ticker, "income_statement", limit=5)
-            bundle.income = rows[0] if rows else {}
-            if not bundle.income:
-                # EODHD financial_scores has: revenue, ebit, netIncome, marketCap,
-                # totalAssets, totalLiabilities, workingCapital, retainedEarnings
-                eodhd_scores = self._latest_payload(ticker, "financial_scores")
-                if eodhd_scores:
-                    bundle.income = {
-                        "revenue":          eodhd_scores.get("revenue"),
-                        "operatingIncome":  eodhd_scores.get("ebit"),
-                        "ebit":             eodhd_scores.get("ebit"),
-                        "netIncome":        eodhd_scores.get("netIncome"),
-                    }
-                    logger.info(
-                        "[QF] income_statement: FMP empty for %s — using EODHD financial_scores fallback",
-                        ticker,
-                    )
-            if not bundle.income:
-                # Last-resort: financial_statements specialty table (EODHD-sourced)
-                stmt = self._financial_stmt_payload(ticker, "Income_Statement")
-                if stmt:
-                    # EODHD stores revenue as 'totalRevenue'; normalise to 'revenue'
-                    if not stmt.get("revenue") and stmt.get("totalRevenue"):
-                        stmt["revenue"] = stmt["totalRevenue"]
-                    bundle.income = {
-                        "revenue":         stmt.get("revenue"),
-                        "operatingIncome": stmt.get("operatingIncome") or stmt.get("ebit"),
-                        "ebit":            stmt.get("ebit") or stmt.get("operatingIncome"),
-                        "ebitda":          stmt.get("ebitda"),
-                        "netIncome":       stmt.get("netIncome"),
-                        "grossProfit":     stmt.get("grossProfit"),
-                        "incomeTaxExpense": stmt.get("incomeTaxExpense") or stmt.get("taxProvision"),
-                    }
-                    logger.info(
-                        "[QF] income_statement: using financial_statements table fallback for %s",
-                        ticker,
-                    )
-        except Exception as exc:
-            logger.warning("Failed to fetch income_statement for %s: %s", ticker, exc)
-
-        # Balance sheet (FMP → EODHD financial_scores → financial_statements)
-        try:
-            rows = self._latest_payload_list(ticker, "balance_sheet", limit=5)
-            bundle.balance = rows[0] if rows else {}
-            if not bundle.balance:
-                eodhd_scores = self._latest_payload(ticker, "financial_scores")
-                if eodhd_scores:
-                    bundle.balance = {
-                        "totalAssets":             eodhd_scores.get("totalAssets"),
-                        "totalLiabilities":        eodhd_scores.get("totalLiabilities"),
-                        "workingCapital":          eodhd_scores.get("workingCapital"),
-                        "retainedEarnings":        eodhd_scores.get("retainedEarnings"),
-                        "totalStockholdersEquity": (
-                            (eodhd_scores.get("totalAssets") or 0)
-                            - (eodhd_scores.get("totalLiabilities") or 0)
-                        ) or None,
-                    }
-                    logger.info(
-                        "[QF] balance_sheet: FMP empty for %s — using EODHD financial_scores fallback",
-                        ticker,
-                    )
-            if not bundle.balance:
-                # Last-resort: financial_statements specialty table (EODHD-sourced)
-                stmt = self._financial_stmt_payload(ticker, "Balance_Sheet")
-                if stmt:
-                    bundle.balance = {
-                        "totalAssets":             stmt.get("totalAssets"),
-                        "totalLiabilities":        stmt.get("totalLiabilities") or stmt.get("totalLiab"),
-                        "totalDebt":               stmt.get("longTermDebt") or stmt.get("shortLongTermDebt"),
-                        "longTermDebt":            stmt.get("longTermDebt"),
-                        "cashAndCashEquivalents":  stmt.get("cashAndEquivalents") or stmt.get("cash"),
-                        "workingCapital":          stmt.get("netWorkingCapital"),
-                        "retainedEarnings":        stmt.get("retainedEarnings"),
-                        "totalCurrentAssets":      stmt.get("totalCurrentAssets"),
-                        "totalCurrentLiabilities": stmt.get("totalCurrentLiabilities") or stmt.get("otherCurrentLiab"),
-                        "totalStockholdersEquity": (
-                            (stmt.get("totalAssets") or 0)
-                            - (stmt.get("totalLiabilities") or stmt.get("totalLiab") or 0)
-                        ) or None,
-                    }
-                    logger.info(
-                        "[QF] balance_sheet: using financial_statements table fallback for %s",
-                        ticker,
-                    )
-        except Exception as exc:
-            logger.warning("Failed to fetch balance_sheet for %s: %s", ticker, exc)
-
-        # Cash flow (FMP → EODHD key_metrics_ttm → financial_statements)
-        try:
-            rows = self._latest_payload_list(ticker, "cash_flow", limit=5)
-            bundle.cashflow = rows[0] if rows else {}
-            if not bundle.cashflow:
-                km = self._latest_payload(ticker, "key_metrics_ttm")
-                if km:
-                    fcff = _safe_float(km.get("freeCashFlowToFirmTTM"))
-                    fcfe = _safe_float(km.get("freeCashFlowToEquityTTM"))
-                    revenue = _safe_float(bundle.income.get("revenue")) if bundle.income else None
-                    capex_ratio = _safe_float(km.get("capexToRevenueTTM"))
-                    capex_abs = -(capex_ratio * revenue) if (capex_ratio and revenue) else None
-                    ocf = (fcff + abs(capex_abs)) if (fcff and capex_abs) else fcff
-                    bundle.cashflow = {
-                        "freeCashFlow":       fcfe,
-                        "freeCashFlowToFirm": fcff,
-                        "operatingCashFlow":  ocf,
-                        "capitalExpenditure": capex_abs,
-                        "netIncome":          bundle.income.get("netIncome") if bundle.income else None,
-                    }
-                    logger.info(
-                        "[QF] cash_flow: FMP empty for %s — using EODHD key_metrics_ttm fallback",
-                        ticker,
-                    )
-            if not bundle.cashflow:
-                # Last-resort: financial_statements specialty table (EODHD-sourced)
-                stmt = self._financial_stmt_payload(ticker, "Cash_Flow")
-                if stmt:
-                    bundle.cashflow = {
-                        "operatingCashFlow":        stmt.get("totalCashFromOperatingActivities") or stmt.get("operatingCashFlow"),
-                        "capitalExpenditure":       stmt.get("capitalExpenditures") or stmt.get("capitalExpenditure"),
-                        "freeCashFlow":             stmt.get("freeCashFlow"),
-                        "netIncome":                stmt.get("netIncome"),
-                        "depreciationAmortization": stmt.get("depreciation"),
-                    }
-                    logger.info(
-                        "[QF] cash_flow: using financial_statements table fallback for %s",
-                        ticker,
-                    )
-        except Exception as exc:
-            logger.warning("Failed to fetch cash_flow for %s: %s", ticker, exc)
-
-        # Financial ratios (FMP → ratios_ttm fallback — same field-name convention)
-        try:
-            rows = self._latest_payload_list(ticker, "financial_ratios", limit=5)
-            bundle.ratios = rows[0] if rows else {}
-            if not bundle.ratios:
-                # ratios_ttm uses *TTM suffix — strip or map as needed downstream
-                bundle.ratios = self._latest_payload(ticker, "ratios_ttm")
-                if bundle.ratios:
-                    logger.info(
-                        "[QF] financial_ratios: FMP empty for %s — using EODHD ratios_ttm fallback",
-                        ticker,
-                    )
-        except Exception as exc:
-            logger.warning("Failed to fetch financial_ratios for %s: %s", ticker, exc)
-
-        # TTM ratios (EODHD ratios_ttm uses same field-name convention as FMP)
-        try:
-            bundle.ratios_ttm = self._latest_payload(ticker, "ratios_ttm")
-        except Exception as exc:
-            logger.warning("Failed to fetch ratios_ttm for %s: %s", ticker, exc)
-
-        # Key metrics (FMP → key_metrics_ttm as fallback)
-        try:
-            rows = self._latest_payload_list(ticker, "key_metrics", limit=5)
-            bundle.key_metrics = rows[0] if rows else {}
-            if not bundle.key_metrics:
-                bundle.key_metrics = self._latest_payload(ticker, "key_metrics_ttm")
-                if bundle.key_metrics:
-                    logger.info(
-                        "[QF] key_metrics: FMP empty for %s — using EODHD key_metrics_ttm fallback",
-                        ticker,
-                    )
-        except Exception as exc:
-            logger.warning("Failed to fetch key_metrics for %s: %s", ticker, exc)
-
-        # TTM key metrics (EODHD key_metrics_ttm uses same field-name convention as FMP)
+        # === ALLOWED DATA: key_metrics_ttm ===
         try:
             bundle.key_metrics_ttm = self._latest_payload(ticker, "key_metrics_ttm")
+        except ValueError:
+            logger.warning("[QF] key_metrics_ttm not in allowed data types for %s", ticker)
         except Exception as exc:
             logger.warning("Failed to fetch key_metrics_ttm for %s: %s", ticker, exc)
 
-        # Enterprise values (FMP → EODHD key_metrics_ttm fallback)
+        # === ALLOWED DATA: ratios_ttm ===
         try:
-            rows = self._latest_payload_list(ticker, "enterprise_values", limit=5)
-            bundle.enterprise = rows[0] if rows else {}
-            if not bundle.enterprise:
-                km = self._latest_payload(ticker, "key_metrics_ttm")
-                if km:
-                    bundle.enterprise = {
-                        "enterpriseValue":       km.get("enterpriseValueTTM"),
-                        "marketCapitalization":  km.get("marketCap"),
-                    }
-                    logger.info(
-                        "[QF] enterprise_values: FMP empty for %s — using EODHD key_metrics_ttm fallback",
-                        ticker,
-                    )
+            bundle.ratios_ttm = self._latest_payload(ticker, "ratios_ttm")
+        except ValueError:
+            logger.warning("[QF] ratios_ttm not in allowed data types for %s", ticker)
         except Exception as exc:
-            logger.warning("Failed to fetch enterprise_values for %s: %s", ticker, exc)
+            logger.warning("Failed to fetch ratios_ttm for %s: %s", ticker, exc)
 
-        # Financial scores (EODHD financial_scores has piotroskiScore, altmanZScore)
+        # === ALLOWED DATA: earnings_surprises ===
         try:
-            bundle.scores = self._latest_payload(ticker, "financial_scores")
+            earnings_data = self.pg.fetch_earnings_surprises(ticker, limit=8)
+            bundle.earnings_surprises = earnings_data
+            # Also keep basic_fundamentals for any legacy references
+            if earnings_data:
+                bundle.basic_fundamentals = {"earnings_surprises": earnings_data}
         except Exception as exc:
-            logger.warning("Failed to fetch financial_scores for %s: %s", ticker, exc)
+            logger.warning("Failed to fetch earnings_surprises for %s: %s", ticker, exc)
 
-        # Shares float (FMP only — EODHD has no equivalent)
+        # === Valuation metrics (dedicated table) ===
         try:
-            bundle.shares_float = self._latest_payload(ticker, "shares_float")
+            vm = self.pg.fetch_valuation_metrics(ticker)
+            if vm:
+                bundle.valuation_metrics = vm
         except Exception as exc:
-            logger.warning("Failed to fetch shares_float for %s: %s", ticker, exc)
+            logger.warning("Failed to fetch valuation_metrics for %s: %s", ticker, exc)
 
-        # Historical price data
-        # Preference order: daily EOD (up to 400 rows) → weekly (54 rows, ~1 year) →
-        # legacy name variants.  Weekly is used as a fallback when daily has too few
-        # rows (e.g. only 23 rows of recent EOD data in the DB) so that
-        # compute_momentum_risk has enough data points for Beta/Sharpe/Return.
+        # === Short interest (dedicated table) ===
+        try:
+            si = self.pg.fetch_short_interest(ticker)
+            if si:
+                bundle.short_interest = si
+        except Exception as exc:
+            logger.warning("Failed to fetch short_interest for %s: %s", ticker, exc)
+
+        # === Historical price data (ALLOWED) ===
+        # Preference order: daily EOD → weekly → legacy variants
         try:
             ts_rows = self.pg.fetch_timeseries(ticker, "historical_prices_eod", limit=400)
             if not ts_rows:
@@ -767,153 +655,69 @@ class FinancialDataFetcher:
                 ts_rows = self.pg.fetch_timeseries(ticker, "historical_price", limit=400)
             if not ts_rows:
                 ts_rows = self.pg.fetch_timeseries(ticker, "eod_price", limit=400)
-            # If daily data is sparse (< 60 rows), supplement with weekly data so that
-            # momentum / beta calculations have enough price points.
+            # Supplement with weekly if daily is sparse
             if len(ts_rows) < 60:
                 weekly_rows = self.pg.fetch_timeseries(ticker, "historical_prices_weekly", limit=400)
                 if weekly_rows:
-                    # Merge: use a date-keyed dict so daily rows take precedence over weekly
-                    existing_dates = {
-                        str(row.get("ts_date", "")) for row in ts_rows
-                    }
+                    existing_dates = {str(row.get("ts_date", "")) for row in ts_rows}
                     for row in weekly_rows:
                         if str(row.get("ts_date", "")) not in existing_dates:
                             ts_rows.append(row)
-                    logger.info(
-                        "Price history for %s supplemented with weekly data — total %d rows",
-                        ticker, len(ts_rows),
-                    )
-            # Merge ts_date into payload so momentum_risk can find a date field
+                    logger.info("Price history for %s supplemented with weekly data — total %d rows", ticker, len(ts_rows))
+            # Flatten payload into top-level keys for momentum_risk compatibility.
+            # DB rows are: {"payload": {"close": ..., "adjusted_close": ...}, "ts_date": "..."}
+            # _parse_price_rows expects: {"close": ..., "adjusted_close": ..., "date": "..."}
+            flat_rows = []
             for row in ts_rows:
                 payload = row.get("payload")
-                if not payload:
-                    continue
-                merged = dict(payload) if isinstance(payload, dict) else {}
-                if "date" not in merged and "ts_date" not in merged:
-                    merged["date"] = str(row.get("ts_date", ""))
-                bundle.price_history.append(merged)
+                ts_date = row.get("ts_date", "")
+                if isinstance(payload, dict):
+                    flat = dict(payload)
+                    # Ensure date is accessible as "date" or "ts_date"
+                    flat.setdefault("date", ts_date)
+                    flat.setdefault("ts_date", ts_date)
+                    flat_rows.append(flat)
+                else:
+                    # Fallback: use the row as-is
+                    flat_rows.append(row)
+            bundle.price_history = flat_rows
+        except ValueError:
+            logger.warning("[QF] historical price data not in allowed data types for %s", ticker)
         except Exception as exc:
-            logger.warning("Failed to fetch price_history for %s: %s", ticker, exc)
+            logger.warning("Failed to fetch price history for %s: %s", ticker, exc)
 
-        # Benchmark (market EOD) prices
-        # market_eod_us may be empty or contain only junk rows.  When it has
-        # fewer than 10 usable rows we fall back to a synthetic equal-weighted
-        # index built from the weekly price history of all supported tickers
-        # EXCEPT the one being analysed.  This is not a true market index but
-        # gives compute_beta_60d enough aligned points to produce a valid beta.
+        # === Technical indicators (ALLOWED) ===
+        # Use the dedicated fetch_technicals() method which uses a LIKE query internally
+        # (bypasses validate_data_name since it's already scoped to allowed technical_ prefix)
         try:
-            mkt_rows = self.pg.fetch_market_eod(limit=400)
-            for row in mkt_rows:
+            tech_rows = self.pg.fetch_technicals(ticker, limit=200)
+            bundle.technicals = tech_rows
+        except Exception as exc:
+            logger.warning("Failed to fetch technical indicators for %s: %s", ticker, exc)
+
+        # === Benchmark price history (S&P 500 from market_eod_us) ===
+        try:
+            bench_rows = self.pg.fetch_market_eod(limit=400)
+            flat_bench = []
+            for row in bench_rows:
                 payload = row.get("payload")
-                if not payload:
-                    continue
-                merged = dict(payload) if isinstance(payload, dict) else {}
-                if "date" not in merged and "ts_date" not in merged:
-                    merged["date"] = str(row.get("ts_date", ""))
-                bundle.benchmark_history.append(merged)
+                ts_date = row.get("ts_date", "")
+                if isinstance(payload, dict):
+                    flat = dict(payload)
+                    flat.setdefault("date", ts_date)
+                    flat.setdefault("ts_date", ts_date)
+                    flat_bench.append(flat)
+                else:
+                    flat_bench.append(row)
+            bundle.benchmark_history = flat_bench
         except Exception as exc:
-            logger.warning("Failed to fetch benchmark_history: %s", exc)
-
-        # Synthetic benchmark fallback when market_eod_us is unusable
-        if len(bundle.benchmark_history) < 10:
-            logger.warning(
-                "market_eod_us has only %d usable rows — building synthetic benchmark "
-                "from peer weekly prices for beta calculation.",
-                len(bundle.benchmark_history),
-            )
-            try:
-                _PEER_TICKERS = ["AAPL", "MSFT", "GOOGL", "TSLA", "NVDA"]
-                peers = [t for t in _PEER_TICKERS if t != ticker]
-                # Collect weekly closes per date across all peers
-                date_sums: Dict[str, List[float]] = {}
-                for peer in peers:
-                    peer_rows = self.pg.fetch_timeseries(peer, "historical_prices_weekly", limit=400)
-                    for row in peer_rows:
-                        payload = row.get("payload")
-                        if not payload:
-                            continue
-                        p = dict(payload) if isinstance(payload, dict) else {}
-                        close = (
-                            p.get("adjusted_close") or p.get("adjClose")
-                            or p.get("close") or p.get("adj_close")
-                        )
-                        date_str = p.get("date") or str(row.get("ts_date", ""))
-                        if close and date_str:
-                            date_key = str(date_str).split("T")[0].split(" ")[0]
-                            date_sums.setdefault(date_key, []).append(float(close))
-                # Build equal-weighted synthetic index rows
-                bundle.benchmark_history = []
-                for date_key, closes in sorted(date_sums.items()):
-                    avg_close = sum(closes) / len(closes)
-                    bundle.benchmark_history.append({
-                        "date": date_key,
-                        "close": avg_close,
-                        "adjusted_close": avg_close,
-                    })
-                logger.info(
-                    "Synthetic benchmark built: %d weekly dates from %d peers",
-                    len(bundle.benchmark_history), len(peers),
-                )
-            except Exception as exc:
-                logger.warning("Failed to build synthetic benchmark: %s", exc)
-
-        # ── Intraday quotes (Row 2: Intraday / Delayed Live Quotes) ─────────
-        try:
-            intraday_rows = self.pg.fetch_intraday_quotes(ticker, limit=390)
-            for row in intraday_rows:
-                payload = row.get("payload")
-                if not payload:
-                    continue
-                merged = dict(payload) if isinstance(payload, dict) else {}
-                if "ts_date" not in merged:
-                    merged["ts_date"] = str(row.get("ts_date", ""))
-                bundle.intraday_quotes.append(merged)
-        except Exception as exc:
-            logger.warning("Failed to fetch intraday_quotes for %s: %s", ticker, exc)
-
-        # ── Technical indicators (Row 7: Beta & Volatility / Technicals) ────
-        try:
-            tech_rows = self.pg.fetch_technicals(ticker, limit=60)
-            for row in tech_rows:
-                payload = row.get("payload")
-                if not payload:
-                    continue
-                merged = dict(payload) if isinstance(payload, dict) else {}
-                merged["_indicator"] = row.get("data_name", "")
-                merged["_ts_date"] = str(row.get("ts_date", ""))
-                bundle.technicals.append(merged)
-        except Exception as exc:
-            logger.warning("Failed to fetch technicals for %s: %s", ticker, exc)
-
-        # ── Screener snapshot (Row 8: Screener API / Bulk) ───────────────────
-        try:
-            screener_rows = self.pg.fetch_screener_snapshot(limit=100)
-            for row in screener_rows:
-                payload = row.get("payload")
-                if not payload:
-                    continue
-                merged = dict(payload) if isinstance(payload, dict) else {}
-                merged["_ticker_code"] = row.get("ticker_code", "")
-                merged["_ts_date"] = str(row.get("ts_date", ""))
-                bundle.screener_snapshot.append(merged)
-        except Exception as exc:
-            logger.warning("Failed to fetch screener_snapshot: %s", exc)
-
-        # ── Basic fundamentals (Row 9) ────────────────────────────────────────
-        try:
-            bundle.basic_fundamentals = self.pg.fetch_basic_fundamentals(ticker)
-        except Exception as exc:
-            logger.warning("Failed to fetch basic_fundamentals for %s: %s", ticker, exc)
-
-        # ── Valuation metrics (Row 19) ────────────────────────────────────────
-        try:
-            vm = self.pg.fetch_valuation_metrics(ticker)
-            if vm:
-                bundle.valuation_metrics = vm
-        except Exception as exc:
-            logger.warning("Failed to fetch valuation_metrics for %s: %s", ticker, exc)
+            logger.warning("Failed to fetch benchmark history for %s: %s", ticker, exc)
 
         return bundle
+
+
+# ---------------------------------------------------------------------------
+# Data quality checker — PostgreSQL-based field-presence + range validation
 
 
 # ---------------------------------------------------------------------------
@@ -933,13 +737,15 @@ class DataQualityChecker:
 
     # Fields to check: (source_dict_attr, key, min_val, max_val, description)
     _RANGE_CHECKS = [
-        ("ratios_ttm", "grossProfitMarginTTM", 0.0, 1.0, "gross margin fraction"),
-        ("ratios_ttm", "operatingProfitMarginTTM", -1.0, 1.0, "operating margin fraction"),
-        ("ratios_ttm", "currentRatioTTM", 0.0, 50.0, "current ratio"),
-        ("ratios_ttm", "priceToEarningsRatioTTM", 0.0, 2000.0, "P/E ratio"),
-        ("key_metrics_ttm", "returnOnEquityTTM", -5.0, 50.0, "ROE"),
-        ("key_metrics_ttm", "returnOnInvestedCapitalTTM", -2.0, 20.0, "ROIC"),
-        ("key_metrics_ttm", "evToEBITDATTM", 0.0, 500.0, "EV/EBITDA"),
+        # key_metrics_ttm — EODHD PascalCase keys
+        ("key_metrics_ttm", "ReturnOnEquityTTM", -5.0, 50.0, "ROE"),
+        ("key_metrics_ttm", "ReturnOnAssetsTTM", -2.0, 5.0, "ROA"),
+        ("key_metrics_ttm", "OperatingMarginTTM", -1.0, 1.0, "operating margin fraction"),
+        ("key_metrics_ttm", "ProfitMargin", -1.0, 1.0, "profit margin fraction"),
+        ("key_metrics_ttm", "PERatio", 0.0, 2000.0, "P/E ratio"),
+        # ratios_ttm — EODHD PascalCase keys
+        ("ratios_ttm", "ReturnOnEquityTTM", -5.0, 50.0, "ROE"),
+        ("ratios_ttm", "OperatingMarginTTM", -1.0, 1.0, "operating margin fraction"),
     ]
 
     def check(self, bundle: FinancialsBundle) -> DataQualityCheck:

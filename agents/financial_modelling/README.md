@@ -7,227 +7,364 @@
 
 ## Role
 
-The Financial Modelling Agent is the **quantitative valuation layer** of the multi-agent equity research system. It reads historical prices, fundamentals, and earnings data from PostgreSQL, executes deterministic calculations (DCF, Comps, technicals), and returns a fully computed valuation package to the Supervisor.
+The Financial Modelling Agent is the **quantitative valuation layer** of the multi-agent equity research system. It reads historical prices, fundamentals, and earnings data exclusively from PostgreSQL, executes deterministic calculations (DCF, WACC, Comps, 3-Statement Model, Factor Scores), and returns a fully computed valuation package to the Supervisor.
 
-It does **NOT** generate numbers via LLM. The LLM is only used to interpret the computed outputs and write the `quantitative_summary` narrative. Every numeric output has a traceable formula.
+It does **NOT** generate numbers via LLM. The LLM is only used to interpret the computed outputs and write the `quantitative_summary` narrative and MoE persona narratives. Every numeric output has a traceable formula.
 
 **Handled by this agent:**
-- DCF (Discounted Cash Flow) intrinsic value with Bear / Base / Bull scenarios
+- DCF (Discounted Cash Flow) intrinsic value with Bear / Base / Bull scenarios + sensitivity matrix
+- Mixture-of-Experts (MoE) DCF consensus: Optimist / Pessimist / Realist persona adjustments
+- Macro environment snapshot: VIX-regime-adjusted Market Risk Premium fed into WACC
 - Comparable company analysis (EV/EBITDA, P/E, P/S, EV/Revenue peer multiples)
 - Technical analysis (trend, momentum, volatility indicators)
-- Earnings history analysis (EPS actual vs. estimate, surprise %, beat streak)
-- Dividend and buyback history
-- Split-adjusted price history
-- WACC calculation (CAPM Cost of Equity + Cost of Debt)
-- LBO model (stretch goal — optional)
+- Earnings history analysis (EPS actual vs. estimate, surprise %, beat/miss streak, next date)
+- Dividend and buyback history (yield, annual dividend, payout ratio, 5-year CAGR)
+- 3-Statement Model (linked IS + BS + CF with accounting linkage checks)
+- Factor scores: Piotroski F-Score, Beneish M-Score, Altman Z-Score
 
 **Handled by other agents (do not overlap):**
 - News sentiment and qualitative strategy → Business Analyst Agent
-- Macroeconomic rates and FX → (Phase 3 — not yet implemented)
 - Real-time breaking news → Web Search Agent
 
 ---
 
-## Architecture: Deterministic Python Computation Engine (Non-RAG)
+## Architecture: 11-Node LangGraph Pipeline
 
-This agent does **not** use RAG. All data comes from structured PostgreSQL tables. The LangGraph pipeline is a sequential computation chain — no retrieval confidence scoring or fallback loops.
+This agent uses **LangGraph** as a sequential computation chain. There is no RAG, no retrieval confidence scoring, and no conditional branches. All 11 nodes execute in order.
 
 ```
-Query + Ticker
+ticker
     │
     ▼
-fetch_price_history         ←  PostgreSQL: raw_timeseries (1-year EOD prices, split-adjusted)
-    │
+fetch_price_history         ←  PostgreSQL: raw_timeseries (EOD prices, split-adjusted)
+    │                           market_eod_us (S&P 500 benchmark for beta/HV30)
     ▼
-fetch_fundamentals          ←  PostgreSQL: raw_fundamentals (PE, EPS, EBITDA, FCF, Debt, Equity)
-    │
+fetch_fundamentals          ←  PostgreSQL: raw_fundamentals (income, balance, cashflow,
+    │                           scores, key_metrics_ttm, ratios_ttm, enterprise_values)
+    │                           earnings_surprises (dedicated table, 521 rows)
+    │                           dividends_history (dedicated table, 394 rows)
+    │                           valuation_metrics, outstanding_shares
     ▼
-fetch_earnings_history      ←  PostgreSQL: raw_fundamentals (earnings_history)
-                                → EPS actual vs. estimate, surprise %, beat streak
-    │
+fetch_earnings_history      ←  bundle.earnings_surprises (primary)
+    │                           → EPS actual/estimate, surprise %, beat/miss streak,
+    │                             next earnings date
     ▼
 calculate_technicals        ←  Python (pandas-ta / manual)
-                                → SMA 20/50/200, EMA 12/26, RSI(14), MACD,
-                                   Bollinger Bands, ATR, HV30, Stochastic
-    │
+    │                           → SMA 20/50/200, EMA 12/26, RSI(14), MACD + signal line,
+    │                             Bollinger Bands, ATR(14), HV30, Stochastic %K/%D
     ▼
-run_dcf_model               ←  Python: 5-year FCF projection + WACC + Terminal Value
-                                → Bear / Base / Bull scenario table
-                                → Sensitivity matrix (WACC × Terminal Growth Rate)
-    │
+macro_environment           ←  bundle.treasury_rates, bundle.benchmark_history (already fetched)
+    │                           → 10Y Treasury yield, S&P 500 HV30 proxy for VIX regime
+    │                           → VIX-adjusted MRP written into bundle.market_risk_premium
     ▼
-run_comparable_analysis     ←  PostgreSQL: peer group EV/EBITDA, P/E, EV/Revenue
-                            ←  Neo4j: COMPETES_WITH / BELONGS_TO edges for peer selection
-                                → Median/mean peer multiples applied to target metrics
-    │
+run_dcf_model               ←  Python: WACC (CAPM), 3-stage FCF projection, Terminal Value
+    │                           → Bear / Base / Bull scenario table
+    │                           → Sensitivity matrix (WACC × Terminal Growth Rate)
+    │                           → Reverse DCF implied CAGR at current market price
     ▼
-assess_analyst_estimates    ←  PostgreSQL: raw_fundamentals (analyst_estimates)
-                                → Consensus EPS/Revenue vs. actuals, surprise history
-    │
+moe_consensus               ←  DeepSeek API (deepseek-reasoner): 3 parallel persona threads
+    │                           → Optimist / Pessimist / Realist DCF adjustments
+    │                           → Probability-weighted Bear/Base/Bull consensus
     ▼
-format_json_output          ←  Structured JSON for Supervisor
+run_comparable_analysis     ←  Python + Neo4j peer group + PG peer multiples
+    │                           → EV/EBITDA, P/E (trailing + forward), P/S, EV/Revenue, P/FCF
+    │                           → vs_sector_avg: "premium +X%" or "discount -X%"
+    │                           → valuation_metrics table fills any null multiples
+    ▼
+assess_analyst_estimates    ←  bundle.dividends_dedicated (primary: dividends_history table)
+    │                           → dividend yield, annual dividend, payout ratio, 5y CAGR
+    │                           → Piotroski F-Score (2 annual periods)
+    │                           → Beneish M-Score (accruals-based)
+    │                           → Altman Z-Score (5-variable)
+    ▼
+build_three_statement_model ←  Python: IS + BS + CF reconciliation
+    │                           → income_annual / balance_annual / cashflow_annual (primary)
+    │                           → revenue, gross_margin, net_margin, OCF, FCF, net_debt
+    │                           → Linkage checks: RE linkage, cash linkage, BS balance
+    ▼
+format_json_output          ←  Structured JSON assembly
+    │                           LLM writes quantitative_summary only (no arithmetic)
     │
    END → return to Supervisor
 ```
 
 ---
 
-## Infrastructure State
+## Data Sources
 
-| Service | Container | Status | Notes |
-|---|---|---|---|
-| PostgreSQL | `fyp-postgres` | healthy | `raw_timeseries`, `raw_fundamentals` tables populated by EODHD + FMP DAGs. Earnings, dividends, splits stored in `raw_fundamentals` payload JSONB. |
-| Neo4j | `fyp-neo4j` | healthy | 5 `Company` nodes available for peer selection via `COMPETES_WITH` / `BELONGS_TO` edges. Full peer graph populated once FMP DAG runs for all S&P 100 tickers. |
-| Ollama | local | running | `deepseek-r1:8b` for narrative summary only; `temperature=0.1` (numeric analysis). Version 0.14.2. |
+All data is ingested into **PostgreSQL** via Airflow DAGs. The agent **never calls external APIs directly** — all reads go through PostgreSQL only.
+
+### PostgreSQL Tables Used
+
+| Table | Content | Used For |
+|---|---|---|
+| `raw_fundamentals` | JSONB payload keyed by `data_name` and `period_type`. Rows per ticker: `income_statement`, `balance_sheet`, `cash_flow`, `financial_ratios`, `financial_scores`, `key_metrics_ttm`, `ratios_ttm`, `enterprise_values` | DCF inputs, factor scores, comps multiples |
+| `raw_timeseries` | EOD prices (OHLCV), split-adjusted, weekly / daily | Price history for technicals and beta |
+| `market_eod_us` | US equity market EOD — S&P 100 universe | S&P 500 benchmark for rolling beta and HV30 |
+| `earnings_surprises` | `ticker, period_date, eps_actual, eps_estimate, eps_surprise_pct, revenue_actual, revenue_estimate, revenue_surprise_pct, before_after_market` | EPS surprise, beat/miss streak, next earnings date |
+| `dividends_history` | `ticker, amount, ex_date, pay_date, record_date` (amount > 0 filter) | Annual dividend, 5-year CAGR, payout ratio |
+| `valuation_metrics` | `trailing_pe, forward_pe, ev_ebitda, ev_revenue, price_sales_ttm, free_cash_flow, market_cap, enterprise_value, beta, wacc` | Fill-null fallback for comps multiples |
+| `outstanding_shares` | `ticker, shares_outstanding, as_of_date` | Share count for per-share calculations |
+| `splits_history` | Split date, ratio | Price history adjustment reference |
+| `treasury_rates` | 10Y, 2Y, 3M, 30Y Treasury yields | Risk-free rate for WACC / CAPM |
+| `global_macro_indicators` | GDP, CPI, unemployment, VIX | Macro regime context |
+| `economic_events` | Economic calendar events | Macro context |
+| `corporate_bond_yields` | IG/HY bond yields | Cost of debt inputs |
+| `forex_rates` | FX rates (EOD) | Currency adjustment for international peers |
+
+### `raw_fundamentals` Schema
+
+```
+id, ticker_symbol, data_name, as_of_date, payload (JSONB), source, ingested_at, period_type
+```
+
+- `period_type = 'yearly'` or `'quarterly'`
+- `data_name` values for each ticker: `balance_sheet`, `cash_flow`, `enterprise_values`, `financial_ratios`, `financial_scores`, `income_statement`, `key_metrics_ttm`, `ratios_ttm`
+
+### EODHD Field Name Conventions (important gotcha)
+
+EODHD uses different field names from FMP. Both are handled in `tools.py` with bidirectional aliases.
+
+**Balance Sheet:**
+- `totalStockholderEquity` (EODHD) ≡ `totalStockholdersEquity` (FMP)
+- `totalLiab` (EODHD) ≡ `totalLiabilities` (FMP)
+- `cash` (EODHD) ≡ `cashAndCashEquivalents` (FMP)
+- `shortLongTermDebt`, `longTermDebtTotal` (EODHD) ≡ `shortTermDebt`, `longTermDebt` (FMP)
+- `goodWill` (EODHD) ≡ `goodwill` (FMP)
+
+**Cash Flow:**
+- `totalCashFromOperatingActivities` (EODHD) ≡ `operatingCashFlow` (FMP)
+- `capitalExpenditures` (EODHD) ≡ `capitalExpenditure` (FMP)
+- `endPeriodCashFlow`, `beginPeriodCashFlow` (EODHD)
+- `dividendsPaid`, `salePurchaseOfStock`, `netBorrowings`, `stockBasedCompensation` (EODHD)
+
+**Income Statement:**
+- `totalRevenue` (EODHD) ≡ `revenue` (FMP)
+- `taxProvision` (EODHD) ≡ `incomeTaxExpense` (FMP)
+- `researchDevelopment` (EODHD) ≡ `researchAndDevelopmentExpenses` (FMP)
 
 ---
 
-## Data Sources
+## `FMDataBundle` Key Fields
 
-All data is ingested into **PostgreSQL** via two Airflow DAGs: `fmp_complete_ingestion` (FMP Ultimate) and `eodhd_complete_ingestion` (EODHD All-In-One). Treasury rates and market risk premium are FMP-exclusive — these feed directly into DCF WACC and Cost of Equity calculations.
+The `FMDataBundle` dataclass (defined in `schema.py`) carries all data between pipeline nodes:
 
-| Data Type | FMP | EODHD | Primary | PostgreSQL Table | Purpose |
-|---|:---:|:---:|:---:|---|---|
-| Financial Statements (Q & A) | ✓ | ✓ | Both | `raw_fundamentals` | Model inputs, DCF calculations |
-| As-Reported Financials | ✓ | ✗ | FMP | `raw_fundamentals` | GAAP/IFRS compliance checking |
-| DCF Valuation Models | ✓ | ✗ | FMP | `raw_fundamentals` | Valuation model inputs and outputs |
-| Revenue Segmentation | ✓ | ✗ | FMP | `raw_fundamentals` | Segment analysis, growth projections |
-| Analyst Estimates | ✓ | ✓ | Both | `raw_fundamentals` | Consensus vs. actual tracking |
-| Historical Stock Prices | ✓ | ✓ | Both | `raw_timeseries` | Returns calculation, valuation |
-| Dividend History | ✓ | ✓ | Both | `raw_fundamentals` | Dividend discount model, yield analysis |
-| Treasury Rates | ✓ | ✗ | FMP | `raw_timeseries` | Risk-free rate (\(R_f\)) for WACC/DCF |
-| Market Risk Premium | ✓ | ✗ | FMP | `raw_fundamentals` | Cost of equity calculation (\(R_m - R_f\)) |
-| Economic Indicators | ✓ | ✓ | Both | `raw_timeseries` | Macro factors for scenario analysis |
-| Peer Company Data | ✓ | ✓ | Both | `raw_fundamentals` | Comparable company analysis |
-| Industry Benchmarks | ✓ | ✗ | FMP | `raw_fundamentals` | Sector comparison metrics |
-
-### Source API Details
-
-| API | Endpoint Type | Ingestion DAG | Update Frequency |
-|---|---|---|---|
-| FMP Ultimate | REST JSON (financials, DCF models, segments, treasury rates, market risk premium) | `fmp_complete_ingestion` | Daily at 02:00 UTC |
-| EODHD All-In-One | REST JSON (fundamentals, EOD prices, analyst estimates, dividends) | `eodhd_complete_ingestion` | Daily at 01:00 UTC |
-
-### Key PostgreSQL Tables
-
-| Table | Content |
-|---|---|
-| `raw_fundamentals` | PE (trailing + forward), EPS, EBITDA, FCF, Total Debt, Total Equity, Market Cap, Analyst Estimates, Earnings History, Dividends, Splits, As-Reported Financials, Revenue Segments, DCF Model Inputs, Market Risk Premium — stored as `payload JSONB` keyed by `data_name` and `period` |
-| `raw_timeseries` | EOD prices (OHLCV), intraday, SMA/EMA pre-computed, split-adjusted, Treasury Rates (3M, 2Y, 10Y, 30Y), Economic Indicators |
-| `market_eod_us` | US equity market EOD — S&P 100 universe, used for peer beta, sector return, and Comps universe |
+| Field | Source | Content |
+|---|---|---|
+| `income` / `balance` / `cashflow` | `raw_fundamentals` most recent row (may be quarterly) | Used for Piotroski, Altman, Beneish, DCF |
+| `income_annual` / `balance_annual` / `cashflow_annual` | `raw_fundamentals` most recent `period_type='yearly'` row | Primary input to 3-Statement Model |
+| `income_prior` / `balance_prior` / `cashflow_prior` | `raw_fundamentals` prior-year `period_type='yearly'` row | Piotroski YoY signals (F3, F5, F6, F8, F9) |
+| `earnings_surprises` | `earnings_surprises` table, sorted `period_date DESC` | EPS actuals, estimates, surprise %, beat/miss streak |
+| `dividends_dedicated` | `dividends_history` table, sorted `pay_date DESC`, `amount > 0` | Annual dividend total, 5-year CAGR |
+| `valuation_metrics` | `valuation_metrics` table | Fill-null fallback for comps multiples |
+| `price_history` | `raw_timeseries` weekly EOD (fallback: daily) | Technical indicators |
+| `benchmark_history` | `market_eod_us` | S&P 500 rolling beta, HV30 for VIX proxy |
+| `treasury_rates` | `raw_timeseries` or `treasury_rates` dedicated table | 10Y yield → risk-free rate |
 
 ---
 
 ## Models Implemented
 
-### Discounted Cash Flow (DCF)
+### Discounted Cash Flow (DCF) — `models/dcf.py`
 
-**WACC Calculation:**
+**WACC (live, not hardcoded):**
 
-\[
-\text{WACC} = \frac{E}{V} \times R_e + \frac{D}{V} \times R_d \times (1 - T)
-\]
+```
+WACC = (E/V) × Re + (D/V) × Rd × (1 − T)
 
-- \( R_e \) (Cost of Equity) via CAPM: \( R_e = R_f + \beta \times (R_m - R_f) \)
-- \( R_f \) = 10Y Treasury Yield (sourced from `raw_timeseries` — FMP treasury rates endpoint)
-- \( R_m - R_f \) = Market Risk Premium (sourced from `raw_fundamentals` — FMP market risk premium endpoint)
-- \( \beta \) = 60-day rolling beta vs. S&P 500 (computed from `market_eod_us`)
-- \( R_d \) = Interest Expense / Total Debt (from `raw_fundamentals`)
-- \( T \) = Effective Tax Rate (from `raw_fundamentals`)
+Re  = Rf + β × (Rm − Rf)          [CAPM]
+Rf  = 10Y Treasury yield           [treasury_rates table]
+β   = 60-day rolling vs. S&P 500   [market_eod_us]
+Rm−Rf = VIX-adjusted MRP           [base MRP from raw_fundamentals, adjusted by HV30 regime]
+Rd  = Interest Expense / Total Debt [raw_fundamentals]
+T   = Effective tax rate            [raw_fundamentals]
+```
 
-**Terminal Value (Gordon Growth Model):**
+**VIX Regime MRP Adjustment (macro_environment node):**
 
-\[
-\text{TV} = \frac{\text{FCF}_n \times (1 + g)}{\text{WACC} - g}
-\]
+| HV30 Regime | Label | MRP Delta |
+|---|---|---|
+| < 15% | low | −0.005 |
+| 15–25% | normal | 0 |
+| 25–35% | high | +0.010 |
+| > 35% | extreme | +0.020 |
+
+**3-Stage FCF Projection + Terminal Value:**
+
+```
+TV = FCFn × (1 + g) / (WACC − g)    [Gordon Growth Model]
+```
 
 **Scenario Engine:**
 
-```python
-scenarios = {
-    "Bear": {"revenue_growth": -0.05, "ebit_margin": 0.10, "wacc": 0.12},
-    "Base": {"revenue_growth":  0.08, "ebit_margin": 0.18, "wacc": 0.10},
-    "Bull": {"revenue_growth":  0.20, "ebit_margin": 0.25, "wacc": 0.09},
-}
-# Output: {"Bear": $85, "Base": $130, "Bull": $195}
-```
+| Scenario | Revenue Growth | EBIT Margin | WACC Offset |
+|---|---|---|---|
+| Bear | −5% | 10% | +2% |
+| Base | +8% | 18% | 0% |
+| Bull | +20% | 25% | −1% |
 
-**Sensitivity Matrix** (WACC × Terminal Growth Rate):
+**Sensitivity Matrix:** WACC (4 levels) × Terminal Growth Rate (4 levels) → implied intrinsic value grid.
 
-| | g=1.5% | g=2.0% | g=2.5% | g=3.0% |
-|---|---|---|---|---|
-| WACC=8% | $148 | $155 | $163 | $172 |
-| WACC=9% | $131 | $137 | $143 | $150 |
-| WACC=10% | $118 | $123 | $128 | $134 |
-| WACC=11% | $107 | $111 | $115 | $120 |
-
-### Comparable Company Analysis (Comps)
-
-- Peer group sourced from Neo4j `COMPETES_WITH` / `BELONGS_TO` relationships (top 5 peers by sector/industry)
-- Peer financial data from `raw_fundamentals` (FMP + EODHD, both sourced)
-- Industry benchmark multiples from `raw_fundamentals` (FMP — sector median EV/EBITDA, P/E, EV/Revenue)
-- Multiples applied: EV/EBITDA, P/E (trailing + forward), P/S, EV/Revenue
-- Output: Implied valuation range (min / median / max peer multiple applied to target metrics)
-- Comparison: `vs_sector_avg` expressed as `premium +X%` or `discount -X%`
-
-### Technical Analysis
-
-**Trend Indicators:**
-- SMA 20, SMA 50, SMA 200
-- EMA 12, EMA 26
-- Golden Cross (SMA 50 crosses above SMA 200) / Death Cross (SMA 50 crosses below SMA 200)
-
-**Momentum Indicators:**
-- RSI (14): >70 overbought, <30 oversold
-- MACD and Signal Line divergence → `buy` / `sell` / `neutral`
-- Stochastic Oscillator %K and %D
-
-**Volatility:**
-- Bollinger Bands (20-period, 2σ): price position relative to bands
-- ATR (Average True Range, 14-day)
-- Annualised Historical Volatility (HV 30)
-
-**Support / Resistance:**
-- 52-week high and low
-- Rolling pivot points (last 20-day high/low)
+**Reverse DCF:** Implied revenue CAGR at current market price.
 
 ---
 
-## LLM & Models
+### Mixture-of-Experts (MoE) DCF Consensus — `agent.py`
 
-```python
-# Primary LLM — used ONLY for quantitative_summary narrative interpretation
-llm_model = "deepseek-r1:8b"       # via Ollama at localhost:11434 (LLM_MODEL_FINANCIAL_MODELING)
-temperature = 0.1                   # Very low: number interpretation, not creativity
-request_timeout = None              # No timeout
+Three parallel LLM persona threads (DeepSeek `deepseek-reasoner`) each adjust the base DCF result:
 
-# think tag suppression (Ollama >= 0.14.2)
-think = False
+| Persona | TGR Delta | WACC Delta | Revenue Multiplier |
+|---|---|---|---|
+| Optimist | +0.5% | −1.0% | 1.25× |
+| Pessimist | −0.5% | +1.5% | 0.70× |
+| Realist | 0% | 0% | 1.0× |
+
+- Consensus = equal-weight average of the three persona Bear/Base/Bull values
+- Synthesis narrative generated by a fourth LLM call (DeepSeek `deepseek-reasoner`, fallback to `deepseek-chat`)
+
+---
+
+### Comparable Company Analysis (Comps) — `models/valuation.py`
+
+- Peer group from Neo4j `COMPETES_WITH` / `BELONGS_TO` relationships (top 5 peers)
+- Multiples computed: EV/EBITDA, EV/EBIT, P/E trailing, P/E forward, P/S, EV/Revenue, P/FCF, PEG
+- Null multiples filled from `valuation_metrics` table
+- `vs_sector_avg`: target multiple vs. peer median → expressed as "premium +X%" or "discount −X%"
+
+---
+
+### Technical Analysis — `models/technicals.py`
+
+**Trend:** SMA 20/50/200, EMA 12/26, Golden Cross (SMA50 > SMA200), Death Cross
+
+**Momentum:** RSI(14) — overbought >70 / oversold <30; MACD histogram + signal line (9-period EMA); Stochastic %K and %D
+
+**Volatility:** Bollinger Bands (20-period, 2σ); ATR(14); Annualised HV30
+
+**Support/Resistance:** 52-week high/low; 20-day rolling pivot points
+
+---
+
+### 3-Statement Model — `models/three_statement.py`
+
+Produces linked Income Statement + Balance Sheet + Cash Flow for the two most recent annual fiscal periods, with three accounting linkage checks:
+
+| Check | Formula | Tolerance |
+|---|---|---|
+| RE linkage | `ΔRetained Earnings ≈ Net Income − Dividends + Buybacks` | ±$5B absolute or ±10% relative |
+| Cash linkage | `EndCash ≈ BeginCash + OCF + Capex + Financing` | ±$5B absolute or ±10% relative |
+| BS balance | `Total Assets ≈ Total Liabilities + Total Equity` | ±$5B absolute or ±10% relative |
+
+Primary data source: `bundle.income_annual` / `balance_annual` / `cashflow_annual` (annual period). Fallback: `bundle.income` / `balance` / `cashflow`.
+
+**Verified results for all 5 tickers:**
+
+| Ticker | Fiscal Periods | Revenue | Linkage |
+|---|---|---|---|
+| AAPL | FY2024-09-30, FY2025-09-30 | $391B → $416B | All pass |
+| MSFT | FY2024-06-30, FY2025-06-30 | $245B → $282B | All pass |
+| GOOGL | FY2024-12-31, FY2025-12-31 | $350B → $403B | All pass |
+| TSLA | FY2024-12-31, FY2025-12-31 | $97.7B → $94.8B | All pass |
+| NVDA | FY2025-01-31, FY2026-01-31 | $130B → $216B | All pass |
+
+---
+
+### Piotroski F-Score — `agent.py`
+
+Full 9-signal model across two annual periods (`bundle.income/balance/cashflow` vs. `bundle.income_prior/balance_prior/cashflow_prior`).
+
+| Pillar | Signal | Formula |
+|---|---|---|
+| Profitability | F1 | ROA > 0 |
+| Profitability | F2 | OCF > 0 |
+| Profitability | F3 | ΔROA > 0 (YoY improvement) |
+| Profitability | F4 | OCF/Assets > ROA (cash earnings > accruals) |
+| Leverage/Liquidity | F5 | ΔLeverage ≤ 0 (LTD/Assets not increased) |
+| Leverage/Liquidity | F6 | ΔCurrent Ratio ≥ 0 (liquidity not decreased) |
+| Leverage/Liquidity | F7 | No new shares issued |
+| Efficiency | F8 | ΔGross Margin > 0 |
+| Efficiency | F9 | ΔAsset Turnover > 0 |
+
+Returns `None` if fewer than 5 of 9 signals are computable.
+
+---
+
+### Beneish M-Score — `agent.py`
+
+Simplified accruals-based model (single period; full 8-variable model requires YoY deltas):
+
+```
+M ≈ −6.065 + 4.679 × (Net Income − OCF) / Total Assets
 ```
 
-**LLM scope is strictly limited:** The LLM receives the fully computed numeric outputs as context and is instructed only to write the `quantitative_summary` string and flag any anomalies in plain language. It does not perform arithmetic.
+Threshold: M > −2.22 suggests possible earnings manipulation.
+
+OCF sourced from `bundle.cashflow.operatingCashFlow` (direct from CF statement); fallback: `incomeQualityTTM × Net Income`.
+
+---
+
+### Altman Z-Score — `agent.py`
+
+```
+Z = 1.2×X1 + 1.4×X2 + 3.3×X3 + 0.6×X4 + 1.0×X5
+
+X1 = Working Capital / Total Assets
+X2 = Retained Earnings / Total Assets
+X3 = EBIT / Total Assets
+X4 = Market Cap / Total Liabilities
+X5 = Revenue / Total Assets
+```
+
+Sourced from `raw_fundamentals.financial_scores` (pre-computed EODHD value) if available; otherwise computed from IS/BS fields.
+
+---
+
+## LLM Configuration
+
+```python
+# Primary LLM — DeepSeek API (cloud)
+llm_provider = "deepseek"
+llm_model    = "deepseek-reasoner"
+base_url     = "https://api.deepseek.com"
+temperature  = 0.1   # narrative interpretation, not creativity
+
+# Fallback for MoE persona narratives (if deepseek-reasoner returns empty)
+fallback_model = "deepseek-chat"
+
+# Fallback if DeepSeek API is unreachable
+fallback_provider = "ollama"   # localhost:11434
+```
+
+**LLM scope is strictly limited:**
+- `quantitative_summary` — 10–15 sentence interpretation of the pre-computed factor table
+- MoE persona narratives — 2-sentence justification per persona (Optimist / Pessimist / Realist)
+- MoE synthesis — 3-sentence Bear/Base/Bull consensus narrative
+
+The LLM receives fully computed numeric outputs as context. It does **not** perform arithmetic.
 
 ---
 
 ## Output Format (JSON)
 
-The agent returns **structured JSON only** — no freeform Markdown prose. All numeric fields are Python-computed — never LLM-generated.
-
 ```json
 {
   "agent": "financial_modelling",
   "ticker": "AAPL",
-  "as_of_date": "2026-02-27",
+  "as_of_date": "2026-03-10",
   "current_price": 218.50,
   "valuation": {
     "dcf": {
       "intrinsic_value_base": 195.20,
       "intrinsic_value_bear": 148.00,
       "intrinsic_value_bull": 253.00,
+      "intrinsic_value_weighted": 195.85,
       "upside_pct_base": -10.7,
       "wacc_used": 0.098,
       "terminal_growth_rate": 0.025,
-      "scenario_probability": {"bear": 0.25, "base": 0.55, "bull": 0.20}
+      "beta_used": 1.21,
+      "scenario_table": [...],
+      "sensitivity_matrix": {...},
+      "reverse_dcf_implied_cagr": 0.062
     },
     "comps": {
       "ev_ebitda": 22.4,
@@ -235,60 +372,98 @@ The agent returns **structured JSON only** — no freeform Markdown prose. All n
       "pe_forward": 27.8,
       "ps_ttm": 8.1,
       "ev_revenue": 7.9,
+      "p_fcf": 28.5,
       "vs_sector_avg": "premium +18%",
       "peer_group": ["MSFT", "GOOGL", "META", "AMZN", "NVDA"]
     },
-    "implied_price_range": {
-      "low": 148.00,
-      "mid": 195.20,
-      "high": 253.00
-    }
+    "implied_price_range": {"low": 148.00, "mid": 195.20, "high": 253.00}
+  },
+  "moe_consensus": {
+    "personas": [
+      {"persona": "Optimist", "bear": 162.0, "base": 214.0, "bull": 278.0, "narrative": "..."},
+      {"persona": "Pessimist", "bear": 111.0, "base": 146.0, "bull": 190.0, "narrative": "..."},
+      {"persona": "Realist",  "bear": 148.0, "base": 195.0, "bull": 253.0, "narrative": "..."}
+    ],
+    "consensus_bear": 140.0,
+    "consensus_base": 185.0,
+    "consensus_bull": 240.0,
+    "consensus_narrative": "..."
+  },
+  "macro_environment": {
+    "risk_free_rate_10y": 0.043,
+    "benchmark_hv30": 0.182,
+    "vix_regime": "normal",
+    "base_mrp": 0.055,
+    "mrp_delta": 0.0,
+    "vix_adjusted_mrp": 0.055
   },
   "technicals": {
     "trend": "bullish",
     "rsi_14": 58.3,
     "macd_signal": "buy",
+    "macd_signal_line": 2.15,
     "macd_histogram": 1.24,
     "sma_50": 212.40,
     "sma_200": 198.80,
     "sma_50_above_200": true,
     "golden_cross": false,
     "death_cross": false,
+    "bollinger_upper": 228.00,
+    "bollinger_lower": 196.00,
     "bollinger_position": "mid",
     "atr_14": 3.82,
     "hv_30": 0.198,
+    "stochastic_k": 62.1,
+    "stochastic_d": 58.4,
     "support": 205.00,
     "resistance": 230.00,
     "52w_high": 237.49,
     "52w_low": 164.08
   },
   "earnings": {
-    "last_eps_actual": 2.40,
+    "last_eps_actual": 2.84,
     "last_eps_estimate": 2.35,
-    "surprise_pct": 2.1,
-    "beat_streak": 6,
+    "surprise_pct": 20.85,
+    "beat_streak": 12,
     "miss_streak": 0,
-    "next_earnings_date": "2026-04-24"
+    "next_earnings_date": "2026-04-29"
   },
   "dividends": {
     "dividend_yield": 0.0052,
-    "annual_dividend": 1.00,
+    "annual_dividend": 1.04,
     "payout_ratio": 0.145,
-    "dividend_growth_5y_cagr": 0.054
+    "dividend_growth_5y_cagr": 0.0487
   },
   "factor_scores": {
     "piotroski_f_score": 7,
     "beneish_m_score": -2.41,
     "altman_z_score": 4.82
   },
-  "quantitative_summary": "Apple trades at a premium to peers (EV/EBITDA +18% vs. sector). DCF base case suggests -11% downside at current price, though bull scenario (+16% revenue growth) supports 253 intrinsic value. Technical momentum remains constructive — RSI neutral at 58, SMA50 above SMA200. Piotroski F-Score of 7 indicates good financial health.",
+  "three_statement_model": {
+    "ticker": "AAPL",
+    "income_statements": [
+      {"period": "2024-09-30", "revenue": 391035000000, "gross_profit": ..., "net_income": ...},
+      {"period": "2025-09-30", "revenue": 416000000000, ...}
+    ],
+    "balance_sheets": [...],
+    "cash_flows": [...],
+    "linkage_checks": [
+      {"period": "2025-09-30", "re_linkage_holds": true, "cash_linkage_holds": true, "bs_balance_holds": true},
+      {"period": "2024-09-30", "re_linkage_holds": null, "cash_linkage_holds": true, "bs_balance_holds": true}
+    ]
+  },
+  "quantitative_summary": "Apple trades at a premium to peers...",
   "data_sources": {
     "price_data": "postgresql:raw_timeseries",
     "fundamentals": "postgresql:raw_fundamentals",
     "peer_group": "neo4j:COMPETES_WITH",
     "treasury_rates": "postgresql:raw_timeseries (FMP treasury endpoint)",
-    "market_risk_premium": "postgresql:raw_fundamentals (FMP market risk premium endpoint)"
-  }
+    "market_risk_premium": "postgresql:raw_fundamentals (FMP market risk premium endpoint)",
+    "llm_scope": "quantitative_summary narrative only",
+    "llm_model": "deepseek-reasoner"
+  },
+  "price_history": [...],
+  "benchmark_history": [...]
 }
 ```
 
@@ -300,74 +475,83 @@ The agent returns **structured JSON only** — no freeform Markdown prose. All n
 agents/financial_modelling/
 ├── README.md              # This file
 ├── __init__.py            # Package init — exports run() and run_full_analysis()
-├── agent.py               # LangGraph pipeline (8 nodes) + run() + run_full_analysis()
-├── config.py              # Centralised env-var configuration
-├── tools.py               # PostgreSQL query helpers, Neo4j peer selector
-├── prompts.py             # System prompt + quantitative summary prompt + JSON schema
-├── schema.py              # Dataclasses: ValuationResult, TechnicalSnapshot, EarningsRecord, etc.
+├── agent.py               # LangGraph 11-node pipeline + all node functions
+│                          #   Includes: Piotroski, Beneish, Altman computations
+│                          #   MoE persona engine (3 parallel LLM threads)
+│                          #   Dividend CAGR / payout from dividends_history table
+├── config.py              # Centralised env-var config (DeepSeek, Ollama, PG, Neo4j)
+├── tools.py               # PostgreSQL query helpers, FMToolkit, FMDataFetcher
+│                          #   EODHD ↔ FMP field name bidirectional aliases
+│                          #   _map_annual_income/balance/cashflow helper functions
+│                          #   ALLOWED_DATA_TYPES whitelist enforcement
+├── prompts.py             # System prompt + quantitative summary prompt
+├── schema.py              # Dataclasses: FMDataBundle, DCFResult, CompsResult,
+│                          #   TechnicalSnapshot, EarningsRecord, DividendRecord,
+│                          #   FactorScores, ValuationResult
 ├── models/
-│   ├── dcf.py             # DCF engine: WACC, FCF projections, Terminal Value, scenario table
-│   ├── valuation.py       # Comps: EV/EBITDA, P/E, P/S peer multiples from PostgreSQL
-│   └── technicals.py      # RSI, MACD, Bollinger Bands, ATR, HV30, SMA/EMA
+│   ├── __init__.py        # Exports: ThreeStatementEngine, ThreeStatementModel
+│   ├── dcf.py             # DCFEngine: WACC, CAPM, 3-stage FCF, Terminal Value,
+│   │                      #   scenario table, sensitivity matrix, reverse DCF
+│   │                      #   vix_mrp_adjustment(), compute_benchmark_hv30()
+│   ├── valuation.py       # CompsEngine: peer multiples (EV/EBITDA, P/E, P/S, etc.)
+│   ├── technicals.py      # TechnicalEngine: RSI, MACD, Bollinger, ATR, HV30,
+│   │                      #   SMA/EMA, Stochastic, rolling beta
+│   └── three_statement.py # ThreeStatementEngine: linked IS+BS+CF with linkage checks
+│                          #   RE linkage (includes buybacks), cash linkage, BS balance
 └── tests/
-    └── test_agent.py      # Unit + integration tests (all mocked)
+    └── test_agent.py      # Unit + integration tests (mocked)
 ```
 
 ---
 
 ## Public API
 
-The package exports two functions from `agents.financial_modelling`:
-
-### `run(task, ticker, config)` — targeted query
-
 ```python
-from agents.financial_modelling import run
+from agents.financial_modelling import run, run_full_analysis
 
-result = run(task="What is Apple's DCF intrinsic value?", ticker="AAPL")
+# Single ticker
+report = run_full_analysis(ticker="AAPL")
+report["valuation"]["dcf"]["intrinsic_value_base"]   # → float
+report["technicals"]["rsi_14"]                        # → float
+report["earnings"]["beat_streak"]                     # → int
+report["three_statement_model"]["linkage_checks"]     # → list
+
+# Natural-language prompt (ticker extracted automatically)
+report = run(prompt="Analyze NVDA valuation")
+
+# Multiple tickers
+reports = run(prompt="Compare MSFT vs AAPL")  # → List[Dict]
 ```
-
-Answers a **single quantitative question**. Output is scoped to the relevant model (e.g. only DCF is run if the task is DCF-specific). Use this when the Supervisor has a targeted follow-up.
-
-### `run_full_analysis(ticker, config)` — comprehensive valuation dossier
-
-```python
-from agents.financial_modelling import run_full_analysis
-
-dossier = run_full_analysis(ticker="AAPL")
-# dossier["valuation"]["dcf"]["intrinsic_value_base"]  → 195.20
-# dossier["technicals"]["rsi_14"]                       → 58.3
-# dossier["earnings"]["beat_streak"]                    → 6
-# dossier["quantitative_summary"]                        → "..."
-```
-
-Runs **all models** (DCF, Comps, Technicals, Earnings, Dividends, Factor Scores) in a single pipeline pass. This is the intended entry point for the Synthesizer. Returns the full JSON schema above.
 
 ---
 
 ## Environment Variables
 
 ```bash
-# LLM (narrative summary only)
+# LLM — DeepSeek API (primary)
+FM_LLM_PROVIDER=deepseek
+DEEPSEEK_API_KEY=sk-...
+FM_LLM_MODEL=deepseek-reasoner
+
+# LLM — Ollama (fallback if DeepSeek unreachable)
 OLLAMA_BASE_URL=http://localhost:11434
-LLM_MODEL_FINANCIAL_MODELING=deepseek-r1:8b
 
 # PostgreSQL
-POSTGRES_HOST=localhost
+POSTGRES_HOST=postgres
 POSTGRES_PORT=5432
 POSTGRES_DB=airflow
 POSTGRES_USER=airflow
 POSTGRES_PASSWORD=airflow
 
-# Neo4j (peer group selection)
-NEO4J_URI=bolt://localhost:7687
+# Neo4j (peer group selection for Comps)
+NEO4J_URI=bolt://neo4j:7687
 NEO4J_USER=neo4j
 NEO4J_PASSWORD=changeme_neo4j_password
 
 # Analysis configuration
 PRICE_HISTORY_DAYS=365          # Look-back window for technical analysis
 DCF_FORECAST_YEARS=5            # Number of years to project FCF
-DCF_TERMINAL_GROWTH_RATE=0.025  # Terminal growth rate (default; overridden by Macro Agent)
+DCF_TERMINAL_GROWTH_RATE=0.025  # Terminal growth rate default
 DCF_WACC=0.09                   # WACC default (overridden by live CAPM calculation)
 COMPS_SECTOR_PEERS=5            # Number of peer companies for Comps analysis
 ```
@@ -377,65 +561,78 @@ COMPS_SECTOR_PEERS=5            # Number of peer companies for Comps analysis
 ## Run Commands
 
 ```bash
-cd /Users/brianho/FYP && \
-LLM_MODEL_FINANCIAL_MODELING=deepseek-r1:8b \
-python -m agents.financial_modelling.agent \
-  --ticker AAPL \
-  --log-level WARNING
-```
+# Run inside the Airflow scheduler container (standard)
+docker exec fyp-airflow-scheduler \
+    python -m agents.financial_modelling.agent --ticker AAPL --log-level INFO
 
-**Suggested test commands:**
+# All 5 validated tickers
+docker exec fyp-airflow-scheduler \
+    python -m agents.financial_modelling.agent --ticker AAPL --log-level WARNING
 
-```bash
-# 1. AAPL — full valuation dossier (DCF, comps, technicals, dividends, factor scores)
-python -m agents.financial_modelling.agent --ticker AAPL --log-level WARNING
+docker exec fyp-airflow-scheduler \
+    python -m agents.financial_modelling.agent --ticker MSFT --log-level WARNING
 
-# 2. MSFT — verifies dividend CAGR, payout ratio, and bearish RSI signal
-python -m agents.financial_modelling.agent --ticker MSFT --log-level WARNING
+docker exec fyp-airflow-scheduler \
+    python -m agents.financial_modelling.agent --ticker GOOGL --log-level WARNING
 
-# 3. GOOGL — checks EV/EBITDA sector discount computation and Altman Z-Score derivation
-python -m agents.financial_modelling.agent --ticker GOOGL --log-level WARNING
+docker exec fyp-airflow-scheduler \
+    python -m agents.financial_modelling.agent --ticker TSLA --log-level WARNING
 
-# 4. TSLA — high-volatility stock; exercises Bollinger band lower-band signal and ATR output
-python -m agents.financial_modelling.agent --ticker TSLA --log-level WARNING
+docker exec fyp-airflow-scheduler \
+    python -m agents.financial_modelling.agent --ticker NVDA --log-level WARNING
 
-# 5. NVDA — high-growth stock; tests DCF sensitivity matrix with elevated P/S and EV/Revenue multiples
-python -m agents.financial_modelling.agent --ticker NVDA --log-level WARNING
+# Natural-language prompt mode
+docker exec fyp-airflow-scheduler \
+    python -m agents.financial_modelling.agent --prompt "Analyze AAPL valuation" --log-level WARNING
 
-# Run unit test suite
+# Unit test suite
 python -m pytest agents/financial_modelling/tests/ -q
 ```
 
 ---
 
-## Validated Live Results
+## Data Boundary Enforcement
 
-All 5 supported tickers have been validated end-to-end with real PostgreSQL and Neo4j data running locally via `docker-compose.yml`.
+The agent is restricted to the financial modelling use-case only. All data queries are validated against `ALLOWED_DATA_TYPES` in `tools.py`.
 
-| Ticker | Status | Computations Verified | Citations in output | Fallback |
-|---|---|---|---|---|
-| AAPL | CORRECT | Yes | N/A (Computed) | false |
-| TSLA | CORRECT | Yes | N/A (Computed) | false |
-| MSFT | CORRECT | Yes | N/A (Computed) | false |
-| NVDA | CORRECT | Yes | N/A (Computed) | false |
-| GOOGL | CORRECT | Yes | N/A (Computed) | false |
+### Allowed Data Types (whitelist)
+- Basic Fundamentals (EPS, key metrics, ratios)
+- Financial Statements (IS / BS / CF)
+- Valuation Metrics
+- Outstanding Shares History
+- Dividend History / Stock Splits
+- Earnings Surprises
+- Treasury Rates / Macro Indicators
+- Economic Events
+- Bonds Data (Yields)
+- Forex Historical Rates (EOD)
+- Historical Stock Prices (EOD — used for beta/WACC and technicals)
+
+### Excluded Data Types (reserved for other agents)
+- Intraday / Delayed Live Quotes
+- Screener API (Bulk)
+- Short Interest & Shares Stats
+- Any Business Analyst data (news, sentiment, insiders, etc.)
+
+### Implementation
+- `ALLOWED_DATA_TYPES` whitelist in `tools.py`
+- `validate_data_name()` enforces the whitelist on every `raw_fundamentals` query
+- **No direct external API calls** — all data reads go through PostgreSQL
 
 ---
 
 ## Design Decisions
 
-- **Numbers are never LLM-generated:** All numeric outputs (DCF intrinsic value, RSI, EV/EBITDA, WACC, etc.) are computed in Python. The LLM is used exclusively to write the `quantitative_summary` interpretation string. This guarantees mathematical reproducibility.
-- **Treasury rates and Market Risk Premium are FMP-exclusive:** EODHD does not provide these endpoints. The risk-free rate (\(R_f\)) and equity risk premium (\(R_m - R_f\)) used in CAPM are therefore sourced from FMP only and stored in `raw_timeseries` and `raw_fundamentals` respectively. If the FMP DAG has not yet run for the current day, the agent falls back to the previous day’s cached value.
-- **Dual-path verification (from Quant Fundamental Agent pattern):** Where applicable, critical calculations (e.g. WACC) are cross-verified with the Quant Fundamental Agent’s outputs. If the two agents produce materially different WACC figures, the Supervisor flags a `CalculationAlert`.
-- **WACC is live, not hardcoded:** The `DCF_WACC` env var is a default fallback only. At runtime, WACC is computed from live CAPM inputs: 10Y yield (from `raw_timeseries`), Market Risk Premium (from `raw_fundamentals`), rolling 60-day beta (from `market_eod_us`), and cost of debt from `raw_fundamentals`.
-- **As-Reported Financials for GAAP/IFRS compliance:** FMP provides as-reported financials (pre-adjustment) alongside standardised financials. The agent uses as-reported data to check for unusual restatements or GAAP/IFRS presentation differences that could distort comparability in Comps.
-- **Revenue Segmentation for growth projections:** FMP revenue segment data (geography + product line) is used to build differentiated growth assumptions per segment in the Bear/Base/Bull DCF scenarios, rather than applying a single blended growth rate.
-- **Split-adjusted prices:** All price history retrieved from `raw_timeseries` is split-adjusted before technical indicator computation to avoid distorted signals from historical splits.
-- **Peer group from Neo4j:** Comparable companies are selected via Neo4j `COMPETES_WITH` and `BELONGS_TO` Cypher queries. If Neo4j returns fewer than 5 peers, the agent falls back to selecting the top-5 companies by market cap in the same GICS sector from `raw_fundamentals`.
-- **Industry benchmarks from FMP:** Sector-level median multiples (EV/EBITDA, P/E, EV/Revenue) are sourced from FMP’s industry benchmarks endpoint and used as the denominator for `vs_sector_avg` comparisons in Comps output.
-- **Scenario probability weighting:** The three DCF scenarios are probability-weighted: `E[IV] = 0.25 × Bear + 0.55 × Base + 0.20 × Bull`. Weights are configurable via the config object.
-- **`data_sources` block in output:** Every numeric output block includes a `data_sources` field citing the exact PostgreSQL table and originating API. This provides an auditable provenance chain for the Synthesizer’s citation verification stage.
+- **Numbers are never LLM-generated.** All numeric outputs (DCF intrinsic value, RSI, EV/EBITDA, WACC, F-Score, etc.) are computed in Python. The LLM writes only narrative strings.
+- **EODHD field name aliases.** EODHD uses different field names from FMP throughout IS/BS/CF payloads. `tools.py` applies bidirectional aliases so downstream models can use consistent FMP-style keys (`revenue`, `operatingCashFlow`, etc.) regardless of the originating API.
+- **Annual vs. quarterly data split.** `bundle.income/balance/cashflow` carries the most recent DB row (may be quarterly). `bundle.income_annual/balance_annual/cashflow_annual` always carries the most recent `period_type='yearly'` row. The 3-Statement Model uses annual data for comparability.
+- **RE linkage formula includes buybacks.** `ΔRE ≈ NI − Dividends + salePurchaseOfStock`. Buybacks are negative (cash outflow), which reduces retained earnings for repurchase-heavy companies like AAPL.
+- **Linkage tolerances are wide by design.** `±$5B absolute or ±10% relative` is needed because RE linkage legitimately differs from the simplified formula due to AOCI, SBC vesting, and other equity movements not captured in the three-statement stub. TSLA's cash definition differs by ~$1.1B between BS and CF statement (EODHD convention); $5B tolerance handles this.
+- **VIX-adjusted MRP.** WACC uses a live Market Risk Premium that is uplifted in high-volatility regimes (HV30 > 25%) and reduced in calm regimes (HV30 < 15%). This prevents WACC from being artificially low during market stress.
+- **MoE DCF consensus.** Three parallel LLM personas adjust TGR and WACC assumptions and produce a probability-weighted Bear/Base/Bull range. This gives the Supervisor a distribution of outcomes, not just a point estimate.
+- **`deepseek-chat` fallback for MoE narratives.** `deepseek-reasoner` uses chain-of-thought `<think>` tags that consume tokens before emitting the actual response. If the cleaned response is fewer than 20 characters, the agent retries with `deepseek-chat` (no reasoning overhead) for the persona narrative only.
+- **WACC is live, not hardcoded.** `DCF_WACC` env var is a fallback only. At runtime, WACC is computed from live CAPM inputs: 10Y Treasury yield (from `treasury_rates`), VIX-adjusted MRP, rolling 60-day beta (from `market_eod_us`), and cost of debt from `raw_fundamentals`.
 
 ---
 
-*Last updated: 2026-03-01 | Author: hck717*
+*Last updated: 2026-03-10 | Author: hck717*

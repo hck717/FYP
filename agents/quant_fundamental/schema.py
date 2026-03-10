@@ -192,14 +192,15 @@ class FinancialsBundle:
     # ── EODHD data (Row 19): Valuation Metrics from dedicated table
     valuation_metrics: Dict[str, Any] = field(default_factory=dict)
     # ── EODHD data (Row 20): Short Interest & Shares Stats (short_interest table)
-    # Already fetched via fetch_short_interest()
+    short_interest: Dict[str, Any] = field(default_factory=dict)
     # ── EODHD data (Row 21): Earnings History & Surprises (earnings_surprises table)
-    # Already fetched via fetch_earnings_surprises()
+    earnings_surprises: List[Dict[str, Any]] = field(default_factory=list)
 
     def is_empty(self) -> bool:
         return not any([
-            self.income, self.balance, self.cashflow, self.ratios,
-            self.key_metrics, self.enterprise, self.scores,
+            self.key_metrics_ttm, self.ratios_ttm,
+            self.price_history, self.technicals,
+            self.basic_fundamentals,
         ])
 
 

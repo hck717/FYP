@@ -20,6 +20,12 @@ def _env(key: str, default: Optional[str] = None) -> str:
     return value
 
 
+def _get_default_ollama() -> str:
+    """Determine default Ollama URL based on environment."""
+    in_docker = Path("/.dockerenv").exists()
+    return "http://host.docker.internal:11434" if in_docker else "http://localhost:11434"
+
+
 @dataclass(slots=True)
 class FinancialModellingConfig:
     """Runtime configuration container for the Financial Modelling agent."""
@@ -43,13 +49,15 @@ class FinancialModellingConfig:
     )
 
     # LLM — used ONLY for the quantitative_summary narrative.
-    # Use deepseek-r1:8b (same as BA and Summarizer) so Ollama never has to swap
-    # models mid-pipeline.  A single model stays resident in GPU/ANE memory across
-    # BA → QF → FM → Summarizer, eliminating the ~30-60s reload penalty per swap.
+    # Supports both Ollama (local) and DeepSeek API (cloud).
+    # Configure via FM_LLM_PROVIDER: "ollama" (default) or "deepseek"
+    llm_provider: str = field(
+        default_factory=lambda: os.getenv("FM_LLM_PROVIDER", "deepseek")
+    )
     llm_model: str = field(
         default_factory=lambda: os.getenv(
             "LLM_MODEL_FINANCIAL_MODELING",
-            os.getenv("LLM_MODEL_FINANCIAL_MODELLING", "deepseek-r1:8b"),
+            os.getenv("LLM_MODEL_FINANCIAL_MODELLING", "deepseek-reasoner"),
         )
     )
     llm_temperature: float = field(
@@ -59,10 +67,12 @@ class FinancialModellingConfig:
         default_factory=lambda: int(os.getenv("FM_LLM_MAX_TOKENS", "4096"))
     )
     # Determine Ollama URL based on environment
-    _in_docker = Path("/.dockerenv").exists()
-    _default_ollama = "http://host.docker.internal:11434" if _in_docker else "http://localhost:11434"
     ollama_base_url: str = field(
-        default_factory=lambda: os.getenv("OLLAMA_BASE_URL", _default_ollama)
+        default_factory=lambda: os.getenv("OLLAMA_BASE_URL", _get_default_ollama())
+    )
+    # DeepSeek API configuration
+    deepseek_api_key: str = field(
+        default_factory=lambda: os.getenv("DEEPSEEK_API_KEY", "")
     )
     # No hard cap by default — quality over speed.
     # Set FM_REQUEST_TIMEOUT=<seconds> env var to add a cap if needed.

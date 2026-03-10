@@ -384,12 +384,16 @@ def compute_beneish_m_score(
 def compute_key_metrics_quality(
     bundle: FinancialsBundle,
 ) -> Dict[str, Optional[float]]:
-    """Compute gross_margin, ebit_margin, fcf_conversion, dso, current_ratio, debt_to_equity."""
-    inc = bundle.income
-    bal = bundle.balance
-    cf = bundle.cashflow
-    km_ttm = bundle.key_metrics_ttm
-    rt = bundle.ratios_ttm
+    """Compute gross_margin, ebit_margin, fcf_conversion, dso, current_ratio, debt_to_equity.
+
+    Sources (in priority order):
+      1. key_metrics_ttm / ratios_ttm (EODHD PascalCase fields)
+      2. valuation_metrics table (profit_margin, operating_margin as fallback)
+    current_ratio and debt_to_equity are not in any allowed source — remain null.
+    """
+    km_ttm = bundle.key_metrics_ttm or {}
+    rt = bundle.ratios_ttm or {}
+    vm = bundle.valuation_metrics or {}
 
     def _g(d, *keys):
         for k in keys:
@@ -398,60 +402,42 @@ def compute_key_metrics_quality(
                 return v
         return None
 
-    # Gross margin
-    gm = _g(rt, "grossProfitMarginTTM") or _g(km_ttm, "grossProfitMarginTTM")
+    # Gross margin — derive from GrossProfitTTM / RevenueTTM (key_metrics_ttm)
+    gm = _g(rt, "grossProfitMarginTTM", "GrossProfitMarginTTM")
     if gm is None:
-        gp = _g(inc, "grossProfit")
-        rev = _g(inc, "revenue")
+        gm = _g(km_ttm, "grossProfitMarginTTM", "GrossProfitMarginTTM")
+    if gm is None:
+        gp = _g(km_ttm, "GrossProfitTTM", "grossProfitTTM")
+        rev = _g(km_ttm, "RevenueTTM", "revenueTTM")
         gm = _safe_div(gp, rev)
+    # valuation_metrics doesn't have gross_margin directly
 
-    # EBIT margin
-    ebit_margin = _g(rt, "operatingProfitMarginTTM", "ebitPerRevenue")
-    if ebit_margin is None:
-        ebit = _g(inc, "operatingIncome", "ebit")
-        rev = _g(inc, "revenue")
-        ebit_margin = _safe_div(ebit, rev)
+    # EBIT margin — EODHD OperatingMarginTTM (PascalCase)
+    ebit_margin = (
+        _g(km_ttm, "OperatingMarginTTM", "operatingMarginTTM")
+        or _g(rt, "operatingProfitMarginTTM", "OperatingProfitMarginTTM")
+        or _g(vm, "operating_margin")  # valuation_metrics fallback
+    )
 
-    # FCF conversion = FCF / Net Income
-    fcf_conv = None
-    fcf = _g(cf, "freeCashFlow")
-    ni = _g(inc, "netIncome")
-    if fcf is None:
-        ocf = _g(cf, "operatingCashFlow")
-        capex = _g(cf, "capitalExpenditure")
-        if ocf is not None and capex is not None:
-            fcf = ocf - abs(capex)
-    fcf_conv = _safe_div(fcf, ni)
+    # FCF conversion — requires cash flow data; not available from allowed sources
+    fcf_conv: Optional[float] = None
 
-    # DSO = Days Sales Outstanding
-    dso = _g(km_ttm, "daysOfSalesOutstandingTTM")
-    if dso is None:
-        ar = _g(bal, "netReceivables", "accountsReceivable")
-        rev = _g(inc, "revenue")
-        if ar is not None and rev and rev > 0:
-            dso = ar / (rev / 365.0)
+    # DSO — daysOfSalesOutstandingTTM not in EODHD key_metrics_ttm payload
+    dso: Optional[float] = None
 
-    # Current ratio
-    cr = _g(rt, "currentRatioTTM") or _g(km_ttm, "currentRatioTTM")
-    if cr is None:
-        ca = _g(bal, "totalCurrentAssets")
-        cl = _g(bal, "totalCurrentLiabilities")
-        cr = _safe_div(ca, cl)
+    # Current ratio — not available in any allowed data source
+    cr: Optional[float] = None
 
-    # Debt to equity (FMP key: debtToEquityRatioTTM in ratios_ttm)
-    dte = _g(rt, "debtToEquityRatioTTM") or _g(rt, "debtEquityRatioTTM")
-    if dte is None:
-        ltd = _g(bal, "longTermDebt", "longTermDebtAndCapitalLeaseObligation")
-        eq = _g(bal, "totalStockholdersEquity", "totalShareholdersEquity")
-        dte = _safe_div(ltd, eq)
+    # Debt to equity — not available in any allowed data source
+    dte: Optional[float] = None
 
     return {
         "gross_margin": round(gm, 4) if gm is not None else None,
         "ebit_margin": round(ebit_margin, 4) if ebit_margin is not None else None,
-        "fcf_conversion": round(fcf_conv, 4) if fcf_conv is not None else None,
-        "dso_days": round(dso, 2) if dso is not None else None,
-        "current_ratio": round(cr, 4) if cr is not None else None,
-        "debt_to_equity": round(dte, 4) if dte is not None else None,
+        "fcf_conversion": fcf_conv,
+        "dso_days": dso,
+        "current_ratio": cr,
+        "debt_to_equity": dte,
     }
 
 
@@ -466,55 +452,39 @@ def compute_quality_factors(
     cf_prev: Optional[Dict] = None,
     beneish_threshold: float = -2.22,
 ) -> QualityFactors:
-    """Compute all quality factors from the FinancialsBundle.
+    """Compute quality factors from the FinancialsBundle.
 
-    inc_prev / bal_prev / cf_prev are the prior-year financials for YoY signals.
+    RESTRICTED: Uses only allowed data types (key_metrics_ttm, ratios_ttm,
+    valuation_metrics). Financial statements are excluded.
+
+    ROE is sourced from key_metrics_ttm (ReturnOnEquityTTM) or valuation_metrics.roe.
+    ROIC is not directly available — remains null.
+    Piotroski/Beneish/Altman require financial statements — remain null.
     """
-    inc = bundle.income
-    bal = bundle.balance
-    cf = bundle.cashflow
-    rt = bundle.ratios_ttm
-    km_ttm = bundle.key_metrics_ttm
+    rt = bundle.ratios_ttm or {}
+    km_ttm = bundle.key_metrics_ttm or {}
+    vm = bundle.valuation_metrics or {}
 
-    # Try pre-computed Piotroski score from FMP financial_scores
+    # ROE: EODHD payloads use PascalCase (ReturnOnEquityTTM)
+    roe_raw = (
+        km_ttm.get("ReturnOnEquityTTM") or km_ttm.get("returnOnEquityTTM")
+        or rt.get("ReturnOnEquityTTM") or rt.get("returnOnEquityTTM")
+        or km_ttm.get("roeTTM")
+        or vm.get("roe")
+    )
+    _roe = _safe_float(roe_raw)
+    roe = round(_roe, 4) if _roe is not None else None
+
+    # ROIC: not in key_metrics_ttm or valuation_metrics — remains null
+    roic: Optional[float] = None
+
+    # Piotroski and Beneish scores require financial statements - not available
     piotroski: Optional[int] = None
-    altman_z: Optional[float] = None
-    fmp_scores = bundle.scores
-    if fmp_scores:
-        pf_raw = fmp_scores.get("piotroskiScore") or fmp_scores.get("piotroski_score")
-        if pf_raw is not None:
-            try:
-                piotroski = int(float(pf_raw))
-            except (TypeError, ValueError):
-                pass
-        az_raw = fmp_scores.get("altmanZScore") or fmp_scores.get("altman_z_score")
-        if az_raw is not None:
-            try:
-                altman_z = round(float(az_raw), 4)
-            except (TypeError, ValueError):
-                pass
-    # Compute from scratch if FMP score not available
-    if piotroski is None:
-        piotroski = compute_piotroski(inc, bal, cf, inc_prev, bal_prev)
-
-    # Beneish M-Score
     beneish: Optional[float] = None
-    if fmp_scores:
-        bm_raw = fmp_scores.get("beneishMScore") or fmp_scores.get("m_score")
-        if bm_raw is not None:
-            try:
-                beneish = round(float(bm_raw), 4)
-            except (TypeError, ValueError):
-                pass
-    if beneish is None and inc_prev and bal_prev:
-        beneish = compute_beneish_m_score(inc, bal, cf, inc_prev, bal_prev)
-
+    altman_z: Optional[float] = None
     manipulation_risk: Optional[str] = None
-    if beneish is not None:
-        manipulation_risk = "HIGH" if beneish > beneish_threshold else "LOW"
 
-    roe = _compute_roe(inc, bal, rt, km_ttm)
-    roic = _compute_roic(inc, bal, cf, rt, km_ttm)
+    logger.info("[QualityFactors] roe=%.4f roic=None (not available from allowed data)", roe or 0)
 
     return QualityFactors(
         roe=roe,

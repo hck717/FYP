@@ -1,32 +1,29 @@
-"""Technical Analysis engine.
+"""Technical Analysis engine — price-based indicators from allowed EOD/weekly data.
 
-Computes all technical indicators from split-adjusted EOD price history.
-All calculations are deterministic Python — no external TA library required,
-no LLM involvement.
+Allowed data sources (per data boundary enforcement):
+  - historical_prices_eod  (~2 years max, daily)
+  - historical_prices_weekly (~2 years max, weekly)
 
-Indicators implemented:
-  Trend:       SMA 20, SMA 50, SMA 200, EMA 12, EMA 26
-               Golden Cross (SMA50 > SMA200), Death Cross (SMA50 < SMA200)
-  Momentum:    RSI(14), MACD + Signal + Histogram, Stochastic %K/%D
-  Volatility:  Bollinger Bands (20-period, 2σ), ATR(14), HV30 (annualised)
-  Range:       52-week high/low, support (20-day low), resistance (20-day high)
-  Trend label: "bullish" / "bearish" / "neutral"
+Computes:
+  - Beta (vs S&P 500 benchmark — input to WACC)
+  - Trend (based on SMA50/SMA200 relationship)
+  - RSI-14, MACD (12/26/9), Bollinger Bands (20,2), ATR-14, HV-30
+  - SMA 20/50/200, EMA 12/26
+  - Stochastic %K/%D (14,3)
+  - Support/Resistance (52-week levels)
+  - Golden cross / Death cross flags
 """
 
 from __future__ import annotations
 
 import logging
 import math
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from ..schema import FMDataBundle, TechnicalSnapshot
 
 logger = logging.getLogger(__name__)
 
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
 def _safe_float(val: Any) -> Optional[float]:
     if val is None:
@@ -40,7 +37,7 @@ def _safe_float(val: Any) -> Optional[float]:
 def _extract_closes(price_history: List[Dict[str, Any]]) -> List[float]:
     """Extract adjusted close prices (chronological, oldest first)."""
     closes: List[float] = []
-    for row in reversed(price_history):   # price_history is newest-first from DB
+    for row in reversed(price_history):
         c = _safe_float(
             row.get("adjClose") or row.get("adjusted_close")
             or row.get("close") or row.get("Close")
@@ -50,28 +47,28 @@ def _extract_closes(price_history: List[Dict[str, Any]]) -> List[float]:
     return closes
 
 
-def _extract_ohlcv(
-    price_history: List[Dict[str, Any]]
-) -> Tuple[List[float], List[float], List[float], List[float]]:
-    """Return (opens, highs, lows, closes) in chronological order."""
-    opens, highs, lows, closes = [], [], [], []
+def _extract_high_low(price_history: List[Dict[str, Any]]) -> tuple[List[float], List[float]]:
+    """Extract high and low prices (chronological, oldest first)."""
+    highs: List[float] = []
+    lows: List[float] = []
     for row in reversed(price_history):
-        o = _safe_float(row.get("open") or row.get("Open"))
         h = _safe_float(row.get("high") or row.get("High"))
         l = _safe_float(row.get("low") or row.get("Low"))
-        c = _safe_float(row.get("adjClose") or row.get("adjusted_close")
-                        or row.get("close") or row.get("Close"))
-        if h is not None and l is not None and c is not None:
-            opens.append(o or c)
+        c = _safe_float(
+            row.get("adjClose") or row.get("adjusted_close")
+            or row.get("close") or row.get("Close")
+        )
+        # Use close as fallback for high/low if missing
+        if h is not None and l is not None:
             highs.append(h)
             lows.append(l)
-            closes.append(c)
-    return opens, highs, lows, closes
+        elif c is not None:
+            highs.append(c)
+            lows.append(c)
+    return highs, lows
 
 
-# ---------------------------------------------------------------------------
-# Core indicator functions (pure Python, no pandas/numpy required)
-# ---------------------------------------------------------------------------
+# ── Indicator helpers ────────────────────────────────────────────────────────
 
 def _sma(series: List[float], period: int) -> Optional[float]:
     if len(series) < period:
@@ -79,92 +76,80 @@ def _sma(series: List[float], period: int) -> Optional[float]:
     return round(sum(series[-period:]) / period, 4)
 
 
-def _ema(series: List[float], period: int) -> Optional[float]:
-    """Compute EMA using standard multiplier. Returns last EMA value."""
-    if len(series) < period:
-        return None
-    k = 2.0 / (period + 1)
-    ema = sum(series[:period]) / period
-    for price in series[period:]:
-        ema = price * k + ema * (1 - k)
-    return round(ema, 4)
-
-
-def _ema_series(series: List[float], period: int) -> List[float]:
-    """Return full EMA series (same length as input after warm-up)."""
+def _ema(series: List[float], period: int) -> List[float]:
+    """Return full EMA series (same length as input starting from period-1)."""
     if len(series) < period:
         return []
-    k = 2.0 / (period + 1)
-    ema = sum(series[:period]) / period
-    result = [ema]
+    k = 2 / (period + 1)
+    ema_val = sum(series[:period]) / period
+    result = [ema_val]
     for price in series[period:]:
-        ema = price * k + ema * (1 - k)
-        result.append(ema)
+        ema_val = price * k + ema_val * (1 - k)
+        result.append(ema_val)
     return result
 
 
 def _rsi(closes: List[float], period: int = 14) -> Optional[float]:
-    """Wilder-smoothed RSI."""
     if len(closes) < period + 1:
         return None
     deltas = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
-    gains = [max(d, 0.0) for d in deltas]
-    losses = [abs(min(d, 0.0)) for d in deltas]
+    gains = [d if d > 0 else 0.0 for d in deltas]
+    losses = [-d if d < 0 else 0.0 for d in deltas]
 
+    # Initial averages
     avg_gain = sum(gains[:period]) / period
     avg_loss = sum(losses[:period]) / period
 
-    for i in range(period, len(gains)):
-        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
-        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+    for g, l in zip(gains[period:], losses[period:]):
+        avg_gain = (avg_gain * (period - 1) + g) / period
+        avg_loss = (avg_loss * (period - 1) + l) / period
 
     if avg_loss == 0:
         return 100.0
     rs = avg_gain / avg_loss
-    return round(100.0 - 100.0 / (1.0 + rs), 2)
+    return round(100 - 100 / (1 + rs), 2)
 
 
-def _macd(closes: List[float]) -> Tuple[Optional[float], Optional[float], Optional[float]]:
-    """MACD(12,26,9). Returns (macd_value, signal_value, histogram)."""
-    ema12 = _ema_series(closes, 12)
-    ema26 = _ema_series(closes, 26)
+def _macd(closes: List[float]) -> tuple[Optional[float], Optional[float], Optional[float]]:
+    """Return (macd_line, signal_line, histogram)."""
+    ema12 = _ema(closes, 12)
+    ema26 = _ema(closes, 26)
     if not ema12 or not ema26:
         return None, None, None
-
-    # Align: ema26 is shorter
-    offset = len(ema12) - len(ema26)
-    macd_line = [ema12[offset + i] - ema26[i] for i in range(len(ema26))]
-    if len(macd_line) < 9:
+    # Align: ema26 starts 26 periods in, ema12 starts 12 periods in
+    # Difference series starts where both are valid
+    offset = 26 - 12  # ema26 is shorter by 14 values
+    if len(ema12) <= offset:
         return None, None, None
-
-    signal_series = _ema_series(macd_line, 9)
+    macd_series = [ema12[offset + i] - ema26[i] for i in range(len(ema26))]
+    signal_series = _ema(macd_series, 9)
     if not signal_series:
         return None, None, None
+    macd_val = round(macd_series[-1], 4)
+    signal_val = round(signal_series[-1], 4)
+    hist_val = round(macd_val - signal_val, 4)
+    return macd_val, signal_val, hist_val
 
-    macd_val = macd_line[-1]
-    signal_val = signal_series[-1]
-    histogram = macd_val - signal_val
-    return round(macd_val, 4), round(signal_val, 4), round(histogram, 4)
 
-
-def _bollinger(closes: List[float], period: int = 20, std_mult: float = 2.0
-               ) -> Tuple[Optional[float], Optional[float], Optional[float]]:
-    """Returns (upper, middle/SMA, lower) Bollinger Bands."""
+def _bollinger(closes: List[float], period: int = 20, num_std: float = 2.0) -> tuple[Optional[float], Optional[float], Optional[float]]:
+    """Return (upper, lower, position_0_to_1)."""
     if len(closes) < period:
         return None, None, None
     window = closes[-period:]
     mid = sum(window) / period
     variance = sum((x - mid) ** 2 for x in window) / period
     std = math.sqrt(variance)
-    upper = mid + std_mult * std
-    lower = mid - std_mult * std
-    return round(upper, 4), round(mid, 4), round(lower, 4)
+    upper = round(mid + num_std * std, 4)
+    lower = round(mid - num_std * std, 4)
+    current = closes[-1]
+    band_width = upper - lower
+    position = round((current - lower) / band_width, 4) if band_width > 0 else None
+    return upper, lower, position
 
 
-def _atr(highs: List[float], lows: List[float], closes: List[float],
-         period: int = 14) -> Optional[float]:
-    """Average True Range (Wilder smoothing)."""
-    if len(closes) < period + 1:
+def _atr(highs: List[float], lows: List[float], closes: List[float], period: int = 14) -> Optional[float]:
+    """Average True Range."""
+    if len(highs) < period + 1 or len(lows) < period + 1 or len(closes) < period + 1:
         return None
     trs = []
     for i in range(1, len(closes)):
@@ -176,56 +161,94 @@ def _atr(highs: List[float], lows: List[float], closes: List[float],
         trs.append(tr)
     if len(trs) < period:
         return None
-    atr = sum(trs[:period]) / period
-    for tr in trs[period:]:
-        atr = (atr * (period - 1) + tr) / period
-    return round(atr, 4)
+    return round(sum(trs[-period:]) / period, 4)
 
 
-def _historical_volatility(closes: List[float], period: int = 30) -> Optional[float]:
-    """Annualised historical volatility from log returns over `period` days."""
-    if len(closes) < period + 1:
+def _hv30(closes: List[float]) -> Optional[float]:
+    """30-day Historical Volatility (annualised)."""
+    if len(closes) < 31:
         return None
-    window = closes[-(period + 1):]
-    log_returns = [math.log(window[i] / window[i - 1]) for i in range(1, len(window))]
-    mean = sum(log_returns) / len(log_returns)
-    variance = sum((r - mean) ** 2 for r in log_returns) / len(log_returns)
-    daily_vol = math.sqrt(variance)
-    annual_vol = daily_vol * math.sqrt(252)
-    return round(annual_vol, 4)
+    log_rets = [math.log(closes[i] / closes[i - 1]) for i in range(len(closes) - 30, len(closes))]
+    mean = sum(log_rets) / len(log_rets)
+    variance = sum((r - mean) ** 2 for r in log_rets) / len(log_rets)
+    return round(math.sqrt(variance * 252), 4)
 
 
 def _stochastic(
     highs: List[float], lows: List[float], closes: List[float],
     k_period: int = 14, d_period: int = 3,
-) -> Tuple[Optional[float], Optional[float]]:
-    """Stochastic Oscillator %K and %D."""
+) -> tuple[Optional[float], Optional[float]]:
+    """Stochastic oscillator %K and %D."""
     if len(closes) < k_period:
         return None, None
     k_values = []
     for i in range(k_period - 1, len(closes)):
-        h = max(highs[i - k_period + 1: i + 1])
-        l = min(lows[i - k_period + 1: i + 1])
-        if h == l:
+        window_h = max(highs[i - k_period + 1: i + 1])
+        window_l = min(lows[i - k_period + 1: i + 1])
+        denom = window_h - window_l
+        if denom == 0:
             k_values.append(50.0)
         else:
-            k_values.append((closes[i] - l) / (h - l) * 100)
+            k_values.append(100 * (closes[i] - window_l) / denom)
     if not k_values:
         return None, None
     k = round(k_values[-1], 2)
     if len(k_values) >= d_period:
         d = round(sum(k_values[-d_period:]) / d_period, 2)
     else:
-        d = k
+        d = None
     return k, d
 
 
-# ---------------------------------------------------------------------------
-# Technical Engine
-# ---------------------------------------------------------------------------
+def compute_beta(
+    price_history: List[Dict[str, Any]],
+    benchmark_history: List[Dict[str, Any]],
+    lookback_weeks: int = 104,
+) -> Optional[float]:
+    """Compute rolling beta of ticker vs. S&P 500 using weekly returns.
+
+    Uses up to `lookback_weeks` weekly data points (2-year = 104 weeks).
+    """
+    asset_closes_raw = _extract_closes(price_history)
+    bench_closes_raw = _extract_closes(benchmark_history)
+
+    if len(asset_closes_raw) > lookback_weeks * 2:
+        asset_closes_raw = asset_closes_raw[::-1][::5][::-1]
+    if len(bench_closes_raw) > lookback_weeks * 2:
+        bench_closes_raw = bench_closes_raw[::-1][::5][::-1]
+
+    asset_closes = asset_closes_raw[-(lookback_weeks + 1):]
+    bench_closes = bench_closes_raw[-(lookback_weeks + 1):]
+
+    n = min(len(asset_closes), len(bench_closes)) - 1
+    if n < 10:
+        logger.debug("compute_beta: insufficient benchmark data (n=%d)", n)
+        return None
+
+    asset_ret = [
+        (asset_closes[-(i + 1)] - asset_closes[-(i + 2)]) / asset_closes[-(i + 2)]
+        for i in range(n)
+    ]
+    bench_ret = [
+        (bench_closes[-(i + 1)] - bench_closes[-(i + 2)]) / bench_closes[-(i + 2)]
+        for i in range(n)
+    ]
+
+    mean_a = sum(asset_ret) / n
+    mean_b = sum(bench_ret) / n
+    cov = sum((a - mean_a) * (b - mean_b) for a, b in zip(asset_ret, bench_ret)) / n
+    var_b = sum((b - mean_b) ** 2 for b in bench_ret) / n
+
+    if var_b == 0:
+        return None
+    return round(cov / var_b, 4)
+
 
 class TechnicalEngine:
-    """Computes all technical indicators for a given FMDataBundle."""
+    """Computes technical indicators from allowed EOD/weekly price data.
+
+    Allowed data: historical_prices_eod, historical_prices_weekly (~2 years max).
+    """
 
     def compute(self, bundle: FMDataBundle) -> TechnicalSnapshot:
         snap = TechnicalSnapshot()
@@ -234,146 +257,113 @@ class TechnicalEngine:
             logger.warning("TechnicalEngine: no price history for %s", bundle.ticker)
             return snap
 
-        opens, highs, lows, closes = _extract_ohlcv(bundle.price_history)
-        if len(closes) < 20:
-            logger.warning(
-                "TechnicalEngine: only %d price points for %s — many indicators skipped",
-                len(closes), bundle.ticker,
-            )
+        closes = _extract_closes(bundle.price_history)
+        highs, lows = _extract_high_low(bundle.price_history)
+
+        if len(closes) < 2:
             return snap
 
-        current_price = closes[-1]
+        # ── Beta (vs benchmark) ──────────────────────────────────────────────
+        if bundle.benchmark_history:
+            snap.beta = compute_beta(
+                bundle.price_history,
+                bundle.benchmark_history,
+                lookback_weeks=104,
+            )
 
-        # ── SMAs ──────────────────────────────────────────────────────────────
+        # ── Moving averages ──────────────────────────────────────────────────
         snap.sma_20 = _sma(closes, 20)
         snap.sma_50 = _sma(closes, 50)
         snap.sma_200 = _sma(closes, 200)
 
-        # ── EMAs ──────────────────────────────────────────────────────────────
-        snap.ema_12 = _ema(closes, 12)
-        snap.ema_26 = _ema(closes, 26)
+        ema12_series = _ema(closes, 12)
+        ema26_series = _ema(closes, 26)
+        snap.ema_12 = round(ema12_series[-1], 4) if ema12_series else None
+        snap.ema_26 = round(ema26_series[-1], 4) if ema26_series else None
 
-        # ── Golden / Death Cross ──────────────────────────────────────────────
-        if snap.sma_50 is not None and snap.sma_200 is not None:
+        # ── Trend ────────────────────────────────────────────────────────────
+        if snap.sma_50 and snap.sma_200:
             snap.sma_50_above_200 = snap.sma_50 > snap.sma_200
-            # Detect cross: compare current vs. previous period
-            if len(closes) >= 201:
-                prev_sma50 = _sma(closes[:-1], 50)
-                prev_sma200 = _sma(closes[:-1], 200)
-                if prev_sma50 is not None and prev_sma200 is not None:
-                    was_below = prev_sma50 <= prev_sma200
-                    now_above = snap.sma_50 > snap.sma_200
-                    snap.golden_cross = was_below and now_above
-                    snap.death_cross = (not was_below) and (not now_above)
-                else:
-                    snap.golden_cross = False
-                    snap.death_cross = False
-            else:
-                snap.golden_cross = False
-                snap.death_cross = False
+            current = closes[-1]
+            prev_sma50 = _sma(closes[:-1], 50) if len(closes) > 50 else None
+            prev_sma200 = _sma(closes[:-1], 200) if len(closes) > 200 else None
 
-        # ── RSI ───────────────────────────────────────────────────────────────
+            # Golden/Death cross detection (today vs yesterday)
+            if prev_sma50 is not None and prev_sma200 is not None:
+                was_below = prev_sma50 <= prev_sma200
+                is_above = snap.sma_50 > snap.sma_200
+                snap.golden_cross = was_below and is_above
+                snap.death_cross = (not was_below) and (not is_above)
+
+            if snap.sma_50_above_200 and current > snap.sma_50:
+                snap.trend = "bullish"
+            elif not snap.sma_50_above_200 and current < snap.sma_50:
+                snap.trend = "bearish"
+            else:
+                snap.trend = "neutral"
+        elif snap.sma_50:
+            snap.trend = "bullish" if closes[-1] > snap.sma_50 else "bearish"
+
+        # ── RSI ──────────────────────────────────────────────────────────────
         snap.rsi_14 = _rsi(closes, 14)
 
-        # ── MACD ──────────────────────────────────────────────────────────────
-        macd_val, signal_val, histogram = _macd(closes)
-        snap.macd_histogram = histogram
-        if macd_val is not None and signal_val is not None:
-            if histogram is not None and histogram > 0:
+        # ── MACD ─────────────────────────────────────────────────────────────
+        macd_val, macd_sig_val, macd_hist_val = _macd(closes)
+        snap.macd = macd_val                    # sets macd_histogram via property
+        snap.macd_signal_line = macd_sig_val    # float signal line value
+        # Derive direction string from histogram
+        if macd_hist_val is not None:
+            if macd_hist_val > 0:
                 snap.macd_signal = "buy"
-            elif histogram is not None and histogram < 0:
+            elif macd_hist_val < 0:
                 snap.macd_signal = "sell"
             else:
                 snap.macd_signal = "neutral"
-        else:
-            snap.macd_signal = None
 
-        # ── Bollinger Bands ───────────────────────────────────────────────────
-        upper, mid_bb, lower = _bollinger(closes, 20, 2.0)
-        snap.bollinger_upper = upper
-        snap.bollinger_lower = lower
-        if upper is not None and lower is not None and mid_bb is not None:
-            if current_price > upper:
+        # ── Bollinger Bands ──────────────────────────────────────────────────
+        bb_upper, bb_lower, bb_pos_float = _bollinger(closes)
+        snap.bollinger_upper = bb_upper
+        snap.bollinger_lower = bb_lower
+        if bb_pos_float is not None:
+            if bb_pos_float > 1.0:
                 snap.bollinger_position = "above_upper"
-            elif current_price >= mid_bb:
+            elif bb_pos_float >= 0.7:
                 snap.bollinger_position = "upper"
-            elif current_price >= lower:
+            elif bb_pos_float >= 0.3:
+                snap.bollinger_position = "mid"
+            elif bb_pos_float >= 0.0:
                 snap.bollinger_position = "lower"
             else:
                 snap.bollinger_position = "below_lower"
-            # Refine: "mid" if within 10% of mid
-            band_width = upper - lower
-            if band_width > 0 and abs(current_price - mid_bb) / band_width < 0.1:
-                snap.bollinger_position = "mid"
 
-        # ── ATR ───────────────────────────────────────────────────────────────
-        snap.atr_14 = _atr(highs, lows, closes, 14)
+        # ── ATR ──────────────────────────────────────────────────────────────
+        if highs and lows and len(highs) == len(lows) == len(closes):
+            snap.atr_14 = _atr(highs, lows, closes, 14)
 
-        # ── Historical Volatility (30-day annualised) ─────────────────────────
-        snap.hv_30 = _historical_volatility(closes, 30)
+        # ── Historical Volatility 30 ─────────────────────────────────────────
+        snap.hv_30 = _hv30(closes)
 
-        # ── Stochastic ────────────────────────────────────────────────────────
-        snap.stochastic_k, snap.stochastic_d = _stochastic(highs, lows, closes)
+        # ── Stochastic ───────────────────────────────────────────────────────
+        if highs and lows and len(highs) == len(lows) == len(closes):
+            snap.stochastic_k, snap.stochastic_d = _stochastic(highs, lows, closes)
 
-        # ── 52-week high / low ────────────────────────────────────────────────
-        year_closes = closes[-252:] if len(closes) >= 252 else closes
-        year_highs = highs[-252:] if len(highs) >= 252 else highs
-        year_lows = lows[-252:] if len(lows) >= 252 else lows
-        snap.high_52w = round(max(year_highs), 4) if year_highs else None
-        snap.low_52w = round(min(year_lows), 4) if year_lows else None
+        # ── 52-week Support / Resistance ─────────────────────────────────────
+        # Use up to 252 daily or 52 weekly data points
+        lookback = min(252, len(closes))
+        if lookback >= 20:
+            window_closes = closes[-lookback:]
+            window_highs = highs[-lookback:] if highs else window_closes
+            window_lows = lows[-lookback:] if lows else window_closes
+            snap.support = round(min(window_lows), 4)
+            snap.resistance = round(max(window_highs), 4)
+            snap.high_52w = snap.resistance
+            snap.low_52w = snap.support
 
-        # ── Support / Resistance (20-day rolling) ────────────────────────────
-        recent_n = 20
-        if len(lows) >= recent_n:
-            snap.support = round(min(lows[-recent_n:]), 4)
-        if len(highs) >= recent_n:
-            snap.resistance = round(max(highs[-recent_n:]), 4)
-
-        # ── Trend label ───────────────────────────────────────────────────────
-        snap.trend = self._classify_trend(snap, current_price)
-
+        logger.debug(
+            "TechnicalEngine: %s trend=%s rsi=%.1f beta=%s macd=%s",
+            bundle.ticker, snap.trend, snap.rsi_14 or 0, snap.beta, snap.macd,
+        )
         return snap
 
-    @staticmethod
-    def _classify_trend(snap: TechnicalSnapshot, price: float) -> str:
-        """Classify overall trend from SMA position and RSI."""
-        bullish_signals = 0
-        bearish_signals = 0
 
-        # Price above/below SMAs
-        if snap.sma_50 is not None:
-            if price > snap.sma_50:
-                bullish_signals += 1
-            else:
-                bearish_signals += 1
-        if snap.sma_200 is not None:
-            if price > snap.sma_200:
-                bullish_signals += 1
-            else:
-                bearish_signals += 1
-        if snap.sma_50_above_200 is True:
-            bullish_signals += 1
-        elif snap.sma_50_above_200 is False:
-            bearish_signals += 1
-
-        # RSI
-        if snap.rsi_14 is not None:
-            if snap.rsi_14 > 55:
-                bullish_signals += 1
-            elif snap.rsi_14 < 45:
-                bearish_signals += 1
-
-        # MACD
-        if snap.macd_signal == "buy":
-            bullish_signals += 1
-        elif snap.macd_signal == "sell":
-            bearish_signals += 1
-
-        if bullish_signals > bearish_signals + 1:
-            return "BULLISH"
-        elif bearish_signals > bullish_signals + 1:
-            return "BEARISH"
-        return "NEUTRAL"
-
-
-__all__ = ["TechnicalEngine"]
+__all__ = ["TechnicalEngine", "compute_beta"]

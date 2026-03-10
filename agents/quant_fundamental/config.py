@@ -20,6 +20,11 @@ def _env(key: str, default: Optional[str] = None) -> str:
     return value
 
 
+# Determine Ollama URL based on environment (for backwards compatibility)
+_in_docker = Path("/.dockerenv").exists()
+_default_ollama = "http://host.docker.internal:11434" if _in_docker else "http://localhost:11434"
+
+
 @dataclass(slots=True)
 class QuantFundamentalConfig:
     """Runtime configuration container for the Quantitative Fundamental agent."""
@@ -31,15 +36,12 @@ class QuantFundamentalConfig:
     postgres_user: str = field(default_factory=lambda: _env("POSTGRES_USER", "airflow"))
     postgres_password: str = field(default_factory=lambda: _env("POSTGRES_PASSWORD", "airflow"))
 
-    # LLM — used ONLY for quantitative_summary narrative.
-    # Use deepseek-r1:8b (same as BA and Summarizer) so Ollama never has to swap
-    # models mid-pipeline.  A single model stays resident in GPU/ANE memory across
-    # BA → QF → FM → Summarizer, eliminating the ~30-60s reload penalty per swap.
+    # LLM — DeepSeek API (replaces Ollama)
+    # DeepSeek API key - uses DEEPSEEK_API_KEY env var
+    deepseek_api_key: str = field(default_factory=lambda: os.getenv("DEEPSEEK_API_KEY", ""))
+    deepseek_base_url: str = field(default_factory=lambda: os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com"))
     llm_model: str = field(
-        default_factory=lambda: os.getenv(
-            "LLM_MODEL_QUANTITATIVE",
-            os.getenv("BUSINESS_ANALYST_MODEL", "deepseek-r1:8b"),
-        )
+        default_factory=lambda: os.getenv("LLM_MODEL_QUANT_FUNDAMENTAL", "deepseek-chat")
     )
     llm_temperature: float = field(
         default_factory=lambda: float(os.getenv("QUANT_LLM_TEMPERATURE", "0.1"))
@@ -47,9 +49,7 @@ class QuantFundamentalConfig:
     llm_max_tokens: int = field(
         default_factory=lambda: int(os.getenv("QUANT_LLM_MAX_TOKENS", "4096"))
     )
-    # Determine Ollama URL based on environment
-    _in_docker = Path("/.dockerenv").exists()
-    _default_ollama = "http://host.docker.internal:11434" if _in_docker else "http://localhost:11434"
+    # Legacy Ollama config (kept for backwards compatibility but not used)
     ollama_base_url: str = field(
         default_factory=lambda: os.getenv("OLLAMA_BASE_URL", _default_ollama)
     )
@@ -57,9 +57,9 @@ class QuantFundamentalConfig:
     # Set QUANT_REQUEST_TIMEOUT=<seconds> env var to add a cap if needed.
     request_timeout: Optional[int] = field(
         default_factory=lambda: (
-            int(os.getenv("QUANT_REQUEST_TIMEOUT"))  # type: ignore[arg-type]
+            int(os.getenv("QUANT_REQUEST_TIMEOUT") or "120")
             if os.getenv("QUANT_REQUEST_TIMEOUT", "").strip()
-            else None
+            else 120
         )
     )
 

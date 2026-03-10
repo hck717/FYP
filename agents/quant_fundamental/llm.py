@@ -1,24 +1,13 @@
 """LLM client for the Quantitative Fundamental agent.
 
-The LLM is used ONLY to produce the `quantitative_summary` narrative field.
-All numeric fields in the output are computed deterministically in Python from PostgreSQL.
-
-The prompt targets plain-text output — no JSON wrapping. This avoids the fragile
-JSON extraction path and produces more natural, readable narratives.
-
-deepseek-r1 / Ollama notes
---------------------------
-- Ollama >= 0.6.0 supports `"think": false` in the API payload to suppress the
-  chain-of-thought reasoning block. We always send this flag.
-- As a belt-and-suspenders measure, _clean_response() also strips any residual
-  <think>...</think> tags from the response text.
-- `request_timeout` defaults to None (no timeout) — let Ollama run to completion.
+Uses DeepSeek API (OpenAI-compatible) for generating quantitative summaries.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 from typing import Any, Dict
 
@@ -29,9 +18,12 @@ from .prompts import build_system_prompt
 
 logger = logging.getLogger(__name__)
 
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
+DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+
 
 def _strip_think_tags(text: str) -> str:
-    """Remove <think>...</think> reasoning blocks (deepseek-r1 / ollama)."""
+    """Remove <think>...</think> reasoning blocks (deepseek-reasoner)."""
     return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
 
 
@@ -46,11 +38,9 @@ def _clean_response(text: str) -> str:
     """Clean raw LLM response to a plain narrative string."""
     cleaned = _strip_think_tags(text)
     cleaned = _strip_markdown_fences(cleaned)
-    # If the LLM returns JSON despite instructions, extract the summary value
     if cleaned.strip().startswith("{"):
         try:
             obj = json.loads(cleaned)
-            # Try common summary keys
             for key in ("quantitative_summary", "summary", "narrative", "analysis"):
                 val = obj.get(key, "")
                 if val and isinstance(val, str) and len(val) > 20:
@@ -61,10 +51,12 @@ def _clean_response(text: str) -> str:
 
 
 class QuantLLMClient:
-    """Calls Ollama to produce the quantitative_summary narrative."""
+    """Calls DeepSeek API to produce the quantitative_summary narrative."""
 
     def __init__(self, config: QuantFundamentalConfig) -> None:
         self.config = config
+        self.api_key = DEEPSEEK_API_KEY or os.getenv("DEEPSEEK_API_KEY", "")
+        self.base_url = DEEPSEEK_BASE_URL
 
     def generate_summary(
         self,
@@ -83,23 +75,33 @@ class QuantLLMClient:
         Returns:
             A 3-5 sentence narrative string, or a fallback message on LLM failure.
         """
+        if not self.api_key:
+            logger.warning("DeepSeek API key not set — skipping LLM summary")
+            return "Quantitative summary unavailable (API key not configured)."
+
         prompt = self._build_prompt(factor_table, from_planner=from_planner)
-        payload = {
-            "model": self.config.llm_model,
-            "prompt": prompt,
-            "temperature": self.config.llm_temperature,
-            "num_predict": self.config.llm_max_tokens,
-            "stream": False,
-            "think": False,  # Suppress <think> chain-of-thought (deepseek-r1 / Ollama)
-        }
+
         try:
             resp = requests.post(
-                f"{self.config.ollama_base_url}/api/generate",
-                json=payload,
-                timeout=self.config.request_timeout,
+                f"{self.base_url}/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": self.config.llm_model,
+                    "messages": [
+                        {"role": "system", "content": prompt},
+                        {"role": "user", "content": "Write the quantitative narrative based on the factor table."},
+                    ],
+                    "temperature": self.config.llm_temperature,
+                    "max_tokens": self.config.llm_max_tokens,
+                },
+                timeout=self.config.request_timeout or 120,
             )
             resp.raise_for_status()
-            content = resp.json().get("response", "")
+            data = resp.json()
+            content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
             if not content.strip():
                 return "Quantitative summary unavailable (LLM returned empty response)."
             cleaned = _clean_response(content)
@@ -107,8 +109,8 @@ class QuantLLMClient:
                 return cleaned
             return "Quantitative summary unavailable (LLM returned unusable content)."
         except requests.exceptions.ConnectionError:
-            logger.warning("Ollama not reachable — skipping LLM summary")
-            return "Quantitative summary unavailable (LLM offline)."
+            logger.warning("DeepSeek API not reachable — skipping LLM summary")
+            return "Quantitative summary unavailable (API offline)."
         except Exception as exc:
             logger.warning("LLM summary generation failed: %s", exc)
             return f"Quantitative summary unavailable ({type(exc).__name__})."
@@ -121,7 +123,6 @@ class QuantLLMClient:
     ) -> str:
         """Build the prompt: system instructions + factor table."""
         system = build_system_prompt(from_planner=from_planner)
-        # Format the factor table as readable key=value lines to reduce token count
         lines = []
         for section, val in factor_table.items():
             if isinstance(val, dict):

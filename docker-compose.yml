@@ -45,9 +45,10 @@ x-airflow-common:
     FMP_API_KEY: 6kqjitcYPxyr60Xy1Jfem92Q1z9LfCHM
     EODHD_API_KEY: 6957671cac2858.27368157
 
-    # DeepSeek API — used by the Business Analyst agent (replaces Ollama for generation)
-    DEEPSEEK_API_KEY: 
+    # DeepSeek API — used by the Business Analyst and Financial Modelling agents
+    DEEPSEEK_API_KEY: sk-9fe1b0635ca341f3bccbe222132e3461
     BUSINESS_ANALYST_LLM_PROVIDER: deepseek
+    FM_LLM_PROVIDER: deepseek
 
     # Ollama – still used for embeddings (nomic-embed-text)
     OLLAMA_BASE_URL: http://ollama:11434
@@ -58,7 +59,7 @@ x-airflow-common:
     # Override with EMBEDDING_MODEL env var if you pull a different version.
     LLM_MODEL_BUSINESS_ANALYST: deepseek-reasoner
     LLM_MODEL_QUANTITATIVE: llama3.2:3b
-    LLM_MODEL_FINANCIAL_MODELING: llama3.2:3b
+    LLM_MODEL_FINANCIAL_MODELING: deepseek-reasoner
     EMBEDDING_MODEL: nomic-embed-text:v1.5
     EMBEDDING_MODEL_VERSION: "1.0"
     EMBEDDING_DIMENSION: 768

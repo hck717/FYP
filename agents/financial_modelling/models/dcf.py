@@ -436,11 +436,19 @@ def _compute_wacc(
 
     market_cap = _safe_float(
         bundle.enterprise.get("marketCapitalization")
+        or bundle.enterprise.get("MarketCapitalization")
         or bundle.key_metrics_ttm.get("marketCap")
         or bundle.key_metrics_ttm.get("marketCapTTM")
+        or bundle.key_metrics_ttm.get("MarketCapitalization")      # EODHD
     )
+    # EODHD may store market cap in millions
+    if market_cap is None:
+        mln = _safe_float(bundle.key_metrics_ttm.get("MarketCapitalizationMln"))
+        if mln is not None and mln > 0:
+            market_cap = mln * 1_000_000
     total_debt = _safe_float(
         bal.get("totalDebt") or bal.get("longTermDebt")
+        or bal.get("shortLongTermDebtTotal")                       # EODHD: total debt
         or bal.get("longTermDebtAndCapitalLeaseObligation"), 0.0
     )
 
@@ -593,19 +601,37 @@ def _equity_value_from_pv(
 
 
 def _shares_outstanding(bundle: FMDataBundle) -> Optional[float]:
-    """Return diluted shares outstanding."""
+    """Return diluted shares outstanding.
+
+    Tries FMP field names first, then EODHD field names, then derives from
+    market cap / price as a last resort.
+    """
     for d in [bundle.income, bundle.key_metrics, bundle.key_metrics_ttm, bundle.enterprise]:
-        for key in ("weightedAverageSharesDiluted", "sharesOutstanding", "weightedAverageShsOutDil"):
+        for key in (
+            # FMP field names
+            "weightedAverageSharesDiluted", "sharesOutstanding", "weightedAverageShsOutDil",
+            # EODHD field names
+            "SharesOutstanding", "CommonStockSharesOutstanding",
+        ):
             v = _safe_float(d.get(key)) if d else None
             if v is not None and v > 0:
                 return v
 
+    # Derive from market cap / price (works with both FMP and EODHD field names)
     market_cap = _safe_float(
         bundle.enterprise.get("marketCapitalization")
+        or bundle.enterprise.get("MarketCapitalization")
         or bundle.key_metrics_ttm.get("marketCap")
         or bundle.key_metrics_ttm.get("marketCapTTM")
+        or bundle.key_metrics_ttm.get("MarketCapitalization")      # EODHD
+        or bundle.key_metrics_ttm.get("MarketCapitalizationMln")   # EODHD (millions)
         or bundle.balance.get("marketCapitalization")
     )
+    # MarketCapitalizationMln is in millions — convert to full value
+    mln_raw = _safe_float(bundle.key_metrics_ttm.get("MarketCapitalizationMln"))
+    if market_cap is None and mln_raw is not None and mln_raw > 0:
+        market_cap = mln_raw * 1_000_000
+
     price = _safe_float(
         bundle.key_metrics_ttm.get("stockPriceTTM")
         or bundle.ratios_ttm.get("stockPriceTTM")
@@ -862,7 +888,9 @@ class DCFEngine:
 
         # Balance sheet inputs for net debt
         total_debt = _safe_float(
-            bundle.balance.get("totalDebt") or bundle.balance.get("longTermDebt"), 0.0
+            bundle.balance.get("totalDebt")
+            or bundle.balance.get("shortLongTermDebtTotal")    # EODHD: total debt incl. short-term
+            or bundle.balance.get("longTermDebt"), 0.0
         ) or 0.0
         cash_val = _safe_float(
             bundle.balance.get("cashAndCashEquivalents")

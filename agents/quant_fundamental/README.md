@@ -28,6 +28,30 @@ It does **NOT** use RAG, DuckDB, or cloud databases. All data comes from local D
 
 ---
 
+## Data Scope – Fundamental Math Agent Only
+
+This agent is restricted to **Fundamental Math** use-case.
+
+### Allowed Data Types (from PostgreSQL)
+- Historical Stock Prices (EOD): `historical_prices_eod`, `historical_prices_weekly`
+- Intraday / Delayed Live Quotes: `intraday_1m`, `intraday_5m`
+- Technical Indicators: `technical_beta`, `technical_volatility`, `technical_rsi`, `technical_macd`
+- Screener API (Bulk): `market_screener`
+- Basic Fundamentals: `key_metrics_ttm`, `ratios_ttm`
+- Short Interest & Shares Stats: `short_interest`, `shares_stats`
+- Earnings History & Surprises: `earnings_history`, `earnings_surprises`
+
+### Excluded Data Types (for Financial Modelling Agent)
+The following data types are **NOT** accessed by this agent:
+- Financial Statements: `income_statement`, `balance_sheet`, `cash_flow`
+- Valuation Metrics: `enterprise_values`, `financial_scores`, `valuation_metrics`
+- Shares Data: `shares_float`
+- Dividend/Capital Change: `dividends`, `splits_history`
+
+All queries are strictly validated against `ALLOWED_DATA_TYPES` in `tools.py`. Any attempt to fetch disallowed data will raise a `ValueError`.
+
+---
+
 ## Architecture: 8-Node LangGraph Pipeline (Non-RAG)
 
 This agent does **not** use RAG. All data comes from structured PostgreSQL tables. The pipeline is a deterministic OLAP computation chain — no retrieval confidence scoring, no fallback loops.
@@ -405,4 +429,22 @@ All 5 tickers validated end-to-end against live PostgreSQL data (docker-compose)
 
 ---
 
-*Last updated: 2026-02-28 | Author: hck717*
+## Running the Agent
+
+### Docker Execution (Production)
+```bash
+docker exec fyp-airflow-webserver python -m agents.quant_fundamental.agent --ticker AAPL
+docker exec fyp-airflow-webserver python -m agents.quant_fundamental.agent --ticker TSLA --verbose
+docker exec fyp-airflow-webserver python -m agents.quant_fundamental.agent --prompt "Compare MSFT vs NVDA fundamentals"
+```
+
+### Local Development
+```bash
+cd /Users/brianho/FYP
+source .venv/bin/activate
+python -m agents.quant_fundamental.agent --ticker AAPL
+```
+
+---
+
+*Last updated: 2026-03-10 | Author: hck717*

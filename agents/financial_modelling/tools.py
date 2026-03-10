@@ -24,6 +24,72 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Data Boundary Enforcement - Financial Modelling Agent Whitelist
+# ---------------------------------------------------------------------------
+
+ALLOWED_DATA_TYPES: List[str] = [
+    "key_metrics_ttm",
+    "ratios_ttm",
+    "dividends",
+    "dividends_history",
+    "historical_dividends",
+    "stock_splits",
+    "splits_history",
+    "treasury_rates",
+    "macro_indicators",
+    "global_macro_indicators",
+    "economic_events",
+    "bonds_yields",
+    "corporate_bond_yields",
+    "forex_eod",
+    "forex_rates",
+    "forex_historical_rates",
+    "income_statement",
+    "balance_sheet",
+    "cash_flow",
+    "income_statement_as_reported",
+    "balance_sheet_as_reported",
+    "cash_flow_as_reported",
+    "financial_statements",
+    "valuation_multiples",
+    "enterprise_values",
+    "valuation_metrics",
+    "outstanding_shares",
+    "outstanding_shares_history",
+    "historical_prices_eod",
+    "historical_prices_weekly",
+    "company_core_info",
+    "analyst_estimates",
+    "analyst_estimates_eodhd",
+    "financial_scores",
+    "fundamentals",
+    "revenue_product_segmentation",
+    "revenue_geographic_segmentation",
+]
+
+
+def validate_data_name(data_name: str) -> None:
+    """Validate that a data_name is allowed for Financial Modelling Agent.
+
+    Args:
+        data_name: The data name to validate.
+
+    Raises:
+        ValueError: If the data type is not in the allowed whitelist.
+    """
+    if not data_name:
+        return
+    if not any(
+        data_name == a or data_name.startswith(a + "_") or data_name.startswith(a)
+        for a in ALLOWED_DATA_TYPES
+    ):
+        raise ValueError(
+            f"Data type not allowed for Financial Modelling Agent: {data_name}. "
+            f"Allowed types: {ALLOWED_DATA_TYPES}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Safe numeric helpers
 # ---------------------------------------------------------------------------
 
@@ -70,11 +136,52 @@ class PostgresConnector:
         limit: int = 1,
     ) -> List[Dict[str, Any]]:
         """Fetch latest `limit` rows from raw_fundamentals for ticker + data_name."""
+        validate_data_name(data_name)
         sql = """
         SELECT payload, as_of_date, source
         FROM raw_fundamentals
         WHERE ticker_symbol = %s
           AND data_name = %s
+        ORDER BY as_of_date DESC
+        LIMIT %s
+        """
+        conn = self._connect()
+        with closing(conn), conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, (ticker, data_name, limit))
+            rows = cur.fetchall()
+        results = []
+        for row in rows:
+            payload = row["payload"]
+            if isinstance(payload, str):
+                try:
+                    payload = json.loads(payload)
+                except json.JSONDecodeError:
+                    pass
+            results.append({
+                "payload": payload,
+                "as_of_date": str(row["as_of_date"]),
+                "source": row["source"],
+            })
+        return results
+
+    def fetch_annual_fundamental(
+        self,
+        ticker: str,
+        data_name: str,
+        limit: int = 2,
+    ) -> List[Dict[str, Any]]:
+        """Fetch up to `limit` annual (period_type='yearly') rows, newest first.
+
+        Used to obtain current + prior-year annual data for YoY calculations
+        (e.g. Piotroski F-Score).  Falls back to all rows if no yearly rows exist.
+        """
+        validate_data_name(data_name)
+        sql = """
+        SELECT payload, as_of_date, source
+        FROM raw_fundamentals
+        WHERE ticker_symbol = %s
+          AND data_name = %s
+          AND (payload->>'period_type' = 'yearly' OR payload->>'periodType' = 'annual')
         ORDER BY as_of_date DESC
         LIMIT %s
         """
@@ -104,6 +211,7 @@ class PostgresConnector:
         limit: int = 400,
     ) -> List[Dict[str, Any]]:
         """Fetch time-series rows from raw_timeseries, newest first."""
+        validate_data_name(data_name)
         sql = """
         SELECT payload, ts_date, source
         FROM raw_timeseries
@@ -426,6 +534,66 @@ class PostgresConnector:
                 counts[st] = counts.get(st, 0) + 1
             return result
 
+    def fetch_earnings_surprises(self, ticker: str, limit: int = 20) -> List[Dict]:
+        """Fetch earnings surprise history from the dedicated earnings_surprises table.
+
+        Returns rows sorted by period_date DESC (most recent first).
+        Columns: period_date, eps_actual, eps_estimate, eps_surprise_pct,
+                 revenue_actual, revenue_estimate, revenue_surprise_pct, before_after_market.
+        """
+        sql = """
+        SELECT ticker, period_date, eps_actual, eps_estimate, eps_surprise_pct,
+               revenue_actual, revenue_estimate, revenue_surprise_pct, before_after_market
+        FROM earnings_surprises
+        WHERE ticker = %s
+        ORDER BY period_date DESC
+        LIMIT %s
+        """
+        conn = self._connect()
+        with closing(conn), conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, (ticker, limit))
+            rows = cur.fetchall()
+        result = []
+        for row in rows:
+            d = dict(row)
+            # Convert Decimal → float, date → str
+            for k, v in d.items():
+                if hasattr(v, '__float__') and not isinstance(v, (str, bool)):
+                    d[k] = float(v)
+                elif hasattr(v, 'isoformat'):
+                    d[k] = str(v)
+            result.append(d)
+        return result
+
+    def fetch_dividends_dedicated(self, ticker: str, limit: int = 30) -> List[Dict]:
+        """Fetch dividend history from the dedicated dividends_history table.
+
+        Returns rows sorted by pay_date DESC (most recent first).
+        Columns: ticker, amount, ex_date, pay_date, record_date.
+        Only returns rows with amount > 0.
+        """
+        sql = """
+        SELECT ticker, amount, ex_date, pay_date, record_date
+        FROM dividends_history
+        WHERE ticker = %s AND amount > 0
+        ORDER BY pay_date DESC
+        LIMIT %s
+        """
+        conn = self._connect()
+        with closing(conn), conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, (ticker, limit))
+            rows = cur.fetchall()
+        result = []
+        for row in rows:
+            d = dict(row)
+            for k, v in d.items():
+                if hasattr(v, '__float__') and not isinstance(v, (str, bool)):
+                    d[k] = float(v)
+                elif hasattr(v, 'isoformat'):
+                    d[k] = str(v)
+            result.append(d)
+        return result
+
     def fetch_valuation_metrics(self, ticker: str) -> Optional[Dict]:
         """Fetch latest valuation metrics for the ticker (Row 19)."""
         sql = """
@@ -728,16 +896,36 @@ class FMDataFetcher:
                 fund = self._latest_payload(ticker, "fundamentals")
                 ebitda_val = fund.get("Highlights_EBITDA")
             bundle.income = {
-                "revenue":              inc.get("revenue"),
+                # Period metadata (needed for 3SM period labels)
+                "date":                 inc.get("date"),
+                "period":               inc.get("period"),
+                "period_type":          inc.get("period_type"),
+                # Revenue — EODHD uses "totalRevenue"; FMP uses "revenue"
+                "revenue":              inc.get("revenue") or inc.get("totalRevenue"),
+                "totalRevenue":         inc.get("totalRevenue") or inc.get("revenue"),
+                # Cost & margins
+                "costOfRevenue":        inc.get("costOfRevenue"),
                 "grossProfit":          inc.get("grossProfit"),
+                # R&D — EODHD uses "researchDevelopment"; FMP uses "researchAndDevelopmentExpenses"
+                "researchDevelopment":  inc.get("researchDevelopment") or inc.get("researchAndDevelopmentExpenses"),
+                "researchAndDevelopmentExpenses": inc.get("researchAndDevelopmentExpenses") or inc.get("researchDevelopment"),
+                # Operating
+                "totalOperatingExpenses": inc.get("totalOperatingExpenses") or inc.get("operatingExpenses"),
+                "operatingExpenses":    inc.get("operatingExpenses") or inc.get("totalOperatingExpenses"),
                 "ebit":                 inc.get("operatingIncome") or inc.get("ebit"),
                 "operatingIncome":      inc.get("operatingIncome") or inc.get("ebit"),
                 "ebitda":               ebitda_val,
-                "netIncome":            inc.get("netIncome"),
+                "EBITDA":               ebitda_val,
+                # Below-line
                 "interestExpense":      inc.get("interestExpense"),
-                "incomeTaxExpense":     inc.get("incomeTaxExpense"),
                 "incomeBeforeTax":      inc.get("incomeBeforeTax"),
+                # Tax — EODHD uses "taxProvision"; FMP uses "incomeTaxExpense"
+                "incomeTaxExpense":     inc.get("incomeTaxExpense") or inc.get("taxProvision"),
+                "taxProvision":         inc.get("taxProvision") or inc.get("incomeTaxExpense"),
+                # Bottom line
+                "netIncome":            inc.get("netIncome"),
                 "depreciationAmortization": inc.get("depreciationAndAmortization"),
+                "depreciationAndAmortization": inc.get("depreciationAndAmortization"),
             }
         except Exception as exc:
             logger.warning("income_statement fetch failed for %s: %s", ticker, exc)
@@ -764,19 +952,56 @@ class FMDataFetcher:
                         ticker,
                     )
             bundle.balance = {
+                # Core totals
                 "totalAssets":              bal.get("totalAssets"),
+                # EODHD uses "totalLiab"; FMP uses "totalLiabilities" — keep both keys
+                "totalLiab":                bal.get("totalLiab") or bal.get("totalLiabilities"),
                 "totalLiabilities":         bal.get("totalLiabilities") or bal.get("totalLiab"),
+                # EODHD uses "totalStockholderEquity" (singular); FMP uses "totalStockholdersEquity"
+                "totalStockholderEquity":   bal.get("totalStockholderEquity") or bal.get("totalStockholdersEquity"),
+                "totalStockholdersEquity":  bal.get("totalStockholdersEquity") or bal.get("totalStockholderEquity"),
+                # Debt
                 "totalDebt":                bal.get("totalDebt") or bal.get("longTermDebt"),
-                "longTermDebt":             bal.get("longTermDebt"),
-                "cashAndCashEquivalents":   bal.get("cashAndCashEquivalents") or bal.get("cash"),
-                "workingCapital":           bal.get("totalCurrentAssets", 0)
-                                            - bal.get("totalCurrentLiabilities", 0)
-                                            if (bal.get("totalCurrentAssets") and bal.get("totalCurrentLiabilities"))
-                                            else bal.get("workingCapital"),
-                "retainedEarnings":         bal.get("retainedEarnings"),
+                "longTermDebt":             bal.get("longTermDebt") or bal.get("longTermDebtTotal"),
+                "longTermDebtTotal":        bal.get("longTermDebtTotal") or bal.get("longTermDebt"),
+                "shortTermDebt":            bal.get("shortTermDebt") or bal.get("shortLongTermDebt"),
+                "shortLongTermDebt":        bal.get("shortLongTermDebt") or bal.get("shortTermDebt"),
+                "shortLongTermDebtTotal":   bal.get("shortLongTermDebtTotal"),
+                # Cash — EODHD uses "cash"; FMP uses "cashAndCashEquivalents"
+                "cash":                     bal.get("cash") or bal.get("cashAndCashEquivalents") or bal.get("cashAndEquivalents"),
+                "cashAndCashEquivalents":   bal.get("cashAndCashEquivalents") or bal.get("cash") or bal.get("cashAndEquivalents"),
+                "cashAndEquivalents":       bal.get("cashAndEquivalents") or bal.get("cash"),
+                # Current items
                 "totalCurrentAssets":       bal.get("totalCurrentAssets"),
                 "totalCurrentLiabilities":  bal.get("totalCurrentLiabilities"),
-                "totalStockholdersEquity":  bal.get("totalStockholdersEquity"),
+                "netReceivables":           bal.get("netReceivables"),
+                "inventory":                bal.get("inventory"),
+                "otherCurrentAssets":       bal.get("otherCurrentAssets"),
+                "otherCurrentLiab":         bal.get("otherCurrentLiab"),
+                "accountsPayable":          bal.get("accountsPayable"),
+                # Non-current items
+                "goodWill":                 bal.get("goodWill") or bal.get("goodwill"),
+                "intangibleAssets":         bal.get("intangibleAssets"),
+                "propertyPlantEquipment":   bal.get("propertyPlantEquipment") or bal.get("propertyPlantAndEquipmentNet"),
+                # Equity components
+                "retainedEarnings":         bal.get("retainedEarnings"),
+                "commonStock":              bal.get("commonStock") or bal.get("capitalStock"),
+                "capitalStock":             bal.get("capitalStock") or bal.get("commonStock"),
+                "treasuryStock":            bal.get("treasuryStock"),
+                "additionalPaidInCapital":  bal.get("additionalPaidInCapital"),
+                "otherStockholderEquity":   bal.get("otherStockholderEquity"),
+                # Derived / convenience
+                "workingCapital":           _safe_float(bal.get("totalCurrentAssets"), 0)
+                                            - _safe_float(bal.get("totalCurrentLiabilities"), 0)
+                                            if (bal.get("totalCurrentAssets") and bal.get("totalCurrentLiabilities"))
+                                            else (bal.get("workingCapital") or bal.get("netWorkingCapital")),
+                "netWorkingCapital":        bal.get("netWorkingCapital"),
+                "netDebt":                  bal.get("netDebt"),
+                "netTangibleAssets":        bal.get("netTangibleAssets"),
+                # Period metadata
+                "date":                     bal.get("date"),
+                "period":                   bal.get("period"),
+                "period_type":              bal.get("period_type"),
                 "marketCapitalization":     None,  # populated from key_metrics_ttm below
             }
         except Exception as exc:
@@ -787,11 +1012,50 @@ class FMDataFetcher:
             rows = self._latest_payload_list(ticker, "cash_flow", limit=5)
             cf = rows[0] if rows else {}
             bundle.cashflow = {
-                "operatingCashFlow":   cf.get("operatingCashFlow"),
-                "capitalExpenditure":  cf.get("capitalExpenditure"),
-                "freeCashFlow":        cf.get("freeCashFlow"),
-                "netIncome":           cf.get("netIncome"),
-                "depreciationAmortization": cf.get("depreciationAndAmortization"),
+                # Operating — EODHD uses "totalCashFromOperatingActivities"; FMP uses "operatingCashFlow"
+                "totalCashFromOperatingActivities": cf.get("totalCashFromOperatingActivities") or cf.get("operatingCashFlow"),
+                "operatingCashFlow":                cf.get("operatingCashFlow") or cf.get("totalCashFromOperatingActivities"),
+                # Investing
+                "capitalExpenditures":              cf.get("capitalExpenditures") or cf.get("capitalExpenditure"),
+                "capitalExpenditure":               cf.get("capitalExpenditure") or cf.get("capitalExpenditures"),
+                "investments":                      cf.get("investments"),
+                "totalCashflowsFromInvestingActivities": cf.get("totalCashflowsFromInvestingActivities"),
+                "otherCashflowsFromInvestingActivities": cf.get("otherCashflowsFromInvestingActivities"),
+                # Financing
+                "totalCashFromFinancingActivities": cf.get("totalCashFromFinancingActivities"),
+                "dividendsPaid":                    cf.get("dividendsPaid"),
+                "salePurchaseOfStock":              cf.get("salePurchaseOfStock"),
+                "issuanceOfCapitalStock":           cf.get("issuanceOfCapitalStock"),
+                "netBorrowings":                    cf.get("netBorrowings"),
+                "otherCashflowsFromFinancingActivities": cf.get("otherCashflowsFromFinancingActivities"),
+                # Net change & cash levels
+                "changeInCash":                     cf.get("changeInCash") or cf.get("cashAndCashEquivalentsChanges"),
+                "cashAndCashEquivalentsChanges":    cf.get("cashAndCashEquivalentsChanges"),
+                "beginPeriodCashFlow":              cf.get("beginPeriodCashFlow"),
+                "endPeriodCashFlow":                cf.get("endPeriodCashFlow"),
+                "exchangeRateChanges":              cf.get("exchangeRateChanges"),
+                # Components of OCF (indirect method)
+                "netIncome":                        cf.get("netIncome"),
+                "depreciation":                     cf.get("depreciation"),
+                "depreciationAndAmortization":      cf.get("depreciationAndAmortization") or cf.get("depreciation"),
+                "depreciationAmortization":         cf.get("depreciationAndAmortization") or cf.get("depreciation"),
+                "stockBasedCompensation":           cf.get("stockBasedCompensation"),
+                "changeInWorkingCapital":           cf.get("changeInWorkingCapital"),
+                "changeToAccountReceivables":       cf.get("changeToAccountReceivables") or cf.get("changeReceivables"),
+                "changeReceivables":                cf.get("changeReceivables") or cf.get("changeToAccountReceivables"),
+                "changeToInventory":                cf.get("changeToInventory") or cf.get("changeInventory"),
+                "changeInventory":                  cf.get("changeInventory") or cf.get("changeToInventory"),
+                "changeToLiabilities":              cf.get("changeToLiabilities"),
+                "changeToNetincome":                cf.get("changeToNetincome"),
+                "changeToOperatingActivities":      cf.get("changeToOperatingActivities"),
+                "otherNonCashItems":                cf.get("otherNonCashItems"),
+                "cashFlowsOtherOperating":          cf.get("cashFlowsOtherOperating"),
+                # Pre-computed FCF
+                "freeCashFlow":                     cf.get("freeCashFlow"),
+                # Period metadata
+                "date":                             cf.get("date"),
+                "period":                           cf.get("period"),
+                "period_type":                      cf.get("period_type"),
             }
             if not cf:
                 # EODHD fallback: key_metrics_ttm has freeCashFlowToFirmTTM,
@@ -843,12 +1107,159 @@ class FMDataFetcher:
         except Exception as exc:
             logger.warning("financial_scores fetch failed for %s: %s", ticker, exc)
 
-        # ── key_metrics_ttm (FMP) — EV, market cap, FCFF, capex/rev ──────────
+        # ── Annual data for 3-Statement Model + Piotroski F-Score YoY signals ────
+        try:
+            ann_inc_rows = self.pg.fetch_annual_fundamental(ticker, "income_statement", limit=2)
+            ann_bal_rows = self.pg.fetch_annual_fundamental(ticker, "balance_sheet", limit=2)
+            ann_cf_rows  = self.pg.fetch_annual_fundamental(ticker, "cash_flow", limit=2)
+            # Index 0 = current annual, index 1 = prior annual
+            # bundle.income_annual/balance_annual/cashflow_annual = current annual (for 3SM)
+            # bundle.income_prior/balance_prior/cashflow_prior = prior annual (for Piotroski YoY)
+
+            def _map_annual_income(p: Dict) -> Dict:
+                ebitda_ann = p.get("ebitda") or p.get("EBITDA")
+                return {
+                    "date":                   p.get("date"),
+                    "period":                 p.get("period"),
+                    "period_type":            p.get("period_type"),
+                    "revenue":                p.get("revenue") or p.get("totalRevenue"),
+                    "totalRevenue":           p.get("totalRevenue") or p.get("revenue"),
+                    "costOfRevenue":          p.get("costOfRevenue"),
+                    "grossProfit":            p.get("grossProfit"),
+                    "researchDevelopment":    p.get("researchDevelopment") or p.get("researchAndDevelopmentExpenses"),
+                    "totalOperatingExpenses": p.get("totalOperatingExpenses") or p.get("operatingExpenses"),
+                    "ebit":                   p.get("operatingIncome") or p.get("ebit"),
+                    "operatingIncome":        p.get("operatingIncome") or p.get("ebit"),
+                    "ebitda":                 ebitda_ann,
+                    "EBITDA":                 ebitda_ann,
+                    "interestExpense":        p.get("interestExpense"),
+                    "incomeBeforeTax":        p.get("incomeBeforeTax"),
+                    "incomeTaxExpense":       p.get("incomeTaxExpense") or p.get("taxProvision"),
+                    "taxProvision":           p.get("taxProvision") or p.get("incomeTaxExpense"),
+                    "netIncome":              p.get("netIncome"),
+                    "depreciationAndAmortization": p.get("depreciationAndAmortization"),
+                    "depreciationAmortization":    p.get("depreciationAndAmortization"),
+                }
+
+            def _map_annual_balance(p: Dict) -> Dict:
+                return {
+                    "date":                    p.get("date"),
+                    "period":                  p.get("period"),
+                    "period_type":             p.get("period_type"),
+                    "totalAssets":             p.get("totalAssets"),
+                    "totalLiab":               p.get("totalLiab") or p.get("totalLiabilities"),
+                    "totalLiabilities":        p.get("totalLiabilities") or p.get("totalLiab"),
+                    "totalCurrentAssets":      p.get("totalCurrentAssets"),
+                    "totalCurrentLiabilities": p.get("totalCurrentLiabilities"),
+                    "longTermDebt":            p.get("longTermDebt") or p.get("longTermDebtTotal"),
+                    "longTermDebtTotal":       p.get("longTermDebtTotal") or p.get("longTermDebt"),
+                    "shortTermDebt":           p.get("shortTermDebt") or p.get("shortLongTermDebt"),
+                    "cash":                    p.get("cash") or p.get("cashAndCashEquivalents") or p.get("cashAndEquivalents"),
+                    "cashAndCashEquivalents":  p.get("cashAndCashEquivalents") or p.get("cash"),
+                    "netReceivables":          p.get("netReceivables"),
+                    "inventory":               p.get("inventory"),
+                    "accountsPayable":         p.get("accountsPayable"),
+                    "goodWill":                p.get("goodWill") or p.get("goodwill"),
+                    "intangibleAssets":        p.get("intangibleAssets"),
+                    "retainedEarnings":        p.get("retainedEarnings"),
+                    "commonStock":             p.get("commonStock") or p.get("capitalStock"),
+                    "treasuryStock":           p.get("treasuryStock"),
+                    "totalStockholderEquity":  p.get("totalStockholderEquity") or p.get("totalStockholdersEquity"),
+                    "totalStockholdersEquity": p.get("totalStockholdersEquity") or p.get("totalStockholderEquity"),
+                    "netWorkingCapital":       p.get("netWorkingCapital"),
+                    "netDebt":                 p.get("netDebt"),
+                }
+
+            def _map_annual_cashflow(p: Dict) -> Dict:
+                return {
+                    "date":                     p.get("date"),
+                    "period":                   p.get("period"),
+                    "period_type":              p.get("period_type"),
+                    "totalCashFromOperatingActivities": p.get("totalCashFromOperatingActivities") or p.get("operatingCashFlow"),
+                    "operatingCashFlow":        p.get("operatingCashFlow") or p.get("totalCashFromOperatingActivities"),
+                    "capitalExpenditures":      p.get("capitalExpenditures") or p.get("capitalExpenditure"),
+                    "capitalExpenditure":       p.get("capitalExpenditure") or p.get("capitalExpenditures"),
+                    "investments":              p.get("investments"),
+                    "totalCashflowsFromInvestingActivities": p.get("totalCashflowsFromInvestingActivities"),
+                    "totalCashFromFinancingActivities": p.get("totalCashFromFinancingActivities"),
+                    "dividendsPaid":            p.get("dividendsPaid"),
+                    "salePurchaseOfStock":      p.get("salePurchaseOfStock"),
+                    "issuanceOfCapitalStock":   p.get("issuanceOfCapitalStock"),
+                    "netBorrowings":            p.get("netBorrowings"),
+                    "changeInCash":             p.get("changeInCash") or p.get("cashAndCashEquivalentsChanges"),
+                    "cashAndCashEquivalentsChanges": p.get("cashAndCashEquivalentsChanges"),
+                    "beginPeriodCashFlow":      p.get("beginPeriodCashFlow"),
+                    "endPeriodCashFlow":        p.get("endPeriodCashFlow"),
+                    "freeCashFlow":             p.get("freeCashFlow"),
+                    "netIncome":                p.get("netIncome"),
+                    "depreciation":             p.get("depreciation"),
+                    "depreciationAndAmortization": p.get("depreciationAndAmortization") or p.get("depreciation"),
+                    "depreciationAmortization": p.get("depreciationAndAmortization") or p.get("depreciation"),
+                    "stockBasedCompensation":   p.get("stockBasedCompensation"),
+                    "changeInWorkingCapital":   p.get("changeInWorkingCapital"),
+                    "changeToAccountReceivables": p.get("changeToAccountReceivables"),
+                    "changeToInventory":        p.get("changeToInventory"),
+                    "changeToLiabilities":      p.get("changeToLiabilities"),
+                    "changeToOperatingActivities": p.get("changeToOperatingActivities"),
+                    "otherNonCashItems":        p.get("otherNonCashItems"),
+                    "cashFlowsOtherOperating":  p.get("cashFlowsOtherOperating"),
+                    "exchangeRateChanges":       p.get("exchangeRateChanges"),
+                }
+
+            if ann_inc_rows:
+                bundle.income_annual = _map_annual_income(ann_inc_rows[0]["payload"])
+            if ann_bal_rows:
+                bundle.balance_annual = _map_annual_balance(ann_bal_rows[0]["payload"])
+            if ann_cf_rows:
+                bundle.cashflow_annual = _map_annual_cashflow(ann_cf_rows[0]["payload"])
+
+            if len(ann_inc_rows) >= 2:
+                bundle.income_prior = _map_annual_income(ann_inc_rows[1]["payload"])
+            if len(ann_bal_rows) >= 2:
+                bundle.balance_prior = _map_annual_balance(ann_bal_rows[1]["payload"])
+            if len(ann_cf_rows) >= 2:
+                bundle.cashflow_prior = _map_annual_cashflow(ann_cf_rows[1]["payload"])
+            # Also ensure current-year annual data is in bundle for signals that need it.
+            # If the current income row was quarterly, overlay OCF from annual cash_flow.
+            if ann_cf_rows:
+                curr_cf = ann_cf_rows[0]["payload"]
+                if not bundle.cashflow.get("operatingCashFlow"):
+                    ocf = curr_cf.get("operatingCashFlow") or curr_cf.get("totalCashFromOperatingActivities")
+                    if ocf:
+                        bundle.cashflow["operatingCashFlow"] = ocf
+                if not bundle.cashflow.get("freeCashFlow"):
+                    fcf = curr_cf.get("freeCashFlow")
+                    if fcf:
+                        bundle.cashflow["freeCashFlow"] = fcf
+                if not bundle.cashflow.get("capitalExpenditure"):
+                    capex = curr_cf.get("capitalExpenditure") or curr_cf.get("capitalExpenditures")
+                    if capex:
+                        bundle.cashflow["capitalExpenditure"] = capex
+        except Exception as exc:
+            logger.warning("prior-year annual data fetch failed for %s: %s", ticker, exc)
+
+        # ── key_metrics_ttm (FMP primary / EODHD fallback) ───────────────────
         try:
             bundle.key_metrics_ttm = self._latest_payload(ticker, "key_metrics_ttm")
             if bundle.key_metrics_ttm:
-                ev_ttm  = _safe_float(bundle.key_metrics_ttm.get("enterpriseValueTTM"))
-                mkt_cap = _safe_float(bundle.key_metrics_ttm.get("marketCap"))
+                ev_ttm = _safe_float(
+                    # FMP field names
+                    bundle.key_metrics_ttm.get("enterpriseValueTTM")
+                    # EODHD field names (enterprise_values table)
+                )
+                mkt_cap = _safe_float(
+                    # FMP field names
+                    bundle.key_metrics_ttm.get("marketCap")
+                    or bundle.key_metrics_ttm.get("marketCapTTM")
+                    # EODHD Highlights field names
+                    or bundle.key_metrics_ttm.get("MarketCapitalization")
+                )
+                # EODHD also stores market cap in millions (MarketCapitalizationMln)
+                if mkt_cap is None:
+                    mln = _safe_float(bundle.key_metrics_ttm.get("MarketCapitalizationMln"))
+                    if mln is not None and mln > 0:
+                        mkt_cap = mln * 1_000_000
+
                 bundle.enterprise["enterpriseValueTTM"]   = ev_ttm
                 bundle.enterprise["marketCapitalization"] = mkt_cap
 
@@ -883,11 +1294,29 @@ class FMDataFetcher:
                     if not bundle.cashflow.get("capitalExpenditure"):
                         bundle.cashflow["capitalExpenditure"] = -abs(capex_abs)
 
-                # EBIT margin overlay
-                ebit   = _safe_float(bundle.income.get("ebit")) if bundle.income else None
-                rev    = _safe_float(bundle.income.get("revenue")) if bundle.income else None
-                if ebit and rev:
-                    bundle.income["ebitMargin"] = round(ebit / rev, 6)
+                # Override revenue with RevenueTTM (authoritative TTM annual figure).
+                # The income_statement table may contain a quarterly row as its most
+                # recent entry (e.g. Q4 = $143B) which is far smaller than the true
+                # annual TTM ($435B for AAPL).  RevenueTTM from key_metrics_ttm is
+                # always the trailing-twelve-months annual total — use it whenever
+                # available so DCF projections are based on annual revenue.
+                rev_ttm = _safe_float(bundle.key_metrics_ttm.get("RevenueTTM"))
+                if rev_ttm and rev_ttm > 0 and bundle.income is not None:
+                    bundle.income["revenue"] = rev_ttm
+                    logger.debug(
+                        "[FM] Overriding income.revenue with RevenueTTM=%.0f for %s",
+                        rev_ttm, ticker,
+                    )
+                    # Re-derive EBIT margin with updated (annual) revenue
+                    ebit = _safe_float(bundle.income.get("ebit"))
+                    if ebit and ebit > 0:
+                        bundle.income["ebitMargin"] = round(ebit / rev_ttm, 6)
+                else:
+                    # EBIT margin overlay (fallback when RevenueTTM unavailable)
+                    ebit   = _safe_float(bundle.income.get("ebit")) if bundle.income else None
+                    rev    = _safe_float(bundle.income.get("revenue")) if bundle.income else None
+                    if ebit and rev:
+                        bundle.income["ebitMargin"] = round(ebit / rev, 6)
         except Exception as exc:
             logger.warning("key_metrics_ttm fetch failed for %s: %s", ticker, exc)
 
@@ -899,7 +1328,28 @@ class FMDataFetcher:
         except Exception as exc:
             logger.warning("ratios_ttm fetch failed for %s: %s", ticker, exc)
 
-        # ── Analyst estimates (FMP primary → EODHD fallback) ─────────────────
+        # ── enterprise_values (EODHD) — EnterpriseValue, TrailingPE, etc. ────
+        try:
+            ev_payload = self._latest_payload(ticker, "enterprise_values")
+            if ev_payload:
+                ev = _safe_float(ev_payload.get("EnterpriseValue"))
+                if ev and ev > 0:
+                    if not bundle.enterprise.get("enterpriseValue"):
+                        bundle.enterprise["enterpriseValue"] = ev
+                    if not bundle.enterprise.get("enterpriseValueTTM"):
+                        bundle.enterprise["enterpriseValueTTM"] = ev
+                # Also derive shares from MarketCap / RevenuePerShare if needed
+                rev_per_share = _safe_float(
+                    bundle.key_metrics_ttm.get("RevenuePerShareTTM")
+                    or bundle.ratios_ttm.get("RevenuePerShareTTM")
+                )
+                rev = _safe_float(bundle.income.get("revenue")) if bundle.income else None
+                if rev and rev > 0 and rev_per_share and rev_per_share > 0:
+                    implied_shares = rev / rev_per_share
+                    if implied_shares > 0 and not bundle.income.get("sharesOutstanding"):
+                        bundle.income["sharesOutstanding"] = implied_shares
+        except Exception as exc:
+            logger.warning("enterprise_values fetch failed for %s: %s", ticker, exc)
         try:
             est_rows = self._latest_payload_list(ticker, "analyst_estimates", limit=8)
             if not est_rows:
@@ -1105,6 +1555,24 @@ class FMDataFetcher:
         except Exception as exc:
             logger.warning("valuation_metrics fetch failed for %s: %s", ticker, exc)
 
+        # ── Earnings surprises from dedicated table (Row 23) ──────────────────
+        try:
+            es_rows = self.pg.fetch_earnings_surprises(ticker, limit=20)
+            if es_rows:
+                bundle.earnings_surprises = es_rows
+                logger.debug("[FM] earnings_surprises: %d rows for %s", len(es_rows), ticker)
+        except Exception as exc:
+            logger.warning("earnings_surprises fetch failed for %s: %s", ticker, exc)
+
+        # ── Dedicated dividends table (Row 10 — primary source) ───────────────
+        try:
+            div_rows = self.pg.fetch_dividends_dedicated(ticker, limit=30)
+            if div_rows:
+                bundle.dividends_dedicated = div_rows
+                logger.debug("[FM] dividends_dedicated: %d rows for %s", len(div_rows), ticker)
+        except Exception as exc:
+            logger.warning("dividends_dedicated fetch failed for %s: %s", ticker, exc)
+
         # ── Outstanding shares history (Row 22) ───────────────────────────────
         try:
             bundle.outstanding_shares = self.pg.fetch_outstanding_shares(ticker, limit=10)
@@ -1238,6 +1706,14 @@ class FMToolkit:
     def fetch_splits_history(self, ticker: str, limit: int = 10) -> List[Dict]:
         """Fetch stock split history for the ticker (Row 10: splits)."""
         return self.pg.fetch_splits_history(ticker, limit)
+
+    def fetch_earnings_surprises(self, ticker: str, limit: int = 20) -> List[Dict]:
+        """Fetch earnings surprise history from the dedicated earnings_surprises table."""
+        return self.pg.fetch_earnings_surprises(ticker, limit)
+
+    def fetch_dividends_dedicated(self, ticker: str, limit: int = 30) -> List[Dict]:
+        """Fetch dividend history from the dedicated dividends_history table."""
+        return self.pg.fetch_dividends_dedicated(ticker, limit)
 
     def fetch_macro_indicators(self, indicator: str, limit: int = 5) -> List[Dict]:
         """Fetch global macro indicator rows (Row 11)."""

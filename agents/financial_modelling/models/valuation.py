@@ -104,16 +104,25 @@ class CompsEngine:
         enterprise: Dict[str, Any],
         income: Dict[str, Any],
     ) -> Optional[float]:
-        # Try precomputed TTM key first
+        # Try precomputed TTM key first (FMP field names)
         v = _safe_float(km_ttm.get("evToEBITDATTM") or km_ttm.get("enterpriseValueMultipleTTM"))
         if v is not None and v > 0:
             return round(v, 2)
+        # EODHD field names (enterprise_values payload stored in bundle.enterprise)
+        v = _safe_float(enterprise.get("EnterpriseValueEbitda") or km_ttm.get("EnterpriseValueEbitda"))
+        if v is not None and v > 0:
+            return round(v, 2)
         # Compute from components
-        ev = _safe_float(enterprise.get("enterpriseValue") or enterprise.get("enterpriseValueTTM"))
+        ev = _safe_float(
+            enterprise.get("enterpriseValue")
+            or enterprise.get("EnterpriseValue")
+            or enterprise.get("enterpriseValueTTM")
+        )
         ebitda = _safe_float(
             income.get("ebitda")
             or income.get("EBITDA")
             or km_ttm.get("ebitdaTTM")
+            or km_ttm.get("EBITDA")   # EODHD key_metrics_ttm
         )
         if ev and ebitda and ebitda > 0:
             return round(ev / ebitda, 2)
@@ -125,9 +134,13 @@ class CompsEngine:
         ratios_ttm: Dict[str, Any],
     ) -> Optional[float]:
         v = _safe_float(
+            # FMP field names
             ratios_ttm.get("priceToEarningsRatioTTM")
             or km_ttm.get("peRatioTTM")
             or km_ttm.get("priceEarningsRatioTTM")
+            # EODHD field names
+            or km_ttm.get("PERatio")
+            or ratios_ttm.get("PERatio")
         )
         if v is not None and v > 0:
             return round(v, 2)
@@ -159,9 +172,13 @@ class CompsEngine:
         ratios_ttm: Dict[str, Any],
     ) -> Optional[float]:
         v = _safe_float(
+            # FMP field names
             ratios_ttm.get("priceToSalesRatioTTM")
             or km_ttm.get("priceToSalesRatioTTM")
             or km_ttm.get("psTTM")
+            # EODHD field names
+            or km_ttm.get("PriceSalesTTM")
+            or ratios_ttm.get("PriceSalesTTM")
         )
         if v is not None and v > 0:
             return round(v, 2)
@@ -174,22 +191,23 @@ class CompsEngine:
         enterprise: Dict[str, Any],
         income: Dict[str, Any],
     ) -> Optional[float]:
-        v = _safe_float(
-            km_ttm.get("evToSalesTTM")
-            or km_ttm.get("enterpriseValueOverEBITDATTM")
+        # Try computing from EV / revenue (most reliable)
+        ev = _safe_float(
+            enterprise.get("enterpriseValue")
+            or enterprise.get("EnterpriseValue")
+            or enterprise.get("enterpriseValueTTM")
         )
-        if v is not None and v > 0 and "revenue" not in str(v):
-            # evToSales ≠ evToEBITDA; verify via raw components
-            pass
-        # Try computing from EV / revenue
-        ev = _safe_float(enterprise.get("enterpriseValue") or enterprise.get("enterpriseValueTTM"))
         revenue = _safe_float(income.get("revenue"))
         if ev and revenue and revenue > 0:
             return round(ev / revenue, 2)
-        # Fallback to TTM key
-        v2 = _safe_float(km_ttm.get("evToSalesTTM"))
-        if v2 is not None and v2 > 0:
-            return round(v2, 2)
+        # EODHD pre-computed EV/Revenue
+        v = _safe_float(
+            enterprise.get("EnterpriseValueRevenue")
+            or km_ttm.get("EnterpriseValueRevenue")
+            or km_ttm.get("evToSalesTTM")
+        )
+        if v is not None and v > 0:
+            return round(v, 2)
         return None
 
     def _ev_ebit(
@@ -199,7 +217,11 @@ class CompsEngine:
         income: Dict[str, Any],
     ) -> Optional[float]:
         """EV / EBIT — pure operating multiple (excludes D&A from denominator vs EV/EBITDA)."""
-        ev = _safe_float(enterprise.get("enterpriseValue") or enterprise.get("enterpriseValueTTM"))
+        ev = _safe_float(
+            enterprise.get("enterpriseValue")
+            or enterprise.get("EnterpriseValue")
+            or enterprise.get("enterpriseValueTTM")
+        )
         ebit = _safe_float(
             income.get("ebit")
             or income.get("operatingIncome")

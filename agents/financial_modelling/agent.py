@@ -1,6 +1,6 @@
 """Financial Modelling Agent — LangGraph computation pipeline.
 
-Architecture (8-node pipeline):
+Architecture (11-node pipeline):
 
     ticker
         │
@@ -8,24 +8,37 @@ Architecture (8-node pipeline):
     fetch_price_history      ←  PostgreSQL: raw_timeseries (EOD prices, Treasury rates)
         │                       market_eod_us (S&P 500 benchmark)
         ▼
-    fetch_fundamentals       ←  PostgreSQL: raw_fundamentals
+    fetch_fundamentals       ←  PostgreSQL: raw_fundamentals, earnings_surprises,
+        │                       dividends_history (dedicated tables)
         │                       (income, balance, cashflow, ratios, scores,
-        │                        earnings, dividends, analyst estimates)
+        │                        earnings_surprises, dividends_dedicated, analyst estimates)
         ▼
-    fetch_earnings_history   ←  PostgreSQL: earnings_history payload
-        │                       → EPS actual vs. estimate, surprise %, beat/miss streak
+    fetch_earnings_history   ←  earnings_surprises table (dedicated, 521 rows)
+        │                       → EPS actual vs. estimate, surprise %, beat/miss streak,
+        │                         next earnings date
         ▼
     calculate_technicals     ←  Python: SMA/EMA, RSI, MACD, Bollinger, ATR, HV30, Stochastic
         │
         ▼
+    macro_environment        ←  PostgreSQL: global_macro_indicators, treasury_rates (dedicated)
+        │                       → VIX-adjusted MRP, GDP/CPI/unemployment snapshot
+        ▼
     run_dcf_model            ←  Python: WACC (CAPM), FCF projections, Terminal Value
         │                       → Bear / Base / Bull scenarios + sensitivity matrix
         ▼
+    moe_consensus            ←  DeepSeek (reasoner) MoE: Bull/Bear/Contrarian personas
+        │
+        ▼
     run_comparable_analysis  ←  Python + Neo4j peer group + PG peer multiples
         │                       → EV/EBITDA, P/E, P/S, EV/Revenue vs. sector
+        │                       → valuation_metrics table fills null multiples
         ▼
-    assess_analyst_estimates ←  PostgreSQL: analyst_estimates + dividends
-        │                       → EPS consensus, dividend yield, Piotroski/Beneish/Altman
+    assess_analyst_estimates ←  PostgreSQL: dividends_history (dedicated) + factor scores
+        │                       → dividend yield / CAGR / payout, Piotroski/Beneish/Altman
+        ▼
+    build_three_statement_model ← Python: IS + BS + CF reconciliation + linkage checks
+        │                       → revenue, gross_margin, net_margin, OCF, FCF, net_debt,
+        │                         BS balance check, RE linkage, cash linkage
         ▼
     format_json_output       ←  Structured JSON assembly; LLM writes quantitative_summary only
         │
@@ -45,7 +58,7 @@ import logging
 import re
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, TypedDict, cast
 
 import requests
@@ -54,6 +67,7 @@ from langgraph.graph import END, StateGraph
 from .config import FinancialModellingConfig, load_config
 from .models.dcf import DCFEngine, compute_benchmark_hv30, vix_mrp_adjustment
 from .models.technicals import TechnicalEngine
+from .models.three_statement import ThreeStatementEngine, ThreeStatementModel
 from .models.valuation import CompsEngine
 from .prompts import build_system_prompt
 from .schema import (
@@ -94,6 +108,7 @@ class AgentState(TypedDict, total=False):
     dividends: Optional[DividendRecord]
     factor_scores: Optional[FactorScores]
     current_price: Optional[float]
+    three_statement: Optional[Any]   # ThreeStatementModel
 
     # Final output
     output: Optional[Dict[str, Any]]
@@ -196,8 +211,73 @@ def _node_fetch_earnings_history(state: AgentState) -> AgentState:
 
 
 def _compute_earnings_record(bundle: FMDataBundle) -> EarningsRecord:
-    """Parse earnings_history payload into EarningsRecord."""
+    """Parse earnings data into EarningsRecord.
+
+    Primary source: bundle.earnings_surprises (dedicated earnings_surprises table,
+    sorted period_date DESC). Columns: eps_actual, eps_estimate, eps_surprise_pct,
+    revenue_actual, revenue_estimate, revenue_surprise_pct, before_after_market.
+
+    Fallback: bundle.earnings_history (raw_fundamentals payload, legacy EODHD format).
+    """
     record = EarningsRecord()
+
+    # ── Primary: earnings_surprises dedicated table ───────────────────────────
+    surprises = bundle.earnings_surprises  # already sorted DESC by period_date
+    if surprises:
+        # Find the most recent row that HAS eps_actual (i.e. the last reported quarter)
+        last_reported = None
+        next_earnings_row = None
+        for row in surprises:
+            if row.get("eps_actual") is not None:
+                if last_reported is None:
+                    last_reported = row
+            else:
+                # eps_actual is None → this is a future/scheduled earnings date
+                if next_earnings_row is None:
+                    # Only treat as next if it looks like a future date
+                    next_earnings_row = row
+
+        if last_reported:
+            record.last_eps_actual   = _sf(last_reported.get("eps_actual"))
+            record.last_eps_estimate = _sf(last_reported.get("eps_estimate"))
+            # Use pre-computed surprise_pct if available, else compute
+            pre_surp = _sf(last_reported.get("eps_surprise_pct"))
+            if pre_surp is not None:
+                record.surprise_pct = round(pre_surp, 2)
+            elif record.last_eps_actual is not None and record.last_eps_estimate:
+                record.surprise_pct = round(
+                    (record.last_eps_actual - record.last_eps_estimate)
+                    / abs(record.last_eps_estimate) * 100, 2
+                )
+
+        # Beat / miss streak: iterate through reported rows (most recent first)
+        current_beat = 0
+        current_miss = 0
+        in_beat = True
+        in_miss = True
+        for row in surprises:
+            actual   = _sf(row.get("eps_actual"))
+            estimate = _sf(row.get("eps_estimate"))
+            if actual is None or estimate is None:
+                continue  # skip future / missing rows
+            beat = actual >= estimate
+            if in_beat and beat:
+                current_beat += 1
+            else:
+                in_beat = False
+            if in_miss and not beat:
+                current_miss += 1
+            else:
+                in_miss = False
+        record.beat_streak = current_beat
+        record.miss_streak = current_miss
+
+        # Next earnings date: earliest future row (eps_actual is None, has a period_date)
+        if next_earnings_row:
+            record.next_earnings_date = str(next_earnings_row.get("period_date", ""))
+        return record
+
+    # ── Fallback: legacy earnings_history payload ─────────────────────────────
     history = bundle.earnings_history  # list of dicts, newest first
 
     if not history:
@@ -211,14 +291,6 @@ def _compute_earnings_record(bundle: FMDataBundle) -> EarningsRecord:
         history = sorted(history, key=_date_key, reverse=True)
     except Exception:
         pass
-
-    def _sf(v: Any) -> Optional[float]:
-        if v is None:
-            return None
-        try:
-            return float(v)
-        except (TypeError, ValueError):
-            return None
 
     # Most recent entry
     latest = history[0] if history else {}
@@ -234,8 +306,6 @@ def _compute_earnings_record(bundle: FMDataBundle) -> EarningsRecord:
             record.surprise_pct = round(surprise, 2)
 
     # Beat / miss streak
-    beat_streak = 0
-    miss_streak = 0
     current_beat_streak = 0
     current_miss_streak = 0
     in_beat = True
@@ -462,21 +532,58 @@ def _moe_persona_valuation(
         f"Be specific about the economic assumptions driving your view."
     )
     narrative = f"[{persona_name} narrative unavailable]"
+    # deepseek-reasoner uses chain-of-thought <think> tags that consume tokens before
+    # emitting the actual response. Use 800 tokens to give enough headroom. Fall back
+    # to deepseek-chat (no reasoning overhead) on a second attempt if response is empty.
+    _PERSONA_MAX_TOKENS = 800
     try:
-        resp = requests.post(
-            f"{config.ollama_base_url}/api/generate",
-            json={
-                "model": config.llm_model,
-                "prompt": prompt,
-                "temperature": 0.5,
-                "num_predict": 200,
-                "stream": False,
-                "think": False,
-            },
-            timeout=config.request_timeout or None,
-        )
-        resp.raise_for_status()
-        narrative = _clean_response(resp.json().get("response", "")).strip() or narrative
+        if config.llm_provider == "deepseek" and config.deepseek_api_key:
+            from openai import OpenAI
+            client = OpenAI(
+                api_key=config.deepseek_api_key,
+                base_url="https://api.deepseek.com",
+            )
+            from openai.types.chat import ChatCompletionMessageParam as _MsgParam
+            messages: List[Any] = [
+                {"role": "system", "content": f"You are the {persona_name} analyst in a DCF review committee."},
+                {"role": "user", "content": prompt},
+            ]
+            # Attempt 1: primary model (deepseek-reasoner)
+            response = client.chat.completions.create(
+                model=config.llm_model,
+                messages=messages,
+                temperature=0.5,
+                max_tokens=_PERSONA_MAX_TOKENS,
+            )
+            content = response.choices[0].message.content or ""
+            cleaned = _clean_response(content).strip()
+            if not cleaned or len(cleaned) < 20:
+                # Attempt 2: fallback to deepseek-chat (no reasoning tokens overhead)
+                logger.debug("[MoE] %s: primary model returned short/empty response (%d chars), retrying with deepseek-chat", persona_name, len(cleaned))
+                response2 = client.chat.completions.create(
+                    model="deepseek-chat",
+                    messages=messages,
+                    temperature=0.5,
+                    max_tokens=300,
+                )
+                content = response2.choices[0].message.content or ""
+                cleaned = _clean_response(content).strip()
+            narrative = cleaned if cleaned and len(cleaned) >= 20 else narrative
+        else:
+            resp = requests.post(
+                f"{config.ollama_base_url}/api/generate",
+                json={
+                    "model": config.llm_model,
+                    "prompt": prompt,
+                    "temperature": 0.5,
+                    "num_predict": _PERSONA_MAX_TOKENS,
+                    "stream": False,
+                    "think": False,
+                },
+                timeout=config.request_timeout or None,
+            )
+            resp.raise_for_status()
+            narrative = _clean_response(resp.json().get("response", "")).strip() or narrative
     except Exception as exc:
         logger.warning("[MoE] %s persona LLM call failed: %s", persona_name, exc)
 
@@ -558,20 +665,38 @@ def _node_moe_consensus(
     )
     consensus_narrative = "MoE consensus synthesis unavailable."
     try:
-        resp = requests.post(
-            f"{config.ollama_base_url}/api/generate",
-            json={
-                "model": config.llm_model,
-                "prompt": synthesis_prompt,
-                "temperature": 0.3,
-                "num_predict": 300,
-                "stream": False,
-                "think": False,
-            },
-            timeout=config.request_timeout or None,
-        )
-        resp.raise_for_status()
-        consensus_narrative = _clean_response(resp.json().get("response", "")).strip() or consensus_narrative
+        if config.llm_provider == "deepseek" and config.deepseek_api_key:
+            from openai import OpenAI
+            client = OpenAI(
+                api_key=config.deepseek_api_key,
+                base_url="https://api.deepseek.com",
+            )
+            response = client.chat.completions.create(
+                model=config.llm_model,
+                messages=[
+                    {"role": "system", "content": "You are a senior equity research analyst synthesising DCF committee views."},
+                    {"role": "user", "content": synthesis_prompt},
+                ],
+                temperature=0.3,
+                max_tokens=500,
+            )
+            content = response.choices[0].message.content or ""
+            consensus_narrative = _clean_response(content).strip() or consensus_narrative
+        else:
+            resp = requests.post(
+                f"{config.ollama_base_url}/api/generate",
+                json={
+                    "model": config.llm_model,
+                    "prompt": synthesis_prompt,
+                    "temperature": 0.3,
+                    "num_predict": 500,
+                    "stream": False,
+                    "think": False,
+                },
+                timeout=config.request_timeout or None,
+            )
+            resp.raise_for_status()
+            consensus_narrative = _clean_response(resp.json().get("response", "")).strip() or consensus_narrative
     except Exception as exc:
         logger.warning("[MoE] Consensus synthesis LLM call failed: %s", exc)
 
@@ -600,9 +725,33 @@ def _node_run_comparable_analysis(
 
     engine = CompsEngine(config)
     result = engine.compute(bundle)
+
+    # ── Enrich with valuation_metrics pre-computed EODHD values (fill nulls) ─
+    # valuation_metrics has: trailing_pe, forward_pe, ev_ebitda, ev_revenue,
+    #   price_sales_ttm, free_cash_flow, market_cap, enterprise_value, beta, wacc
+    vm = bundle.valuation_metrics or {}
+    if vm:
+        if result.pe_trailing is None:
+            result.pe_trailing = _sf(vm.get("trailing_pe"))
+        if result.pe_forward is None:
+            result.pe_forward = _sf(vm.get("forward_pe"))
+        if result.ev_ebitda is None:
+            result.ev_ebitda = _sf(vm.get("ev_ebitda"))
+        if result.ev_revenue is None:
+            result.ev_revenue = _sf(vm.get("ev_revenue"))
+        if result.ps_ttm is None:
+            result.ps_ttm = _sf(vm.get("price_sales_ttm"))
+        # Compute P/FCF from valuation_metrics if still null
+        if result.p_fcf is None:
+            mc = _sf(vm.get("market_cap"))
+            fcf = _sf(vm.get("free_cash_flow"))
+            if mc and fcf and fcf > 0:
+                result.p_fcf = round(mc / fcf, 2)
+
     logger.debug(
-        "comps for %s: ev_ebitda=%s vs_sector=%s peers=%s",
-        bundle.ticker, result.ev_ebitda, result.vs_sector_avg, result.peer_group,
+        "comps for %s: ev_ebitda=%s pe_trailing=%s pe_forward=%s vs_sector=%s peers=%s",
+        bundle.ticker, result.ev_ebitda, result.pe_trailing, result.pe_forward,
+        result.vs_sector_avg, result.peer_group,
     )
     return {**state, "comps_result": result}
 
@@ -637,6 +786,27 @@ def _node_assess_analyst_estimates(state: AgentState) -> AgentState:
         "factor_scores": scores,
         "current_price": current_price,
     }
+
+
+# ---------------------------------------------------------------------------
+# Node 8: build_three_statement_model
+# ---------------------------------------------------------------------------
+
+def _node_build_three_statement_model(state: AgentState) -> AgentState:
+    """Build linked IS + BS + CF 3-statement model and verify accounting linkages."""
+    bundle: Optional[FMDataBundle] = state.get("bundle")
+    if bundle is None or bundle.is_empty():
+        return {**state, "three_statement": ThreeStatementModel(ticker="")}
+
+    engine = ThreeStatementEngine()
+    model = engine.compute(bundle)
+    logger.debug(
+        "3SM for %s: %d IS periods, linkages=%s",
+        bundle.ticker,
+        len(model.income_statements),
+        [(c.period, c.bs_balance_holds, c.cash_linkage_holds) for c in model.linkage_checks],
+    )
+    return {**state, "three_statement": model}
 
 
 def _sf(val: Any) -> Optional[float]:
@@ -692,25 +862,92 @@ def _compute_dividends(bundle: FMDataBundle) -> DividendRecord:
     km_ttm = bundle.key_metrics_ttm
     ratios_ttm = bundle.ratios_ttm
 
-    record.dividend_yield = _sf(
-        km_ttm.get("dividendYieldTTM") or ratios_ttm.get("dividendYieldTTM")
-        or km_ttm.get("dividendYield")
+    # EODHD uses PascalCase: DividendYield, DividendShare
+    # FMP uses camelCase: dividendYieldTTM, dividendYield
+    raw_yield = (
+        km_ttm.get("DividendYield")            # EODHD key_metrics_ttm
+        or ratios_ttm.get("DividendYield")      # EODHD financial_ratios (via ratios_ttm slot)
+        or km_ttm.get("dividendYieldTTM")       # FMP
+        or ratios_ttm.get("dividendYieldTTM")   # FMP
+        or km_ttm.get("dividendYield")          # FMP legacy
     )
+    record.dividend_yield = _sf(raw_yield)
+
     record.payout_ratio = _sf(
         ratios_ttm.get("dividendPayoutRatioTTM") or ratios_ttm.get("payoutRatioTTM")
         or km_ttm.get("payoutRatioTTM")
     )
 
-    # Annual dividend from history
+    # Annual dividend: use DividendShare (EODHD) or derive from history
+    annual_div_share = _sf(km_ttm.get("DividendShare") or km_ttm.get("dividendPerShareTTM"))
+    if annual_div_share and annual_div_share > 0:
+        record.annual_dividend = round(annual_div_share, 4)
+
+    # ── Primary: dedicated dividends_history table ────────────────────────────
+    dedicated = bundle.dividends_dedicated  # sorted pay_date DESC, amount > 0
+    if dedicated:
+        # Annual dividend = sum of last 4 quarterly payments (most recent 4 rows)
+        recent_4 = [_sf(d.get("amount")) for d in dedicated[:4]]
+        recent_4 = [v for v in recent_4 if v is not None and v > 0]
+        if recent_4:
+            record.annual_dividend = round(sum(recent_4), 4)
+
+        # 5-year CAGR: compare annual dividend sum ~5 years ago vs. last year
+        # Need rows spanning at least ~20 quarters (5 years × 4 quarters)
+        today = date.today()
+        cutoff_recent  = today - timedelta(days=365)         # 1 year ago
+        cutoff_old     = today - timedelta(days=365 * 6)     # 6 years ago
+        cutoff_old_end = today - timedelta(days=365 * 5)     # 5 years ago
+
+        def _parse_date(s: Any) -> Optional[date]:
+            if s is None:
+                return None
+            if isinstance(s, date):
+                return s
+            try:
+                parts = str(s).split("-")
+                return date(int(parts[0]), int(parts[1]), int(parts[2]))
+            except Exception:
+                return None
+
+        recent_year_amts = []
+        old_year_amts = []
+        for d in dedicated:
+            dt = _parse_date(d.get("pay_date") or d.get("ex_date"))
+            if dt is None:
+                continue
+            amt = _sf(d.get("amount"))
+            if amt is None or amt <= 0:
+                continue
+            if dt >= cutoff_recent:
+                recent_year_amts.append(amt)
+            elif cutoff_old <= dt <= cutoff_old_end:
+                old_year_amts.append(amt)
+
+        recent_ann = sum(recent_year_amts) if recent_year_amts else 0.0
+        old_ann    = sum(old_year_amts)    if old_year_amts    else 0.0
+        if old_ann > 0 and recent_ann > 0:
+            cagr = (recent_ann / old_ann) ** (1 / 5) - 1
+            record.dividend_growth_5y_cagr = round(cagr, 4)
+
+        # Payout ratio: annual_dividend / EPS_TTM (if not already set from ratios)
+        if record.payout_ratio is None and record.annual_dividend:
+            eps_ttm = _sf(km_ttm.get("EPS") or km_ttm.get("epsTTM") or km_ttm.get("eps"))
+            if eps_ttm and eps_ttm > 0:
+                record.payout_ratio = round(record.annual_dividend / eps_ttm, 4)
+
+        return record
+
+    # ── Fallback: raw_timeseries dividend_history payload ─────────────────────
     history = bundle.dividend_history
     if history:
         annual_total = 0.0
-        recent_year = None
         for div in history[:12]:  # last 12 entries (quarterly/monthly)
             amount = _sf(div.get("dividend") or div.get("adjDividend") or div.get("amount"))
             if amount is not None:
                 annual_total += amount
-        record.annual_dividend = round(annual_total, 4) if annual_total > 0 else None
+        if annual_total > 0:
+            record.annual_dividend = round(annual_total, 4)
 
         # 5-year CAGR
         if len(history) >= 20:
@@ -785,18 +1022,14 @@ def _compute_altman_z(bundle: FMDataBundle) -> Optional[float]:
 def _compute_beneish_m(bundle: FMDataBundle) -> Optional[float]:
     """Simplified Beneish M-Score using available single-period data.
 
-    Uses a reduced form based on the accruals component and profit-margin proxy
-    since prior-year comparatives are not available in the current DB schema.
+    Uses the accruals component: M ≈ -6.065 + 4.679 * (net_income - OCF) / total_assets.
+    OCF is sourced from bundle.cashflow.operatingCashFlow (annual cash flow statement);
+    falls back to incomeQualityTTM × net_income if the direct OCF is unavailable.
 
-    Simplified model:
-        M ≈ -6.065 + 0.823*ACCRUALS_INDEX + 4.679*TOTAL_ACCRUALS_TO_ASSETS
-    where:
-        ACCRUALS_INDEX = (net_income - OCF) / total_assets  (accruals ratio)
-        TOTAL_ACCRUALS_TO_ASSETS = (net_income - OCF) / avg_total_assets
-
-    A single-period approximation:
-        OCF ≈ ebit * (1 - eff_tax_rate) * income_quality_ratio
-    Falls back to None if insufficient data.
+    The full 8-variable Beneish model requires YoY changes (DSRI, GMI, etc.) which
+    are not available with single-period data. This reduced accruals form is
+    directionally correct: high accruals (earnings > cash) → higher (worse) M-Score.
+    Threshold: M > -2.22 suggests possible earnings manipulation.
     """
     inc = bundle.income
     bal = bundle.balance
@@ -817,6 +1050,9 @@ def _compute_beneish_m(bundle: FMDataBundle) -> Optional[float]:
     ocf = None
     if net_income is not None and income_quality is not None:
         ocf = net_income * income_quality
+    # Fallback: use OCF directly from cashflow bundle (now populated from annual CF row)
+    if ocf is None:
+        ocf = _sf(bundle.cashflow.get("operatingCashFlow"))
 
     # If no net_income, try to derive from profit margin × revenue
     if net_income is None and revenue is not None:
@@ -836,6 +1072,162 @@ def _compute_beneish_m(bundle: FMDataBundle) -> Optional[float]:
     # This reduced form is directionally correct: high accruals → higher M-Score.
     m_score = -6.065 + 4.679 * accruals_to_assets
     return round(m_score, 3)
+
+
+def _compute_piotroski_f(bundle: FMDataBundle) -> Optional[int]:
+    """Compute Piotroski F-Score (0–9) from two consecutive annual periods.
+
+    Requires bundle.income/balance/cashflow (current year) and
+    bundle.income_prior/balance_prior/cashflow_prior (prior year).
+
+    The 9 signals are grouped into three pillars:
+
+    Profitability (4 signals):
+      F1: ROA > 0            (net_income / total_assets > 0)
+      F2: OCF > 0            (operating cash flow > 0)
+      F3: ΔROA > 0           (roa_curr > roa_prior)
+      F4: Accruals < 0       (OCF / total_assets > ROA  →  cash earnings > accrual earnings)
+
+    Leverage / Liquidity (3 signals):
+      F5: ΔLeverage ≤ 0      (long_term_debt / total_assets has not increased)
+      F6: ΔLiquidity ≥ 0     (current_ratio has not decreased)
+      F7: No new shares       (shares outstanding have not increased significantly)
+
+    Operating Efficiency (2 signals):
+      F8: ΔGross margin > 0  (gross_profit / revenue has improved)
+      F9: ΔAsset turnover > 0 (revenue / total_assets has improved)
+
+    Returns None if fewer than 5 of the 9 signals can be computed (insufficient data).
+    """
+    inc  = bundle.income   or {}
+    bal  = bundle.balance  or {}
+    cf   = bundle.cashflow or {}
+    inc0 = bundle.income_prior   or {}
+    bal0 = bundle.balance_prior  or {}
+    cf0  = bundle.cashflow_prior or {}
+
+    def _f(d: Dict[str, Any], *keys: str) -> Optional[float]:
+        for k in keys:
+            v = _sf(d.get(k))
+            if v is not None:
+                return v
+        return None
+
+    # Current-period values
+    net_income    = _f(inc,  "netIncome")
+    revenue       = _f(inc,  "revenue", "totalRevenue")
+    gross_profit  = _f(inc,  "grossProfit")
+    total_assets  = _f(bal,  "totalAssets")
+    ltd           = _f(bal,  "longTermDebt", "totalDebt")
+    cur_assets    = _f(bal,  "totalCurrentAssets")
+    cur_liab      = _f(bal,  "totalCurrentLiabilities")
+    ocf           = _f(cf,   "operatingCashFlow")
+
+    # Prior-period values
+    net_income0   = _f(inc0, "netIncome")
+    revenue0      = _f(inc0, "revenue", "totalRevenue")
+    gross_profit0 = _f(inc0, "grossProfit")
+    total_assets0 = _f(bal0, "totalAssets")
+    ltd0          = _f(bal0, "longTermDebt", "totalDebt")
+    cur_assets0   = _f(bal0, "totalCurrentAssets")
+    cur_liab0     = _f(bal0, "totalCurrentLiabilities")
+    ocf0          = _f(cf0,  "operatingCashFlow")
+
+    signals: Dict[str, Optional[int]] = {}
+
+    # F1: ROA > 0
+    if net_income is not None and total_assets and total_assets > 0:
+        roa = net_income / total_assets
+        signals["F1"] = 1 if roa > 0 else 0
+    else:
+        signals["F1"] = None
+
+    # F2: OCF > 0
+    if ocf is not None:
+        signals["F2"] = 1 if ocf > 0 else 0
+    else:
+        signals["F2"] = None
+
+    # F3: ΔROA > 0
+    if (net_income is not None and total_assets and total_assets > 0 and
+            net_income0 is not None and total_assets0 and total_assets0 > 0):
+        roa_curr  = net_income  / total_assets
+        roa_prior = net_income0 / total_assets0
+        signals["F3"] = 1 if roa_curr > roa_prior else 0
+    else:
+        signals["F3"] = None
+
+    # F4: Accruals (OCF/assets > ROA)
+    if (ocf is not None and net_income is not None and total_assets and total_assets > 0):
+        signals["F4"] = 1 if (ocf / total_assets) > (net_income / total_assets) else 0
+    else:
+        signals["F4"] = None
+
+    # F5: ΔLeverage ≤ 0  (leverage ratio should not have increased)
+    if (ltd is not None and total_assets and total_assets > 0 and
+            ltd0 is not None and total_assets0 and total_assets0 > 0):
+        lev_curr  = ltd  / total_assets
+        lev_prior = ltd0 / total_assets0
+        signals["F5"] = 1 if lev_curr <= lev_prior else 0
+    else:
+        signals["F5"] = None
+
+    # F6: ΔLiquidity ≥ 0  (current ratio should not have decreased)
+    if (cur_assets is not None and cur_liab and cur_liab > 0 and
+            cur_assets0 is not None and cur_liab0 and cur_liab0 > 0):
+        cr_curr  = cur_assets  / cur_liab
+        cr_prior = cur_assets0 / cur_liab0
+        signals["F6"] = 1 if cr_curr >= cr_prior else 0
+    else:
+        signals["F6"] = None
+
+    # F7: No new shares issued (use income-derived shares if available)
+    # Approximate via revenue / RevenuePerShare; fallback: treat as unknown
+    rps_curr  = _sf(bundle.key_metrics_ttm.get("RevenuePerShareTTM"))
+    rps_prior = _sf(bundle.ratios_ttm.get("revenuePerShareTTM"))  # FMP field name fallback
+    if rps_curr and revenue and revenue > 0:
+        shares_curr = revenue / rps_curr
+        if rps_prior and revenue0 and revenue0 > 0:
+            shares_prior = revenue0 / rps_prior
+            signals["F7"] = 1 if shares_curr <= shares_prior * 1.01 else 0
+        else:
+            signals["F7"] = None
+    else:
+        signals["F7"] = None
+
+    # F8: ΔGross margin > 0
+    if (gross_profit is not None and revenue and revenue > 0 and
+            gross_profit0 is not None and revenue0 and revenue0 > 0):
+        gm_curr  = gross_profit  / revenue
+        gm_prior = gross_profit0 / revenue0
+        signals["F8"] = 1 if gm_curr > gm_prior else 0
+    else:
+        signals["F8"] = None
+
+    # F9: ΔAsset turnover > 0
+    if (revenue is not None and total_assets and total_assets > 0 and
+            revenue0 is not None and total_assets0 and total_assets0 > 0):
+        at_curr  = revenue  / total_assets
+        at_prior = revenue0 / total_assets0
+        signals["F9"] = 1 if at_curr > at_prior else 0
+    else:
+        signals["F9"] = None
+
+    # Count non-None signals; require at least 5 computable signals
+    computable = [v for v in signals.values() if v is not None]
+    if len(computable) < 5:
+        logger.debug(
+            "[Piotroski] Insufficient signals for %s: only %d of 9 computable (%s)",
+            bundle.ticker, len(computable), signals,
+        )
+        return None
+
+    score = sum(computable)
+    logger.info(
+        "[Piotroski] %s F-Score=%d (%d/9 signals computed): %s",
+        bundle.ticker, score, len(computable), signals,
+    )
+    return score
 
 
 def _compute_factor_scores(bundle: FMDataBundle) -> FactorScores:
@@ -861,6 +1253,10 @@ def _compute_factor_scores(bundle: FMDataBundle) -> FactorScores:
     # Simplified accruals-based model (YoY deltas unavailable with single-period data).
     if result.beneish_m_score is None:
         result.beneish_m_score = _compute_beneish_m(bundle)
+
+    # Derive Piotroski F-Score from two annual periods if not pre-computed
+    if result.piotroski_f_score is None:
+        result.piotroski_f_score = _compute_piotroski_f(bundle)
 
     return result
 
@@ -916,7 +1312,7 @@ def _clean_response(text: str) -> str:
 
 
 def _generate_summary(config: FinancialModellingConfig, factor_table: Dict[str, Any]) -> str:
-    """Call Ollama to produce the quantitative_summary narrative string."""
+    """Call LLM (DeepSeek API or Ollama) to produce the quantitative_summary narrative string."""
     system = build_system_prompt(from_planner=False)
     lines = []
     for section, val in factor_table.items():
@@ -936,6 +1332,50 @@ def _generate_summary(config: FinancialModellingConfig, factor_table: Dict[str, 
         f"Write your 10-15 sentence quantitative narrative now:"
     )
 
+    if config.llm_provider == "deepseek":
+        return _generate_summary_deepseek(config, prompt)
+    else:
+        return _generate_summary_ollama(config, prompt)
+
+
+def _generate_summary_deepseek(config: FinancialModellingConfig, prompt: str) -> str:
+    """Call DeepSeek API to produce the quantitative_summary narrative."""
+    try:
+        from openai import OpenAI
+    except ImportError:
+        logger.warning("openai package not installed — falling back to Ollama")
+        return _generate_summary_ollama(config, prompt)
+
+    if not config.deepseek_api_key:
+        logger.warning("DeepSeek API key not configured — falling back to Ollama")
+        return _generate_summary_ollama(config, prompt)
+
+    try:
+        client = OpenAI(
+            api_key=config.deepseek_api_key,
+            base_url="https://api.deepseek.com",
+        )
+        response = client.chat.completions.create(
+            model=config.llm_model,
+            messages=[
+                {"role": "system", "content": "You are a senior quantitative analyst."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=config.llm_temperature,
+            max_tokens=config.llm_max_tokens,
+        )
+        content = response.choices[0].message.content
+        if not content or not content.strip():
+            return "Quantitative summary unavailable (LLM returned empty response)."
+        cleaned = _clean_response(content)
+        return cleaned if cleaned and len(cleaned) > 20 else "Quantitative summary unavailable."
+    except Exception as exc:
+        logger.warning("DeepSeek API call failed: %s — falling back to Ollama", exc)
+        return _generate_summary_ollama(config, prompt)
+
+
+def _generate_summary_ollama(config: FinancialModellingConfig, prompt: str) -> str:
+    """Call Ollama to produce the quantitative_summary narrative string."""
     payload = {
         "model": config.llm_model,
         "prompt": prompt,
@@ -987,6 +1427,7 @@ def _node_format_json_output(
     factor_scores: FactorScores = state.get("factor_scores") or FactorScores()
     current_price: Optional[float] = state.get("current_price")
     fetch_error = state.get("fetch_error")
+    three_stmt = state.get("three_statement")
 
     # Lazy import to avoid circular
     from .schema import CompsResult, ValuationResult
@@ -1047,6 +1488,7 @@ def _node_format_json_output(
         "dividends": dividends.to_dict(),
         "factor_scores": factor_scores.to_dict(),
         "quantitative_summary": quantitative_summary,
+        "three_statement_model": three_stmt.to_dict() if three_stmt is not None else None,
         "data_sources": data_sources,
         # Price series forwarded for Streamlit charts (serialised OHLCV, oldest-first)
         "price_history": _serialise_price_history(
@@ -1105,6 +1547,10 @@ def build_graph(toolkit: FMToolkit, config: FinancialModellingConfig) -> Any:
         lambda state: _node_assess_analyst_estimates(cast(AgentState, state)),
     )
     graph.add_node(
+        "build_three_statement_model",
+        lambda state: _node_build_three_statement_model(cast(AgentState, state)),
+    )
+    graph.add_node(
         "format_json_output",
         lambda state: _node_format_json_output(cast(AgentState, state), config),
     )
@@ -1118,7 +1564,8 @@ def build_graph(toolkit: FMToolkit, config: FinancialModellingConfig) -> Any:
     graph.add_edge("run_dcf_model", "moe_consensus")          # 4A: MoE after DCF
     graph.add_edge("moe_consensus", "run_comparable_analysis")
     graph.add_edge("run_comparable_analysis", "assess_analyst_estimates")
-    graph.add_edge("assess_analyst_estimates", "format_json_output")
+    graph.add_edge("assess_analyst_estimates", "build_three_statement_model")
+    graph.add_edge("build_three_statement_model", "format_json_output")
     graph.add_edge("format_json_output", END)
 
     return graph.compile()
@@ -1336,8 +1783,36 @@ def main() -> None:
             ticker=args.ticker or "",
             prompt=args.prompt or None,
         )
+
+        # ── Print compact JSON (price_history/benchmark_history elided for readability) ──
+        compact = {k: v for k, v in result.items() if k not in ("price_history", "benchmark_history")}
         indent = 2 if args.pretty else None
-        print(json.dumps(result, indent=indent, default=str))
+        print(json.dumps(compact, indent=indent, default=str))
+
+        # ── Print price series counts so the reader knows they exist ──
+        ph = result.get("price_history") or []
+        bh = result.get("benchmark_history") or []
+        print(f"\n[price_history: {len(ph)} rows elided | benchmark_history: {len(bh)} rows elided]")
+
+        # ── Always print the summary last so it is the final thing visible ──
+        summary = result.get("quantitative_summary", "")
+        if isinstance(result, list):
+            # multiple tickers
+            for r in result:
+                t = r.get("ticker", "")
+                s = r.get("quantitative_summary", "")
+                if s:
+                    print(f"\n{'='*70}")
+                    print(f"  QUANTITATIVE SUMMARY — {t}")
+                    print(f"{'='*70}")
+                    print(s)
+        elif summary:
+            ticker_label = result.get("ticker", "")
+            print(f"\n{'='*70}")
+            print(f"  QUANTITATIVE SUMMARY — {ticker_label}")
+            print(f"{'='*70}")
+            print(summary)
+
     except ValueError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)

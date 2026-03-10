@@ -113,9 +113,13 @@ class ValuationResult:
 class TechnicalSnapshot:
     """Output of the technical analysis module.
 
+    Per data boundary enforcement, Financial Modelling Agent only computes
+    beta for WACC. All other technical indicators are excluded (reserved for
+    Fundamental Math Agent).
+
     Attribute naming:
       Canonical names (used internally and by the pipeline):
-        macd_histogram, bollinger_upper, bollinger_lower,
+        beta, macd_histogram, bollinger_upper, bollinger_lower,
         stochastic_k, stochastic_d, high_52w, low_52w
 
       Alias properties (expected by tests and external consumers):
@@ -128,9 +132,11 @@ class TechnicalSnapshot:
         w52_low      → low_52w
     """
 
-    trend: Optional[str] = None               # "BULLISH" | "BEARISH" | "NEUTRAL" | "UNKNOWN"
+    trend: Optional[str] = None               # "bullish" | "bearish" | "neutral"
+    beta: Optional[float] = None              # Beta for WACC calculation (2-year weekly rolling)
     rsi_14: Optional[float] = None
-    macd_signal: Optional[str] = None         # "buy" | "sell" | "neutral"
+    macd_signal: Optional[str] = None         # "buy" | "sell" | "neutral" (direction string)
+    macd_signal_line: Optional[float] = None  # MACD signal line value (9-period EMA of MACD)
     macd_histogram: Optional[float] = None
     sma_20: Optional[float] = None
     sma_50: Optional[float] = None
@@ -214,9 +220,11 @@ class TechnicalSnapshot:
     def to_dict(self) -> Dict[str, Any]:
         return {
             "trend": self.trend,
+            "beta": self.beta,
             "rsi_14": self.rsi_14,
             "macd": self.macd_histogram,
             "macd_signal": self.macd_signal,
+            "macd_signal_line": self.macd_signal_line,
             "macd_histogram": self.macd_histogram,
             "sma_20": self.sma_20,
             "sma_50": self.sma_50,
@@ -318,10 +326,20 @@ class FMDataBundle:
 
     ticker: str
 
-    # From raw_fundamentals
+    # From raw_fundamentals (current period — most recent row, may be quarterly)
     income: Dict[str, Any] = field(default_factory=dict)
     balance: Dict[str, Any] = field(default_factory=dict)
     cashflow: Dict[str, Any] = field(default_factory=dict)
+
+    # Most recent annual (yearly) period — used for 3-statement model and annual analysis
+    income_annual: Dict[str, Any] = field(default_factory=dict)
+    balance_annual: Dict[str, Any] = field(default_factory=dict)
+    cashflow_annual: Dict[str, Any] = field(default_factory=dict)
+
+    # Prior-year annual period (for YoY Piotroski signals)
+    income_prior: Dict[str, Any] = field(default_factory=dict)
+    balance_prior: Dict[str, Any] = field(default_factory=dict)
+    cashflow_prior: Dict[str, Any] = field(default_factory=dict)
     key_metrics: Dict[str, Any] = field(default_factory=dict)
     key_metrics_ttm: Dict[str, Any] = field(default_factory=dict)
     ratios: Dict[str, Any] = field(default_factory=dict)
@@ -376,6 +394,15 @@ class FMDataBundle:
 
     # Row 11 (dedicated treasury_rates table) — supersedes raw_timeseries treasury_rates
     treasury_rates_dedicated: List[Dict[str, Any]] = field(default_factory=list)
+
+    # Row 23: Earnings Surprises — from earnings_surprises table (521 rows across 5 tickers)
+    # Each dict has: ticker, period_date, eps_actual, eps_estimate, eps_surprise_pct,
+    #                revenue_actual, revenue_estimate, revenue_surprise_pct, before_after_market
+    earnings_surprises: List[Dict[str, Any]] = field(default_factory=list)
+
+    # Row 10 (dedicated dividends table) — from dividends_history table (394 rows)
+    # Each dict has: ticker, amount, ex_date, pay_date, record_date
+    dividends_dedicated: List[Dict[str, Any]] = field(default_factory=list)
 
     def is_empty(self) -> bool:
         return not any([

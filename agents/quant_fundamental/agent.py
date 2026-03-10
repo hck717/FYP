@@ -47,7 +47,7 @@ import sys
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, TypedDict, cast
 
-from langgraph.graph import END, StateGraph
+from langchain_core.runnables import RunnableLambda
 
 from .config import QuantFundamentalConfig, load_config
 from .factors import (
@@ -150,81 +150,22 @@ def _node_fetch_financials(
         }
 
     try:
+        # Use the simplified fetch method that only accesses allowed data types
         bundle = toolkit.fetch_financials(ticker)
-        # Also fetch prior-year period for YoY factor signals
-        inc_list = toolkit.pg.fetch_latest_fundamental(ticker, "income_statement", limit=5)
-        bal_list = toolkit.pg.fetch_latest_fundamental(ticker, "balance_sheet", limit=5)
-        cf_list = toolkit.pg.fetch_latest_fundamental(ticker, "cash_flow", limit=5)
-
-        def _second_period(rows):
-            """Return the second-most-recent period payload (prior year), or {}."""
-            all_periods: List[Dict] = []
-            for r in rows:
-                p = r.get("payload", [])
-                if isinstance(p, list):
-                    all_periods.extend(p)
-                elif isinstance(p, dict):
-                    all_periods.append(p)
-            return all_periods[1] if len(all_periods) > 1 else {}
-
-        inc_prev = _second_period(inc_list)
-        bal_prev = _second_period(bal_list)
-        cf_prev = _second_period(cf_list)
-
-        # Build quarterly_trends: last 4 periods from income_statement rows.
-        # Each DB row's payload may be a list (multi-period) or a single dict.
-        # We collect all periods newest-first and take the first 4.
+        
+        # Since we only have allowed data now, quarterly_trends requires earnings_history
+        # which may not be available - set empty for now
+        bundle.quarterly_trends = []
+        
+        # No prior-year data available without income_statement
+        inc_prev = {}
+        bal_prev = {}
+        cf_prev = {}
         quarterly_trends: List[QuarterlyPeriod] = []
-        all_inc_periods: List[Dict] = []
-        for r in inc_list:
-            p = r.get("payload", [])
-            if isinstance(p, list):
-                all_inc_periods.extend(p)
-            elif isinstance(p, dict) and p:
-                all_inc_periods.append(p)
-
-        def _fv(d: Dict, *keys) -> Optional[float]:
-            for k in keys:
-                v = d.get(k)
-                if v is not None:
-                    try:
-                        return float(v)
-                    except (TypeError, ValueError):
-                        continue
-            return None
-
-        for period_data in all_inc_periods[:4]:
-            if not isinstance(period_data, dict):
-                continue
-            rev = _fv(period_data, "revenue")
-            gp = _fv(period_data, "grossProfit")
-            oi = _fv(period_data, "operatingIncome", "ebit")
-            ni = _fv(period_data, "netIncome")
-            eps = _fv(period_data, "epsdiluted", "eps", "epsActual")
-            period_label = (
-                period_data.get("period")
-                or period_data.get("calendarYear")
-                or period_data.get("date", "")
-            )
-            gm = round(gp / rev, 4) if rev and rev > 0 and gp is not None else None
-            em = round(oi / rev, 4) if rev and rev > 0 and oi is not None else None
-            quarterly_trends.append(QuarterlyPeriod(
-                period=str(period_label),
-                revenue=rev,
-                gross_profit=gp,
-                operating_income=oi,
-                net_income=ni,
-                eps_diluted=eps,
-                gross_margin=gm,
-                ebit_margin=em,
-            ))
-
-        # Attach quarterly_trends to the bundle so downstream nodes can use it
-        bundle.quarterly_trends = quarterly_trends
 
         logger.debug(
-            "fetch_financials: bundle loaded for %s (income keys=%d, prices=%d, quarterly_periods=%d)",
-            ticker, len(bundle.income), len(bundle.price_history), len(quarterly_trends),
+            "fetch_financials: bundle loaded for %s (key_metrics_ttm=%s, ratios_ttm=%s, price_history=%d)",
+            ticker, bool(bundle.key_metrics_ttm), bool(bundle.ratios_ttm), len(bundle.price_history),
         )
         return {
             **state,
@@ -257,28 +198,22 @@ def _node_chain_of_table_reasoning(state: AgentState) -> AgentState:
 
     ticker = bundle.ticker
 
-    # Step 1: SELECT — identify which data tables are populated
+    # Step 1: SELECT — identify which data tables are populated (now restricted to allowed data)
     available_tables = []
-    if bundle.income:
-        available_tables.append("income_statement")
-    if bundle.balance:
-        available_tables.append("balance_sheet")
-    if bundle.cashflow:
-        available_tables.append("cash_flow")
-    if bundle.ratios_ttm:
-        available_tables.append("ratios_ttm")
     if bundle.key_metrics_ttm:
         available_tables.append("key_metrics_ttm")
-    if bundle.enterprise:
-        available_tables.append("enterprise_values")
-    if bundle.scores:
-        available_tables.append("financial_scores")
+    if bundle.ratios_ttm:
+        available_tables.append("ratios_ttm")
     if bundle.price_history:
         available_tables.append("price_history")
     if bundle.benchmark_history:
         available_tables.append("benchmark_history")
+    if bundle.technicals:
+        available_tables.append("technicals")
+    if bundle.basic_fundamentals:
+        available_tables.append("basic_fundamentals")
 
-    # Step 2: FILTER — extract key numeric fields
+    # Step 2: FILTER — extract key numeric fields from allowed data
     def _g(d: Dict, *keys):
         for k in keys:
             v = d.get(k)
@@ -289,103 +224,78 @@ def _node_chain_of_table_reasoning(state: AgentState) -> AgentState:
                     continue
         return None
 
-    inc = bundle.income
-    bal = bundle.balance
-    cf = bundle.cashflow
+    km = bundle.key_metrics_ttm or {}
+    rt = bundle.ratios_ttm or {}
+
+    # Gross margin: prefer ratios_ttm, then derive from GrossProfitTTM/RevenueTTM
+    _gp = _g(km, "GrossProfitTTM", "grossProfitTTM")
+    _rev = _g(km, "RevenueTTM", "revenueTTM")
+    _gm_derived: Optional[float] = (_gp / _rev) if (_gp is not None and _rev and _rev != 0) else None
 
     key_fields = {
-        "revenue": _g(inc, "revenue"),
-        "gross_profit": _g(inc, "grossProfit"),
-        "operating_income": _g(inc, "operatingIncome", "ebit"),
-        "net_income": _g(inc, "netIncome"),
-        "total_assets": _g(bal, "totalAssets"),
-        "total_equity": _g(bal, "totalStockholdersEquity", "totalShareholdersEquity"),
-        "total_debt": _g(bal, "longTermDebt", "longTermDebtAndCapitalLeaseObligation"),
-        "ocf": _g(cf, "operatingCashFlow"),
-        "capex": _g(cf, "capitalExpenditure"),
+        "roe": _g(km, "ReturnOnEquityTTM", "returnOnEquityTTM", "roeTTM"),
+        "roic": _g(km, "returnOnInvestedCapitalTTM", "roicTTM"),
+        "gross_margin": (
+            _g(rt, "grossProfitMarginTTM", "GrossProfitMarginTTM")
+            or _g(km, "grossProfitMarginTTM", "GrossProfitMarginTTM")
+            or _gm_derived
+        ),
+        "ebit_margin": (
+            _g(km, "OperatingMarginTTM", "operatingMarginTTM")
+            or _g(rt, "operatingProfitMarginTTM", "OperatingProfitMarginTTM")
+        ),
+        "current_ratio": (
+            _g(rt, "currentRatioTTM", "CurrentRatioTTM")
+            or _g(km, "currentRatioTTM", "CurrentRatioTTM")
+        ),
+        "debt_to_equity": (
+            _g(rt, "debtToEquityRatioTTM", "DebtToEquityRatioTTM", "debtEquityRatioTTM")
+            or _g(km, "debtToEquityRatioTTM", "DebtToEquityRatioTTM")
+        ),
         "price_points": len(bundle.price_history),
     }
 
-    # Step 3: CALCULATE — derived ratios for ranking
-    revenue = key_fields.get("revenue")
-    gross_profit = key_fields.get("gross_profit")
-    operating_income = key_fields.get("operating_income")
-    net_income = key_fields.get("net_income")
+    # Step 3: CALCULATE — derived ratios for ranking (using available data only)
+    gross_margin = key_fields.get("gross_margin")
+    roe = key_fields.get("roe")
+    roic = key_fields.get("roic")
     total_assets = key_fields.get("total_assets")
     total_equity = key_fields.get("total_equity")
     ocf = key_fields.get("ocf")
     capex = key_fields.get("capex")
 
     derived = {}
-    if revenue and revenue > 0:
-        if gross_profit is not None:
-            derived["gross_margin"] = round(gross_profit / revenue, 4)
-        if operating_income is not None:
-            derived["ebit_margin"] = round(operating_income / revenue, 4)
-    if total_assets and total_assets > 0 and net_income is not None:
-        derived["roa"] = round(net_income / total_assets, 4)
-    if total_equity and total_equity > 0 and net_income is not None:
-        derived["roe"] = round(net_income / total_equity, 4)
-    if ocf is not None and capex is not None:
-        derived["fcf"] = round(ocf - abs(capex), 0)
-        if net_income and net_income != 0:
-            derived["fcf_conversion"] = round(derived["fcf"] / net_income, 4)
+    # Only compute derived ratios from key_metrics_ttm and ratios_ttm
+    gross_margin = key_fields.get("gross_margin")
+    roe = key_fields.get("roe")
+    roic = key_fields.get("roic")
+    if gross_margin is not None:
+        derived["gross_margin"] = gross_margin
 
-    # Step 4: RANK — classify quality tier
+    # Step 4: RANK — classify quality tier (simplified for allowed data)
     quality_tier = "UNKNOWN"
-    roe = derived.get("roe")
-    ebit_margin = derived.get("ebit_margin")
-    if roe is not None and ebit_margin is not None:
-        if roe > 0.20 and ebit_margin > 0.15:
-            quality_tier = "HIGH"
-        elif roe > 0.10 and ebit_margin > 0.05:
-            quality_tier = "MEDIUM"
-        elif roe is not None:
-            quality_tier = "LOW"
+    if roe is not None and roe > 0.20:
+        quality_tier = "HIGH"
+    elif roe is not None and roe > 0.10:
+        quality_tier = "MEDIUM"
+    elif roe is not None:
+        quality_tier = "LOW"
 
-    # Step 5: IDENTIFY — flag potential data issues
+    # Step 5: IDENTIFY — flag potential data issues (for allowed data)
     data_issues = []
-    if not bundle.income:
-        data_issues.append("income_statement missing")
-    if not bundle.balance:
-        data_issues.append("balance_sheet missing")
+    if not bundle.key_metrics_ttm and not bundle.ratios_ttm:
+        data_issues.append("key_metrics_ttm and ratios_ttm missing")
     if not bundle.price_history:
         data_issues.append("price_history missing — momentum factors unavailable")
-    if len(bundle.price_history) < 60:
+    elif len(bundle.price_history) < 60:
         data_issues.append(f"limited price history ({len(bundle.price_history)} days) — beta may be unreliable")
 
-    # Step 5b: BUILD QUARTERLY TREND SUMMARY from bundle.quarterly_trends
-    # Compute QoQ and YoY (period[0] vs period[4] if available) revenue/margin deltas in Python
-    qt_list = bundle.quarterly_trends  # already List[QuarterlyPeriod], newest first
+    # Quarterly trends not available without income_statement
+    qt_list = bundle.quarterly_trends or []
     qt_summary: List[Dict[str, Any]] = [q.to_dict() for q in qt_list]
 
     qoq_deltas: Dict[str, Any] = {}
-    if len(qt_list) >= 2:
-        q0, q1 = qt_list[0], qt_list[1]  # most recent vs. prior quarter
-        if q0.revenue and q1.revenue and q1.revenue != 0:
-            qoq_deltas["revenue_qoq_pct"] = round((q0.revenue - q1.revenue) / abs(q1.revenue) * 100, 2)
-        if q0.gross_margin is not None and q1.gross_margin is not None:
-            qoq_deltas["gross_margin_qoq_pp"] = round((q0.gross_margin - q1.gross_margin) * 100, 2)
-        if q0.ebit_margin is not None and q1.ebit_margin is not None:
-            qoq_deltas["ebit_margin_qoq_pp"] = round((q0.ebit_margin - q1.ebit_margin) * 100, 2)
-        if q0.net_income is not None and q1.net_income is not None and q1.net_income != 0:
-            qoq_deltas["net_income_qoq_pct"] = round((q0.net_income - q1.net_income) / abs(q1.net_income) * 100, 2)
-        if q0.eps_diluted is not None and q1.eps_diluted is not None and q1.eps_diluted != 0:
-            qoq_deltas["eps_qoq_pct"] = round((q0.eps_diluted - q1.eps_diluted) / abs(q1.eps_diluted) * 100, 2)
-
     yoy_deltas: Dict[str, Any] = {}
-    if len(qt_list) >= 4:
-        q_now, q_year_ago = qt_list[0], qt_list[3]  # most recent vs. 4 quarters ago
-        if q_now.revenue and q_year_ago.revenue and q_year_ago.revenue != 0:
-            yoy_deltas["revenue_yoy_pct"] = round((q_now.revenue - q_year_ago.revenue) / abs(q_year_ago.revenue) * 100, 2)
-        if q_now.gross_margin is not None and q_year_ago.gross_margin is not None:
-            yoy_deltas["gross_margin_yoy_pp"] = round((q_now.gross_margin - q_year_ago.gross_margin) * 100, 2)
-        if q_now.ebit_margin is not None and q_year_ago.ebit_margin is not None:
-            yoy_deltas["ebit_margin_yoy_pp"] = round((q_now.ebit_margin - q_year_ago.ebit_margin) * 100, 2)
-        if q_now.net_income is not None and q_year_ago.net_income is not None and q_year_ago.net_income != 0:
-            yoy_deltas["net_income_yoy_pct"] = round((q_now.net_income - q_year_ago.net_income) / abs(q_year_ago.net_income) * 100, 2)
-        if q_now.eps_diluted is not None and q_year_ago.eps_diluted is not None and q_year_ago.eps_diluted != 0:
-            yoy_deltas["eps_yoy_pct"] = round((q_now.eps_diluted - q_year_ago.eps_diluted) / abs(q_year_ago.eps_diluted) * 100, 2)
 
     cot_summary = {
         "status": "OK",
@@ -478,7 +388,12 @@ def _node_calculate_quality_factors(
 
     # --- 3A: Try materialized view first ---
     mv_row = toolkit.pg.fetch_factor_scores_from_mv(ticker)
-    if mv_row is not None:
+    # Only use MV if it has at least one non-null quality value (MV may exist but be unpopulated)
+    _mv_has_data = mv_row is not None and any(
+        mv_row.get(k) is not None
+        for k in ("roe_ttm", "roic_ttm", "gross_margin_ttm", "piotroski_score", "altman_z_score")
+    )
+    if _mv_has_data and mv_row is not None:
         logger.info("[QF] Using mv_daily_factor_scores for ticker=%s (as_of=%s)", ticker, mv_row.get("as_of_date"))
         _piotroski_raw = _float_or_none(mv_row.get("piotroski_score"))
         quality = QualityFactors(
@@ -567,32 +482,35 @@ def _node_flag_anomalies(
     if bundle is None:
         return {**state, "anomaly_flags": anomaly_flags}
 
-    # Build rolling history from prior-year income statements
+    # Build rolling history from prior ratios_ttm snapshots (income_statement excluded)
     ticker = bundle.ticker
+    gm_history: List[float] = []
+    margin_history: List[float] = []
     try:
-        inc_rows = toolkit.pg.fetch_latest_fundamental(ticker, "income_statement", limit=12)
-        # Collect revenue values across periods for baseline
-        rev_history: List[float] = []
-        gm_history: List[float] = []
-        margin_history: List[float] = []
-        for row in inc_rows:
-            payload = row.get("payload", [])
-            periods = payload if isinstance(payload, list) else [payload]
-            for p in periods:
-                if not isinstance(p, dict):
-                    continue
-                rev = p.get("revenue")
-                gp = p.get("grossProfit")
-                oi = p.get("operatingIncome")
-                if rev and float(rev) > 0:
-                    rev_history.append(float(rev))
-                    if gp is not None:
-                        gm_history.append(float(gp) / float(rev))
-                    if oi is not None:
-                        margin_history.append(float(oi) / float(rev))
+        rt_history = toolkit.pg.fetch_latest_fundamental(ticker, "ratios_ttm", limit=8)
+        for row in rt_history:
+            p = row.get("payload", {})
+            if isinstance(p, list):
+                p = p[0] if p else {}
+            # Gross margin
+            gm_val = p.get("grossProfitMarginTTM") or p.get("GrossProfitMarginTTM")
+            if gm_val is not None:
+                try:
+                    gm_history.append(float(gm_val))
+                except (TypeError, ValueError):
+                    pass
+            # Operating margin
+            om_val = (
+                p.get("operatingProfitMarginTTM") or p.get("OperatingProfitMarginTTM")
+                or p.get("OperatingMarginTTM") or p.get("operatingMarginTTM")
+            )
+            if om_val is not None:
+                try:
+                    margin_history.append(float(om_val))
+                except (TypeError, ValueError):
+                    pass
     except Exception as exc:
-        logger.debug("flag_anomalies: history fetch failed for %s: %s", ticker, exc)
-        rev_history = []
+        logger.debug("flag_anomalies: ratios_ttm history fetch failed for %s: %s", ticker, exc)
         gm_history = []
         margin_history = []
 
@@ -684,6 +602,52 @@ def _node_format_json_output(
 
     # Serialize quarterly trend periods for output / LLM prompt
     qt_serialized = [q.to_dict() for q in quarterly_trends]
+
+    # ---------------------------------------------------------------------------
+    # Extract short_interest from bundle
+    # ---------------------------------------------------------------------------
+    short_interest_out: Optional[Dict[str, Any]] = None
+    if bundle and bundle.short_interest:
+        si = bundle.short_interest
+        short_interest_out = {
+            "short_percent_float": si.get("short_percent_float"),
+            "short_percent_outstanding": si.get("short_percent_outstanding"),
+            "short_ratio": si.get("short_ratio"),
+            "shares_short": si.get("shares_short"),
+            "as_of_date": si.get("as_of_date"),
+        }
+
+    # ---------------------------------------------------------------------------
+    # Extract earnings_surprises from bundle
+    # ---------------------------------------------------------------------------
+    earnings_surprises_out: List[Dict[str, Any]] = []
+    if bundle and bundle.earnings_surprises:
+        earnings_surprises_out = bundle.earnings_surprises[:8]
+
+    # ---------------------------------------------------------------------------
+    # Extract RSI and MACD from bundle.technicals
+    # ---------------------------------------------------------------------------
+    technicals_out: Dict[str, Any] = {}
+    if bundle and bundle.technicals:
+        for row in bundle.technicals:
+            dn = row.get("data_name", "")
+            payload = row.get("payload") or {}
+            if not isinstance(payload, dict):
+                continue
+            if dn == "technical_rsi" and "rsi" not in technicals_out:
+                v = payload.get("rsi") or payload.get("value")
+                if v is not None:
+                    technicals_out["rsi"] = round(float(v), 2)
+            elif dn == "technical_macd" and "macd" not in technicals_out:
+                m = payload.get("macd")
+                s = payload.get("signal")
+                d = payload.get("divergence")
+                if m is not None:
+                    technicals_out["macd"] = round(float(m), 4)
+                if s is not None:
+                    technicals_out["macd_signal"] = round(float(s), 4)
+                if d is not None:
+                    technicals_out["macd_divergence"] = round(float(d), 4)
 
     # ---------------------------------------------------------------------------
     # CoT Self-Validation: check internal consistency across factors and flag tensions
@@ -821,8 +785,8 @@ def _node_format_json_output(
 
     # Period info
     time_range = "TTM"
-    if bundle and bundle.income:
-        period = bundle.income.get("period") or bundle.income.get("calendarYear")
+    if bundle and bundle.key_metrics_ttm:
+        period = bundle.key_metrics_ttm.get("lastUpdated") or bundle.key_metrics_ttm.get("updatedAt")
         if period:
             time_range = f"TTM (latest: {period})"
 
@@ -841,6 +805,9 @@ def _node_format_json_output(
         "qoq_deltas": qoq_deltas,
         "yoy_deltas": yoy_deltas,
         "cot_validation_notes": cot_validation_notes,
+        "short_interest": short_interest_out,
+        "earnings_surprises": earnings_surprises_out,
+        "technicals": technicals_out,
         "quantitative_summary": quantitative_summary,
         "data_sources": data_sources,
     }
@@ -895,76 +862,50 @@ def _node_execute_python(
 
     return {**state, "output": updated_output}
 
-def build_graph(
+def build_pipeline(
     toolkit: QuantFundamentalToolkit,
     llm: QuantLLMClient,
     config: QuantFundamentalConfig,
 ) -> Any:
-    """Assemble and compile the 8-node LangGraph pipeline."""
-    graph = StateGraph(AgentState)
+    """Assemble the 8-node LangChain pipeline.
+    
+    Returns a Runnable that executes the full pipeline sequentially.
+    """
+    fetch_node = RunnableLambda(lambda s: _node_fetch_financials(cast(AgentState, s), toolkit))
+    cot_node = RunnableLambda(lambda s: _node_chain_of_table_reasoning(cast(AgentState, s)))
+    quality_node = RunnableLambda(lambda s: _node_data_quality_check(cast(AgentState, s), toolkit))
+    value_node = RunnableLambda(lambda s: _node_calculate_value_factors(cast(AgentState, s)))
+    qual_node = RunnableLambda(lambda s: _node_calculate_quality_factors(cast(AgentState, s), toolkit))
+    mom_node = RunnableLambda(lambda s: _node_calculate_momentum_risk(cast(AgentState, s), config))
+    anomaly_node = RunnableLambda(lambda s: _node_flag_anomalies(cast(AgentState, s), toolkit))
+    format_node = RunnableLambda(lambda s: _node_format_json_output(cast(AgentState, s), llm))
 
-    # Register nodes (close over toolkit/llm/config)
-    graph.add_node(
-        "fetch_financials",
-        lambda state: _node_fetch_financials(cast(AgentState, state), toolkit),
+    # Build pipeline: sequential execution
+    pipeline = (
+        fetch_node
+        | cot_node
+        | quality_node
+        | value_node
+        | qual_node
+        | mom_node
+        | anomaly_node
+        | format_node
     )
-    graph.add_node(
-        "chain_of_table_reasoning",
-        lambda state: _node_chain_of_table_reasoning(cast(AgentState, state)),
-    )
-    graph.add_node(
-        "data_quality_check",
-        lambda state: _node_data_quality_check(cast(AgentState, state), toolkit),
-    )
-    graph.add_node(
-        "calculate_value_factors",
-        lambda state: _node_calculate_value_factors(cast(AgentState, state)),
-    )
-    graph.add_node(
-        "calculate_quality_factors",
-        lambda state: _node_calculate_quality_factors(cast(AgentState, state), toolkit),
-    )
-    graph.add_node(
-        "calculate_momentum_risk",
-        lambda state: _node_calculate_momentum_risk(cast(AgentState, state), config),
-    )
-    graph.add_node(
-        "flag_anomalies",
-        lambda state: _node_flag_anomalies(cast(AgentState, state), toolkit),
-    )
-    graph.add_node(
-        "format_json_output",
-        lambda state: _node_format_json_output(cast(AgentState, state), llm),
-    )
-    graph.add_node(
-        "execute_python",
-        lambda state: _node_execute_python(cast(AgentState, state), toolkit),
-    )
+    
+    # Add conditional execution for execute_python
+    def conditional_execute(state: AgentState) -> AgentState:
+        output = state.get("output") or {}
+        if output.get("custom_metric_code"):
+            return _node_execute_python(state, toolkit)
+        return state
+    
+    pipeline = pipeline | RunnableLambda(conditional_execute)
+    
+    return pipeline
 
-    # Entry point
-    graph.set_entry_point("fetch_financials")
 
-    # Linear pipeline — no branching through most nodes
-    graph.add_edge("fetch_financials", "chain_of_table_reasoning")
-    graph.add_edge("chain_of_table_reasoning", "data_quality_check")
-    graph.add_edge("data_quality_check", "calculate_value_factors")
-    graph.add_edge("calculate_value_factors", "calculate_quality_factors")
-    graph.add_edge("calculate_quality_factors", "calculate_momentum_risk")
-    graph.add_edge("calculate_momentum_risk", "flag_anomalies")
-    graph.add_edge("flag_anomalies", "format_json_output")
-    # 3B: Conditional edge — run execute_python only when custom_metric_code present
-    graph.add_conditional_edges(
-        "format_json_output",
-        lambda state: (
-            "execute_python"
-            if (state.get("output") or {}).get("custom_metric_code")
-            else END
-        ),
-        {"execute_python": "execute_python", END: END},
-    )
-    graph.add_edge("execute_python", END)
-
-    return graph.compile()
+# Backwards compatibility alias
+build_graph = build_pipeline
 
 
 # ---------------------------------------------------------------------------
