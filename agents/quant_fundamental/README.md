@@ -63,11 +63,12 @@ ticker (or natural-language prompt)
 fetch_financials          ←  PostgreSQL: raw_fundamentals
                                (ratios_ttm, key_metrics_ttm, financial_scores,
                                 earnings_history, analyst_estimates_eodhd)
+                               financial_statements (quarterly_trends: 5 quarters)
     │
     ▼
 chain_of_table_reasoning  ←  Step 1: SELECT — identify populated tables
                                Step 2: FILTER — extract key numeric fields
-                               Step 3: CALCULATE — derived ratios (gross margin, ROA, FCF)
+                               Step 3: CALCULATE — derived ratios + QoQ/YoY deltas
                                Step 4: RANK — classify quality tier (HIGH / MEDIUM / LOW)
                                Step 5: IDENTIFY — flag data issues
     │
@@ -83,6 +84,8 @@ calculate_quality_factors ←  ROE, ROIC, Piotroski F-Score (9-point), Beneish M
     │
     ▼
 calculate_momentum_risk   ←  Sharpe Ratio (12-month), 12-Month Price Return, Beta (60-day)
+                               SMA-50, SMA-200, Golden/Death Cross
+                               Avg Volume (20d), Volume Ratio
     │
     ▼
 flag_anomalies            ←  Z-score > 2 on gross margin, EBIT margin, ROE → anomaly_flags[]
@@ -129,8 +132,9 @@ No re-computation is performed — this is a presence and range check only.
 |---|---|
 | **Value** | P/E (trailing), EV/EBITDA, P/FCF, EV/Revenue |
 | **Quality** | ROE, ROIC, Piotroski F-Score (0–9), Beneish M-Score |
-| **Momentum / Risk** | Beta (60-day rolling), Sharpe Ratio (12-month), 12-Month Price Return |
+| **Momentum / Risk** | Beta (60-day rolling), Sharpe Ratio (12-month), 12-Month Price Return, SMA-50, SMA-200, Golden/Death Cross, Avg Volume (20d), Volume Ratio |
 | **Key Metrics** | Gross Margin, EBIT Margin, FCF Conversion, DSO Days, Current Ratio, D/E |
+| **Quarterly Trends** | 5 quarters of Revenue, Gross Profit, Operating Income, Net Income with QoQ and YoY % deltas |
 
 ### Piotroski F-Score (9-point)
 
@@ -190,8 +194,9 @@ All data is ingested into **PostgreSQL** via Airflow DAGs. This agent reads from
 | Table | `data_name` values used | Purpose |
 |---|---|---|
 | `raw_fundamentals` | `ratios_ttm`, `key_metrics_ttm`, `financial_scores`, `earnings_history`, `analyst_estimates_eodhd` | Factor computation |
-| `raw_timeseries` | `historical_prices_eod` | Momentum/risk factors (Sharpe, return, beta) |
+| `raw_timeseries` | `historical_prices_eod` | Momentum/risk factors (Sharpe, return, beta, SMA, volume) |
 | `market_eod_us` | EOD prices | Benchmark for beta (populated when benchmark data available) |
+| `financial_statements` | `Income_Statement` (quarterly/yearly) | Quarterly trends, QoQ/YoY deltas |
 
 ### PostgreSQL Schema
 
@@ -236,48 +241,75 @@ All numeric fields are Python-computed from PostgreSQL — never LLM-generated.
 {
   "agent": "quant_fundamental",
   "ticker": "AAPL",
-  "as_of_date": "2026-02-28",
+  "as_of_date": "2026-03-11",
   "time_range": "TTM",
   "value_factors": {
-    "pe_trailing": 33.08,
-    "ev_ebitda": 25.6,
-    "p_fcf": 31.85,
-    "ev_revenue": 9.02
+    "pe_trailing": 32.90,
+    "ev_ebitda": 24.87,
+    "p_fcf": null,
+    "ev_revenue": 8.73
   },
   "quality_factors": {
-    "roe": 1.5994,
-    "roic": 0.5101,
-    "piotroski_f_score": 9,
+    "roe": 1.5202,
+    "roic": 0.5799,
+    "piotroski_f_score": null,
     "beneish_m_score": null,
     "manipulation_risk": null
   },
   "momentum_risk": {
-    "beta_60d": null,
-    "sharpe_ratio_12m": 0.6906,
-    "return_12m_pct": 2.38
+    "beta_60d": 0.8936,
+    "sharpe_ratio_12m": 0.1784,
+    "return_12m_pct": 15.47,
+    "sma_50": 263.64,
+    "sma_200": 244.34,
+    "golden_cross": true,
+    "avg_volume_20d": 44380665.0,
+    "volume_ratio": 0.5949
   },
   "key_metrics": {
     "gross_margin": 0.4733,
-    "ebit_margin": 0.3238,
+    "ebit_margin": 0.3537,
     "fcf_conversion": null,
-    "dso_days": 58.92,
-    "current_ratio": 0.9737,
-    "debt_to_equity": 1.0263
+    "dso_days": null,
+    "current_ratio": null,
+    "debt_to_equity": null
   },
   "anomaly_flags": [],
   "data_quality": {
     "status": "PASSED",
-    "checks_passed": 9,
-    "checks_total": 9,
+    "checks_passed": 8,
+    "checks_total": 8,
     "issues": []
   },
-  "quantitative_summary": "AAPL has a strong quality signal with a Piotroski F-Score of 9 ...",
+  "quarterly_trends": [
+    {"period": "2025-12-31", "revenue": 143756000000.0, "gross_profit": 69231000000.0,
+     "operating_income": 50852000000.0, "net_income": 42097000000.0,
+     "gross_margin": 0.4816, "ebit_margin": 0.3537},
+    {"period": "2025-09-30", ...},
+    {"period": "2025-06-30", ...},
+    {"period": "2025-03-31", ...},
+    {"period": "2024-12-31", ...}
+  ],
+  "qoq_deltas": {
+    "revenue_qoq_pct": 40.3,
+    "gross_profit_qoq_pct": 43.21,
+    "operating_income_qoq_pct": 56.82,
+    "net_income_qoq_pct": 53.27
+  },
+  "yoy_deltas": {
+    "revenue_yoy_pct": 15.65,
+    "gross_profit_yoy_pct": 18.80,
+    "operating_income_yoy_pct": 18.72,
+    "net_income_yoy_pct": 15.87
+  },
+  "quantitative_summary": "AAPL exhibits a golden cross (SMA-50=263.64 > SMA-200=244.34) ...",
   "data_sources": {
     "fundamentals": "postgresql:raw_fundamentals",
     "price_history": "postgresql:raw_timeseries",
     "benchmark": "postgresql:market_eod_us",
+    "quarterly_trends": "postgresql:financial_statements",
     "llm_scope": "quantitative_summary narrative only",
-    "llm_model": "llama3.2:latest"
+    "llm_model": "deepseek-chat"
   }
 }
 ```

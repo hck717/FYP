@@ -47,7 +47,7 @@ class QuantFundamentalConfig:
         default_factory=lambda: float(os.getenv("QUANT_LLM_TEMPERATURE", "0.1"))
     )
     llm_max_tokens: int = field(
-        default_factory=lambda: int(os.getenv("QUANT_LLM_MAX_TOKENS", "4096"))
+        default_factory=lambda: int(os.getenv("QUANT_LLM_MAX_TOKENS", "8192"))
     )
     # Legacy Ollama config (kept for backwards compatibility but not used)
     ollama_base_url: str = field(

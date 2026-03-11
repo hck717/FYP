@@ -50,6 +50,17 @@ def _get_cross_encoder_class():
 logger = logging.getLogger(__name__)
 
 
+def _serialize_value(v: Any) -> Any:
+    """Serialize a value for JSON, handling datetime and other non-serializable types."""
+    if v is None:
+        return None
+    if hasattr(v, 'isoformat'):
+        return v.isoformat()
+    if hasattr(v, '__float__') and not isinstance(v, (str, bool)):
+        return float(v)
+    return v
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Chunk content-quality filter
 # ──────────────────────────────────────────────────────────────────────────────
@@ -426,25 +437,97 @@ class Neo4jConnector:
             return dict(node)
 
     def fetch_graph_facts(self, ticker: Optional[str], limit: int = 25) -> List[Dict[str, Any]]:
+        """Return structured facts from Neo4j for *ticker*.
+
+        Strategy (schema-aware):
+          1. Company node properties → financial highlights, sector, description
+          2. CONTAINS relationships → peer/competitor Company nodes (if any)
+          3. Diverse text chunks → one representative chunk per unique section
+             (description, highlights, valuation, ESG, analyst_ratings, earnings_call, etc.)
+
+        This replaces the old HAS_STRATEGY|HAS_FACT query which returned 0 results
+        because those relationship types do not exist in the current graph schema.
+        """
         if not ticker:
             return []
-        cypher = """
-        MATCH (c:Company {ticker:$ticker})-[r:HAS_STRATEGY|HAS_FACT]->(n)
-        RETURN type(r) AS rel_type, properties(n) AS node_props, properties(r) AS rel_props
-        LIMIT $limit
-        """
+
+        facts: List[Dict[str, Any]] = []
+
         with self.driver.session(database=None) as session:
-            rows = session.run(cypher, ticker=ticker, limit=limit)
-            facts: List[Dict[str, Any]] = []
-            for row in rows:
-                facts.append(
-                    {
-                        "relationship": row["rel_type"],
-                        "node": row["node_props"],
-                        "relationship_properties": row["rel_props"],
+            # ── 1. Company node properties ────────────────────────────────────
+            try:
+                company_row = session.run(
+                    "MATCH (c:Company {ticker: $ticker}) RETURN properties(c) AS props LIMIT 1",
+                    ticker=ticker,
+                ).single()
+                if company_row:
+                    props = dict(company_row["props"])
+                    # Omit embedding vectors and very long string blobs
+                    clean_props = {
+                        k: v for k, v in props.items()
+                        if k != "embedding" and not isinstance(v, (list, bytes))
+                        and (not isinstance(v, str) or len(v) < 2000)
                     }
-                )
-            return facts
+                    if clean_props:
+                        facts.append({
+                            "relationship": "COMPANY_PROFILE",
+                            "node": clean_props,
+                            "relationship_properties": {},
+                        })
+            except Exception as exc:
+                logger.debug("[Neo4j] fetch_graph_facts company props failed for %s: %s", ticker, exc)
+
+            # ── 2. CONTAINS peer relationships (Company → Company) ────────────
+            try:
+                peer_rows = session.run(
+                    """
+                    MATCH (c:Company {ticker: $ticker})-[:CONTAINS]->(peer:Company)
+                    RETURN peer.ticker AS peer_ticker, peer.Name AS peer_name,
+                           peer.Sector AS sector, peer.Industry AS industry
+                    LIMIT 10
+                    """,
+                    ticker=ticker,
+                ).data()
+                for row in peer_rows:
+                    facts.append({
+                        "relationship": "CONTAINS_PEER",
+                        "node": {k: v for k, v in row.items() if v is not None},
+                        "relationship_properties": {},
+                    })
+            except Exception as exc:
+                logger.debug("[Neo4j] fetch_graph_facts peers failed for %s: %s", ticker, exc)
+
+            # ── 3. One chunk per unique section (diverse knowledge coverage) ──
+            try:
+                chunk_rows = session.run(
+                    """
+                    MATCH (ch:Chunk {ticker: $ticker})
+                    WITH ch.section AS section, collect(ch)[0] AS sample_chunk
+                    RETURN section, sample_chunk.text AS text,
+                           sample_chunk.filing_date AS filing_date
+                    ORDER BY section
+                    LIMIT $limit
+                    """,
+                    ticker=ticker,
+                    limit=limit - len(facts),
+                ).data()
+                for row in chunk_rows:
+                    section = row.get("section") or "unknown"
+                    text = row.get("text") or ""
+                    if text:
+                        facts.append({
+                            "relationship": f"HAS_CHUNK::{section}",
+                            "node": {
+                                "section": section,
+                                "text": text[:500],  # truncate for prompt budget
+                                "filing_date": row.get("filing_date"),
+                            },
+                            "relationship_properties": {},
+                        })
+            except Exception as exc:
+                logger.debug("[Neo4j] fetch_graph_facts chunks failed for %s: %s", ticker, exc)
+
+        return facts
 
     def vector_search(
         self,
@@ -612,7 +695,7 @@ class Neo4jConnector:
             rel_parts.append(f"{rel_type} ({count} edges)")
             for node in row.get("sample_nodes") or []:
                 clean = {
-                    k: v for k, v in node.items()
+                    k: _serialize_value(v) for k, v in node.items()
                     if k not in ("embedding", "vector") and v is not None
                 }
                 if clean:
@@ -864,6 +947,26 @@ class PostgresConnector:
         )
 
     def fetch_company_profile(self, ticker: str) -> Optional[Dict]:
+        # First try the new dedicated company_profiles table
+        sql = """
+        SELECT *
+        FROM company_profiles
+        WHERE ticker = %s
+        LIMIT 1
+        """
+        try:
+            conn = self._pg_connect()
+            with closing(conn), conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(sql, (ticker,))
+                row = cur.fetchone()
+            if row:
+                return {k: (float(v) if isinstance(v, (int, float)) and k not in ("ticker", "id") else
+                            str(v) if v is not None else None)
+                        for k, v in dict(row).items()}
+        except Exception as exc:
+            logger.debug("[BA] fetch_company_profile primary query failed for %s: %s", ticker, exc)
+
+        # Fallback to raw_fundamentals data_name='company_profile'
         sql = """
         SELECT payload, as_of_date
         FROM raw_fundamentals
@@ -872,19 +975,158 @@ class PostgresConnector:
         ORDER BY as_of_date DESC
         LIMIT 1
         """
-        conn = self._pg_connect()
-        with closing(conn), conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(sql, (ticker,))
-            row = cur.fetchone()
-        if not row:
-            return None
-        payload = row["payload"]
-        if isinstance(payload, str):
-            try:
-                payload = json.loads(payload)
-            except json.JSONDecodeError:
-                pass
-        return payload if isinstance(payload, dict) else {}
+        try:
+            conn = self._pg_connect()
+            with closing(conn), conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(sql, (ticker,))
+                row = cur.fetchone()
+            if row:
+                payload = row["payload"]
+                if isinstance(payload, str):
+                    try:
+                        payload = json.loads(payload)
+                    except json.JSONDecodeError:
+                        pass
+                if isinstance(payload, dict) and payload:
+                    return payload
+        except Exception as exc:
+            logger.debug("[BA] fetch_company_profile raw_fundamentals fallback failed for %s: %s", ticker, exc)
+
+        # Final fallback: company_profile_neo4j.json General section
+        try:
+            base_dir = os.path.join(
+                os.path.dirname(__file__), "..", "..", "ingestion", "etl", "agent_data", ticker.upper()
+            )
+            neo4j_path = os.path.normpath(os.path.join(base_dir, "company_profile_neo4j.json"))
+            if os.path.exists(neo4j_path):
+                with open(neo4j_path, "r", encoding="utf-8") as f:
+                    neo4j_data = json.load(f)
+                g = neo4j_data.get("General", {})
+                if g:
+                    logger.info("[BA] fetch_company_profile: using company_profile_neo4j.json fallback for %s", ticker)
+                    return {
+                        "ticker":              ticker,
+                        "name":                g.get("Name"),
+                        "exchange":            g.get("Exchange"),
+                        "sector":              g.get("Sector"),
+                        "industry":            g.get("Industry"),
+                        "gic_sector":          g.get("GicSector"),
+                        "description":         g.get("Description"),
+                        "address":             g.get("Address"),
+                        "city":                g.get("AddressData", {}).get("City") if isinstance(g.get("AddressData"), dict) else None,
+                        "state":               g.get("AddressData", {}).get("State") if isinstance(g.get("AddressData"), dict) else None,
+                        "country":             g.get("CountryName") or (g.get("AddressData", {}).get("Country") if isinstance(g.get("AddressData"), dict) else None),
+                        "phone":               g.get("Phone"),
+                        "web_url":             g.get("WebURL"),
+                        "full_time_employees": g.get("FullTimeEmployees"),
+                        "fiscal_year_end":     g.get("FiscalYearEnd"),
+                        "ipo_date":            g.get("IPODate"),
+                        "currency":            g.get("CurrencyCode"),
+                        "isin":                g.get("ISIN"),
+                        "cusip":               g.get("CUSIP"),
+                        "cik":                 g.get("CIK"),
+                        "is_delisted":         False,
+                    }
+        except Exception as exc:
+            logger.debug("[BA] fetch_company_profile neo4j json fallback failed for %s: %s", ticker, exc)
+        return None
+
+    def fetch_analyst_ratings(self, ticker: str) -> Optional[Dict]:
+        """Fetch latest analyst ratings for the ticker.
+
+        Falls back to raw_fundamentals data_name='analyst_ratings', then to
+        company_profile_neo4j.json AnalystRatings section.
+        """
+        sql = """
+        SELECT *
+        FROM analyst_ratings
+        WHERE ticker = %s
+        ORDER BY as_of_date DESC
+        LIMIT 1
+        """
+        try:
+            conn = self._pg_connect()
+            with closing(conn), conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(sql, (ticker,))
+                row = cur.fetchone()
+            if row:
+                return {k: (float(v) if isinstance(v, (int, float)) and k not in ("ticker", "id") else
+                            str(v) if v is not None else None)
+                        for k, v in dict(row).items()}
+        except Exception as exc:
+            logger.debug("[BA] fetch_analyst_ratings primary query failed for %s: %s", ticker, exc)
+
+        # Fallback 1: raw_fundamentals data_name='analyst_ratings'
+        sql = """
+        SELECT payload, as_of_date
+        FROM raw_fundamentals
+        WHERE ticker_symbol = %s
+          AND data_name = 'analyst_ratings'
+        ORDER BY as_of_date DESC
+        LIMIT 1
+        """
+        try:
+            conn = self._pg_connect()
+            with closing(conn), conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(sql, (ticker,))
+                row = cur.fetchone()
+            if row:
+                payload = row["payload"]
+                if isinstance(payload, str):
+                    try:
+                        payload = json.loads(payload)
+                    except json.JSONDecodeError:
+                        pass
+                if isinstance(payload, dict) and payload:
+                    logger.info("[BA] fetch_analyst_ratings: using raw_fundamentals fallback for %s", ticker)
+                    def _fn(x):
+                        try:
+                            return float(x) if x is not None else None
+                        except (TypeError, ValueError):
+                            return None
+                    return {
+                        "ticker":           ticker,
+                        "rating":           _fn(payload.get("Rating")),
+                        "target_price":     _fn(payload.get("TargetPrice")),
+                        "strong_buy_count": _fn(payload.get("StrongBuy")),
+                        "buy_count":        _fn(payload.get("Buy")),
+                        "hold_count":       _fn(payload.get("Hold")),
+                        "sell_count":       _fn(payload.get("Sell")),
+                        "strong_sell_count": _fn(payload.get("StrongSell")),
+                    }
+        except Exception as exc:
+            logger.debug("[BA] fetch_analyst_ratings raw_fundamentals fallback failed for %s: %s", ticker, exc)
+
+        # Fallback 2: company_profile_neo4j.json AnalystRatings section
+        try:
+            base_dir = os.path.join(
+                os.path.dirname(__file__), "..", "..", "ingestion", "etl", "agent_data", ticker.upper()
+            )
+            neo4j_path = os.path.normpath(os.path.join(base_dir, "company_profile_neo4j.json"))
+            if os.path.exists(neo4j_path):
+                with open(neo4j_path, "r", encoding="utf-8") as f:
+                    neo4j_data = json.load(f)
+                ar = neo4j_data.get("AnalystRatings", {})
+                if ar:
+                    logger.info("[BA] fetch_analyst_ratings: using company_profile_neo4j.json fallback for %s", ticker)
+                    def _fn(x):
+                        try:
+                            return float(x) if x is not None else None
+                        except (TypeError, ValueError):
+                            return None
+                    return {
+                        "ticker":           ticker,
+                        "rating":           _fn(ar.get("Rating")),
+                        "target_price":     _fn(ar.get("TargetPrice")),
+                        "strong_buy_count": _fn(ar.get("StrongBuy")),
+                        "buy_count":        _fn(ar.get("Buy")),
+                        "hold_count":       _fn(ar.get("Hold")),
+                        "sell_count":       _fn(ar.get("Sell")),
+                        "strong_sell_count": _fn(ar.get("StrongSell")),
+                    }
+        except Exception as exc:
+            logger.debug("[BA] fetch_analyst_ratings neo4j json fallback failed for %s: %s", ticker, exc)
+        return None
 
     def fetch_news(self, ticker: str, limit: int = 20) -> List[Dict]:
         sql = """
@@ -1124,6 +1366,95 @@ def _rrf_fuse(
             )
         )
     return result
+
+
+def _apply_time_decay(chunks: List[Chunk], lambda_: float) -> List[Chunk]:
+    """Apply exponential time-decay to chunk scores based on filing_date metadata.
+
+    Decay multiplier = exp(-lambda_ * age_days / 365).  Chunks with no
+    parseable date are left unchanged (neutral multiplier of 1.0).
+
+    Returns a new sorted list (highest score first).
+    """
+    if lambda_ <= 0.0:
+        return chunks
+    now = datetime.now(timezone.utc).date()
+    result: List[Chunk] = []
+    for chunk in chunks:
+        filing_date_raw = (chunk.metadata or {}).get("filing_date")
+        decay = 1.0
+        if filing_date_raw:
+            try:
+                if hasattr(filing_date_raw, "year"):  # already a date/datetime
+                    fd = filing_date_raw if not hasattr(filing_date_raw, "date") else filing_date_raw.date()
+                else:
+                    fd = datetime.fromisoformat(str(filing_date_raw)[:10]).date()
+                age_days = max((now - fd).days, 0)
+                decay = math.exp(-lambda_ * age_days / 365.0)
+            except Exception:
+                pass  # unparseable date — no penalty
+        result.append(
+            Chunk(
+                chunk_id=chunk.chunk_id,
+                text=chunk.text,
+                score=chunk.score * decay,
+                source=chunk.source,
+                metadata=chunk.metadata,
+            )
+        )
+    result.sort(key=lambda c: -c.score)
+    return result
+
+
+def _mmr_select(
+    chunks: List[Chunk],
+    final_k: int,
+    mmr_lambda: float,
+) -> List[Chunk]:
+    """Maximal Marginal Relevance selection using TF-IDF bag-of-words similarity.
+
+    mmr_lambda=1.0 → pure relevance (equivalent to top-k by score).
+    mmr_lambda=0.0 → pure diversity.
+
+    Uses normalised unigram token overlap as a fast proxy for cosine similarity
+    (no embedding call required).
+    """
+    if mmr_lambda >= 1.0 or len(chunks) <= final_k:
+        return chunks[:final_k]
+
+    def _token_set(text: str) -> set:
+        return set(_re_top.findall(r"\b\w+\b", text.lower()))
+
+    def _jaccard(a: set, b: set) -> float:
+        union = a | b
+        return len(a & b) / len(union) if union else 0.0
+
+    token_sets = [_token_set(c.text) for c in chunks]
+    selected: List[Chunk] = []
+    selected_indices: List[int] = []
+    remaining = list(range(len(chunks)))
+
+    while len(selected) < final_k and remaining:
+        if not selected_indices:
+            # First pick: highest relevance score
+            best_idx = max(remaining, key=lambda i: chunks[i].score)
+        else:
+            best_score = float("-inf")
+            best_idx = remaining[0]
+            for i in remaining:
+                relevance = chunks[i].score
+                max_sim = max(
+                    _jaccard(token_sets[i], token_sets[j]) for j in selected_indices
+                )
+                mmr = mmr_lambda * relevance - (1.0 - mmr_lambda) * max_sim
+                if mmr > best_score:
+                    best_score = mmr
+                    best_idx = i
+        selected.append(chunks[best_idx])
+        selected_indices.append(best_idx)
+        remaining.remove(best_idx)
+
+    return selected
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1506,14 +1837,32 @@ class BusinessAnalystToolkit:
 
         ranked_lists = [neo4j_chunks, pgvec_chunks, bm25_ranked, ce_ranked]
         fused = _rrf_fuse([lst for lst in ranked_lists if lst], k=60)
-        fused = fused[:final_k]
+
+        # ── Time-decay re-ranking ──────────────────────────────────────────────
+        # Penalise older chunks by exp(-lambda * age_days / 365) before final cut.
+        fused = _apply_time_decay(fused, self.config.time_decay_lambda)
+        logger.debug(
+            "[MultiStage] Time-decay applied (lambda=%.2f); top score after decay=%.3f",
+            self.config.time_decay_lambda,
+            fused[0].score if fused else 0.0,
+        )
+
+        # ── MMR selection ─────────────────────────────────────────────────────
+        # Replace naive top-k cut with Maximal Marginal Relevance to reduce
+        # redundant chunks and increase topical diversity in final result.
+        fused = _mmr_select(fused, final_k, self.config.mmr_lambda)
+        logger.debug(
+            "[MultiStage] MMR selected %d/%d chunks (mmr_lambda=%.2f)",
+            len(fused), final_k, self.config.mmr_lambda,
+        )
 
         # Section-diversity guarantee: ensure at least min_chunks_per_section
-        # chunks from each key section (earnings_call, broker_report) appear in
-        # the final result, even when their RRF scores are lower than other sections.
+        # chunks from each key section (earnings_call, broker_report, 10-K,
+        # annual_report) appear in the final result, even when their RRF scores
+        # are lower than other sections.
         _min_sec = self.config.min_chunks_per_section
         if _min_sec > 0 and recall_pool:
-            _key_sections = ("earnings_call", "broker_report")
+            _key_sections = ("earnings_call", "broker_report", "10-K", "annual_report")
             _fused_ids = {c.chunk_id for c in fused}
             _section_counts: Dict[str, int] = {}
             for c in fused:

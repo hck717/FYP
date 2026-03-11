@@ -173,6 +173,11 @@ def node_planner(state: OrchestrationState) -> OrchestrationState:
 
     plan = plan_query(user_query)
 
+    # Extract and remove the thinking trace from the plan dict (it's metadata, not routing data)
+    planner_trace: str = plan.pop("planner_trace", "") or ""
+    if planner_trace:
+        logger.info("[planner] Thinking trace captured (%d chars).", len(planner_trace))
+
     # --- resolve tickers ---------------------------------------------------
     # The planner LLM may return a single ticker or a list in the "tickers"
     # field for comparison queries.  We also run the QF agent's own multi-
@@ -266,6 +271,7 @@ def node_planner(state: OrchestrationState) -> OrchestrationState:
         "run_financial_modelling": run_fm,
         "data_availability": data_availability,
         "episodic_hints": episodic_hints,
+        "planner_trace": planner_trace,
         "react_steps": [],
         "react_iteration": 0,
         "react_max_iterations": react_max,
@@ -971,6 +977,7 @@ def node_summarizer(state: OrchestrationState) -> OrchestrationState:
         logger.warning("[summarizer] financial_modelling was enabled but produced no output — "
                        "check agent_errors for crash details.")
 
+    summarizer_trace_out: List[str] = []
     final_summary = summarise_results(
         user_query=user_query,
         tickers=tickers,
@@ -979,7 +986,11 @@ def node_summarizer(state: OrchestrationState) -> OrchestrationState:
         web_outputs=web_outputs,
         fm_outputs=fm_outputs,
         data_availability=data_availability,
+        _trace_out=summarizer_trace_out,
     )
+    summarizer_trace: str = summarizer_trace_out[0] if summarizer_trace_out else ""
+    if summarizer_trace:
+        logger.info("[summarizer] Thinking trace captured (%d chars).", len(summarizer_trace))
 
     output: Dict[str, Any] = {
         "user_query": user_query,
@@ -999,9 +1010,11 @@ def node_summarizer(state: OrchestrationState) -> OrchestrationState:
         "financial_modelling_output": fm_outputs[0] if fm_outputs else None,
         "agent_errors": errors,
         "final_summary": final_summary,
+        "planner_trace": state.get("planner_trace", ""),
+        "summarizer_trace": summarizer_trace,
     }
 
-    return {**state, "final_summary": final_summary, "output": output}
+    return {**state, "final_summary": final_summary, "summarizer_trace": summarizer_trace, "output": output}
 
 
 # ── Node 8: Episodic Memory Update ───────────────────────────────────────────

@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
 from contextlib import closing
 from typing import Any, Dict, List, Optional
 
@@ -19,7 +20,7 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 
 from .config import QuantFundamentalConfig
-from .schema import DataQualityCheck, FinancialsBundle, QualityStatus
+from .schema import DataQualityCheck, FinancialsBundle, QualityStatus, QuarterlyPeriod
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +48,11 @@ ALLOWED_DATA_TYPES = [
     # Basic fundamentals
     "key_metrics_ttm",
     "ratios_ttm",
+    # Financial statements — required for Piotroski/Beneish/Altman/ROIC/DSO/DPO/DIO
+    "financial_statements",
+    "income_statement",
+    "balance_sheet",
+    "cash_flow",
     # Short interest & shares stats
     "short_interest",
     "shares_stats",
@@ -428,6 +434,9 @@ class PostgresConnector:
         Returns fields: trailing_pe, forward_pe, price_sales_ttm, price_book_mrq,
         enterprise_value, ev_revenue, ev_ebitda, market_cap, ebitda, pe_ratio,
         peg_ratio, eps, profit_margin, operating_margin, roa, roe, revenue_ttm, etc.
+
+        Falls back to company_profile_neo4j.json Highlights + Valuation sections when
+        the valuation_metrics table is empty or all-NULL.
         """
         sql = """
         SELECT *
@@ -440,11 +449,236 @@ class PostgresConnector:
         with closing(conn), conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(sql, (ticker,))
             row = cur.fetchone()
-            if not row:
-                return None
-            return {k: (float(v) if isinstance(v, (int, float)) and k not in ("ticker", "id") else
-                        str(v) if v is not None else None)
-                    for k, v in dict(row).items()}
+            if row:
+                result = {k: (float(v) if isinstance(v, (int, float)) and k not in ("ticker", "id") else
+                              str(v) if v is not None else None)
+                          for k, v in dict(row).items()}
+                # Check if the row has any real values (not all None/null)
+                value_fields = [k for k in result if k not in ("ticker", "id", "as_of_date", "ingested_at")]
+                has_values = any(result.get(k) is not None for k in value_fields)
+                if has_values:
+                    return result
+
+        # Fallback: company_profile_neo4j.json Highlights + Valuation sections
+        try:
+            import os
+            base_dir = os.path.join(
+                os.path.dirname(__file__), "..", "..", "ingestion", "etl", "agent_data", ticker.upper()
+            )
+            neo4j_path = os.path.normpath(os.path.join(base_dir, "company_profile_neo4j.json"))
+            if os.path.exists(neo4j_path):
+                with open(neo4j_path, "r", encoding="utf-8") as f:
+                    neo4j_data = json.load(f)
+                h = neo4j_data.get("Highlights", {})
+                v = neo4j_data.get("Valuation", {})
+                if h or v:
+                    logger.info("[QF] fetch_valuation_metrics: using company_profile_neo4j.json fallback for %s", ticker)
+                    return {
+                        "ticker": ticker,
+                        # From Valuation section (most accurate)
+                        "trailing_pe":      _safe_float(v.get("TrailingPE") or h.get("PERatio")),
+                        "forward_pe":       _safe_float(v.get("ForwardPE")),
+                        "price_sales_ttm":  _safe_float(v.get("PriceSalesTTM")),
+                        "price_book_mrq":   _safe_float(v.get("PriceBookMRQ")),
+                        "enterprise_value": _safe_float(v.get("EnterpriseValue")),
+                        "ev_revenue":       _safe_float(v.get("EnterpriseValueRevenue")),
+                        "ev_ebitda":        _safe_float(v.get("EnterpriseValueEbitda")),
+                        # From Highlights section
+                        "market_cap":       _safe_float(h.get("MarketCapitalization")),
+                        "ebitda":           _safe_float(h.get("EBITDA")),
+                        "pe_ratio":         _safe_float(h.get("PERatio") or v.get("TrailingPE")),
+                        "peg_ratio":        _safe_float(h.get("PEGRatio")),
+                        "eps":              _safe_float(h.get("EarningsShare")),
+                        "profit_margin":    _safe_float(h.get("ProfitMargin")),
+                        "operating_margin": _safe_float(h.get("OperatingMarginTTM")),
+                        "roa":              _safe_float(h.get("ReturnOnAssetsTTM")),
+                        "roe":              _safe_float(h.get("ReturnOnEquityTTM")),
+                        "revenue_ttm":      _safe_float(h.get("RevenueTTM")),
+                        "book_value":       _safe_float(h.get("BookValue")),
+                        "dividend_share":   _safe_float(h.get("DividendShare")),
+                        "dividend_yield":   _safe_float(h.get("DividendYield")),
+                        "wall_st_target":   _safe_float(h.get("WallStreetTargetPrice")),
+                        "as_of_date":       None,
+                    }
+        except Exception as exc:
+            logger.debug("[QF] fetch_valuation_metrics neo4j json fallback failed for %s: %s", ticker, exc)
+
+        return None
+
+    def fetch_analyst_ratings(self, ticker: str) -> Optional[Dict]:
+        """Fetch latest analyst ratings for the ticker.
+
+        Returns fields: rating, target_price, strong_buy_count, buy_count,
+        hold_count, sell_count, strong_sell_count, total_analysts, as_of_date
+
+        Falls back to raw_fundamentals (data_name='analyst_ratings') when the
+        dedicated analyst_ratings table is empty, and further falls back to
+        company_profile_neo4j.json AnalystRatings section.
+        """
+        sql = """
+        SELECT *
+        FROM analyst_ratings
+        WHERE ticker = %s
+        ORDER BY as_of_date DESC
+        LIMIT 1
+        """
+        conn = self._connect()
+        with closing(conn), conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, (ticker,))
+            row = cur.fetchone()
+            if row:
+                return {k: (float(v) if isinstance(v, (int, float)) and k not in ("ticker", "id") else
+                            str(v) if v is not None else None)
+                        for k, v in dict(row).items()}
+
+        # Fallback 1: raw_fundamentals with data_name='analyst_ratings'
+        try:
+            sql2 = """
+            SELECT payload, as_of_date
+            FROM raw_fundamentals
+            WHERE ticker_symbol = %s
+              AND data_name = 'analyst_ratings'
+            ORDER BY as_of_date DESC
+            LIMIT 1
+            """
+            conn2 = self._connect()
+            with closing(conn2), conn2.cursor(cursor_factory=RealDictCursor) as cur2:
+                cur2.execute(sql2, (ticker,))
+                row2 = cur2.fetchone()
+            if row2:
+                payload = row2["payload"]
+                if isinstance(payload, str):
+                    try:
+                        payload = json.loads(payload)
+                    except json.JSONDecodeError:
+                        payload = {}
+                if isinstance(payload, dict) and payload:
+                    strong_buy = _safe_float(payload.get("StrongBuy"))
+                    buy = _safe_float(payload.get("Buy"))
+                    hold = _safe_float(payload.get("Hold"))
+                    sell = _safe_float(payload.get("Sell"))
+                    strong_sell = _safe_float(payload.get("StrongSell"))
+                    total = sum(x for x in [strong_buy, buy, hold, sell, strong_sell] if x is not None)
+                    logger.info("[QF] fetch_analyst_ratings: using raw_fundamentals fallback for %s", ticker)
+                    return {
+                        "ticker": ticker,
+                        "rating": _safe_float(payload.get("Rating")),
+                        "target_price": _safe_float(payload.get("TargetPrice")),
+                        "strong_buy_count": strong_buy,
+                        "buy_count": buy,
+                        "hold_count": hold,
+                        "sell_count": sell,
+                        "strong_sell_count": strong_sell,
+                        "total_analysts": total if total > 0 else None,
+                        "as_of_date": str(row2["as_of_date"]),
+                    }
+        except Exception as exc:
+            logger.debug("[QF] fetch_analyst_ratings raw_fundamentals fallback failed for %s: %s", ticker, exc)
+
+        # Fallback 2: company_profile_neo4j.json AnalystRatings section
+        try:
+            import os
+            base_dir = os.path.join(
+                os.path.dirname(__file__), "..", "..", "ingestion", "etl", "agent_data", ticker.upper()
+            )
+            neo4j_path = os.path.normpath(os.path.join(base_dir, "company_profile_neo4j.json"))
+            if os.path.exists(neo4j_path):
+                with open(neo4j_path, "r", encoding="utf-8") as f:
+                    neo4j_data = json.load(f)
+                ar = neo4j_data.get("AnalystRatings", {})
+                if ar:
+                    strong_buy = _safe_float(ar.get("StrongBuy"))
+                    buy = _safe_float(ar.get("Buy"))
+                    hold = _safe_float(ar.get("Hold"))
+                    sell = _safe_float(ar.get("Sell"))
+                    strong_sell = _safe_float(ar.get("StrongSell"))
+                    total = sum(x for x in [strong_buy, buy, hold, sell, strong_sell] if x is not None)
+                    logger.info("[QF] fetch_analyst_ratings: using company_profile_neo4j.json fallback for %s", ticker)
+                    return {
+                        "ticker": ticker,
+                        "rating": _safe_float(ar.get("Rating")),
+                        "target_price": _safe_float(ar.get("TargetPrice")),
+                        "strong_buy_count": strong_buy,
+                        "buy_count": buy,
+                        "hold_count": hold,
+                        "sell_count": sell,
+                        "strong_sell_count": strong_sell,
+                        "total_analysts": total if total > 0 else None,
+                        "as_of_date": None,
+                    }
+        except Exception as exc:
+            logger.debug("[QF] fetch_analyst_ratings neo4j json fallback failed for %s: %s", ticker, exc)
+
+        return None
+
+    def fetch_company_profile(self, ticker: str) -> Optional[Dict]:
+        """Fetch company profile for the ticker.
+
+        Returns fields: name, exchange, sector, industry, description, address,
+        city, state, country, phone, web_url, full_time_employees, etc.
+
+        Falls back to company_profile_neo4j.json when the dedicated
+        company_profiles table is empty.
+        """
+        sql = """
+        SELECT *
+        FROM company_profiles
+        WHERE ticker = %s
+        LIMIT 1
+        """
+        conn = self._connect()
+        with closing(conn), conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, (ticker,))
+            row = cur.fetchone()
+            if row:
+                return {k: (float(v) if isinstance(v, (int, float)) and k not in ("ticker", "id") else
+                            str(v) if v is not None else None)
+                        for k, v in dict(row).items()}
+
+        # Fallback: company_profile_neo4j.json General section
+        try:
+            import os
+            base_dir = os.path.join(
+                os.path.dirname(__file__), "..", "..", "ingestion", "etl", "agent_data", ticker.upper()
+            )
+            neo4j_path = os.path.normpath(os.path.join(base_dir, "company_profile_neo4j.json"))
+            if os.path.exists(neo4j_path):
+                with open(neo4j_path, "r", encoding="utf-8") as f:
+                    neo4j_data = json.load(f)
+                g = neo4j_data.get("General", {})
+                if g:
+                    addr = g.get("AddressData") or {}
+                    logger.info("[QF] fetch_company_profile: using company_profile_neo4j.json fallback for %s", ticker)
+                    return {
+                        "ticker": ticker,
+                        "name": g.get("Name"),
+                        "exchange": g.get("Exchange"),
+                        "sector": g.get("Sector"),
+                        "industry": g.get("Industry"),
+                        "gic_sector": g.get("GicSector"),
+                        "gic_group": g.get("GicGroup"),
+                        "gic_industry": g.get("GicIndustry"),
+                        "description": g.get("Description"),
+                        "address": g.get("Address"),
+                        "city": addr.get("City"),
+                        "state": addr.get("State"),
+                        "country": addr.get("Country"),
+                        "zip": addr.get("ZIP"),
+                        "phone": g.get("Phone"),
+                        "web_url": g.get("WebURL"),
+                        "full_time_employees": _safe_float(g.get("FullTimeEmployees")),
+                        "fiscal_year_end": g.get("FiscalYearEnd"),
+                        "ipo_date": g.get("IPODate"),
+                        "currency": g.get("CurrencyCode"),
+                        "isin": g.get("ISIN"),
+                        "cusip": g.get("CUSIP"),
+                        "cik": g.get("CIK"),
+                        "is_delisted": g.get("IsDelisted"),
+                    }
+        except Exception as exc:
+            logger.debug("[QF] fetch_company_profile neo4j json fallback failed for %s: %s", ticker, exc)
+
+        return None
 
     def fetch_financial_statements(
         self,
@@ -503,6 +737,70 @@ class PostgresConnector:
             result.setdefault(st, []).append(entry)
             counts[st] = counts.get(st, 0) + 1
         return result
+
+    def fetch_quarterly_trends(self, ticker: str, limit: int = 5) -> List[QuarterlyPeriod]:
+        """Fetch the last `limit` quarters from financial_statements (Income_Statement) and
+        return a list of QuarterlyPeriod objects sorted newest-first.
+
+        Uses totalRevenue, grossProfit, operatingIncome, netIncome from the payload.
+        Computes gross_margin and ebit_margin as derived ratios.
+        """
+        sql = """
+        SELECT report_date, payload
+        FROM financial_statements
+        WHERE ticker = %s
+          AND statement_type = 'Income_Statement'
+          AND period_type = 'quarterly'
+        ORDER BY report_date DESC
+        LIMIT %s
+        """
+        conn = self._connect()
+        with closing(conn), conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, (ticker, limit))
+            rows = cur.fetchall()
+
+        periods: List[QuarterlyPeriod] = []
+        for row in rows:
+            payload = row["payload"] or {}
+            if isinstance(payload, str):
+                try:
+                    payload = json.loads(payload)
+                except Exception:
+                    payload = {}
+
+            def _f(v: Any) -> Optional[float]:
+                try:
+                    return float(v) if v is not None else None
+                except (TypeError, ValueError):
+                    return None
+
+            report_date = str(row["report_date"])
+            revenue = _f(payload.get("totalRevenue") or payload.get("revenue"))
+            gross_profit = _f(payload.get("grossProfit"))
+            op_income = _f(payload.get("operatingIncome"))
+            net_income = _f(payload.get("netIncome"))
+            eps_diluted = _f(
+                payload.get("dilutedEPS")
+                or payload.get("epsDiluted")
+                or payload.get("eps")
+            )
+            gross_margin = (
+                round(gross_profit / revenue, 4) if gross_profit and revenue and revenue > 0 else None
+            )
+            ebit_margin = (
+                round(op_income / revenue, 4) if op_income and revenue and revenue > 0 else None
+            )
+            periods.append(QuarterlyPeriod(
+                period=report_date,
+                revenue=revenue,
+                gross_profit=gross_profit,
+                operating_income=op_income,
+                net_income=net_income,
+                eps_diluted=eps_diluted,
+                gross_margin=gross_margin,
+                ebit_margin=ebit_margin,
+            ))
+        return periods  # newest-first
 
     def fetch_basic_fundamentals(self, ticker: str) -> Dict:
         """Fetch basic fundamentals snapshot for the ticker from raw_fundamentals.
@@ -611,6 +909,35 @@ class FinancialDataFetcher:
         except Exception as exc:
             logger.warning("Failed to fetch key_metrics_ttm for %s: %s", ticker, exc)
 
+        # Fallback: synthesize key_metrics_ttm from company_profile_neo4j.json Highlights
+        if not bundle.key_metrics_ttm:
+            try:
+                base_dir = os.path.join(
+                    os.path.dirname(__file__), "..", "..", "ingestion", "etl", "agent_data", ticker.upper()
+                )
+                neo4j_path = os.path.normpath(os.path.join(base_dir, "company_profile_neo4j.json"))
+                if os.path.exists(neo4j_path):
+                    with open(neo4j_path, "r", encoding="utf-8") as f:
+                        neo4j_data = json.load(f)
+                    h = neo4j_data.get("Highlights", {})
+                    if h:
+                        bundle.key_metrics_ttm = {
+                            "ReturnOnEquityTTM": h.get("ReturnOnEquityTTM"),
+                            "ReturnOnAssetsTTM": h.get("ReturnOnAssetsTTM"),
+                            "OperatingMarginTTM": h.get("OperatingMarginTTM"),
+                            "ProfitMargin": h.get("ProfitMargin"),
+                            "PERatio": h.get("PERatio"),
+                            "RevenueTTM": h.get("RevenueTTM"),
+                            "marketCapTTM": h.get("MarketCapitalization"),
+                            "EarningsShare": h.get("EarningsShare"),
+                            "DividendYield": h.get("DividendYield"),
+                            "QuarterlyRevenueGrowthYOY": h.get("QuarterlyRevenueGrowthYOY"),
+                            "QuarterlyEarningsGrowthYOY": h.get("QuarterlyEarningsGrowthYOY"),
+                        }
+                        logger.info("[QF] fetch key_metrics_ttm: using company_profile_neo4j.json fallback for %s", ticker)
+            except Exception as exc:
+                logger.debug("[QF] key_metrics_ttm neo4j json fallback failed for %s: %s", ticker, exc)
+
         # === ALLOWED DATA: ratios_ttm ===
         try:
             bundle.ratios_ttm = self._latest_payload(ticker, "ratios_ttm")
@@ -618,6 +945,35 @@ class FinancialDataFetcher:
             logger.warning("[QF] ratios_ttm not in allowed data types for %s", ticker)
         except Exception as exc:
             logger.warning("Failed to fetch ratios_ttm for %s: %s", ticker, exc)
+
+        # Fallback: synthesize ratios_ttm from company_profile_neo4j.json Highlights
+        if not bundle.ratios_ttm:
+            try:
+                base_dir = os.path.join(
+                    os.path.dirname(__file__), "..", "..", "ingestion", "etl", "agent_data", ticker.upper()
+                )
+                neo4j_path = os.path.normpath(os.path.join(base_dir, "company_profile_neo4j.json"))
+                if os.path.exists(neo4j_path):
+                    with open(neo4j_path, "r", encoding="utf-8") as f:
+                        neo4j_data = json.load(f)
+                    h = neo4j_data.get("Highlights", {})
+                    v = neo4j_data.get("Valuation", {})
+                    if h or v:
+                        bundle.ratios_ttm = {
+                            "ReturnOnEquityTTM": h.get("ReturnOnEquityTTM"),
+                            "ReturnOnAssetsTTM": h.get("ReturnOnAssetsTTM"),
+                            "OperatingMarginTTM": h.get("OperatingMarginTTM"),
+                            "ProfitMargin": h.get("ProfitMargin"),
+                            "PERatio": h.get("PERatio"),
+                            "PriceSalesTTM": v.get("PriceSalesTTM"),
+                            "PriceBookMRQ": v.get("PriceBookMRQ"),
+                            "TrailingPE": v.get("TrailingPE"),
+                            "ForwardPE": v.get("ForwardPE"),
+                            "DividendYield": h.get("DividendYield"),
+                        }
+                        logger.info("[QF] fetch ratios_ttm: using company_profile_neo4j.json fallback for %s", ticker)
+            except Exception as exc:
+                logger.debug("[QF] ratios_ttm neo4j json fallback failed for %s: %s", ticker, exc)
 
         # === ALLOWED DATA: earnings_surprises ===
         try:
@@ -694,6 +1050,49 @@ class FinancialDataFetcher:
             bundle.technicals = tech_rows
         except Exception as exc:
             logger.warning("Failed to fetch technical indicators for %s: %s", ticker, exc)
+
+        # === Analyst Ratings (dedicated table) ===
+        try:
+            ar = self.pg.fetch_analyst_ratings(ticker)
+            if ar:
+                bundle.analyst_ratings = ar
+        except Exception as exc:
+            logger.warning("Failed to fetch analyst_ratings for %s: %s", ticker, exc)
+
+        # === Financial Statements (now ALLOWED — needed for Piotroski/Beneish/Altman/ROIC) ===
+        try:
+            stmts = self.pg.fetch_financial_statements(ticker, limit=4)
+            # Prefer annual statements; fallback to quarterly
+            def _best_stmt(rows: List[Dict]) -> Dict:
+                if not rows:
+                    return {}
+                annual = [r for r in rows if (r.get("period_type") or "").lower() in ("annual", "yearly", "fy")]
+                chosen = annual[0] if annual else rows[0]
+                p = chosen.get("payload")
+                return p if isinstance(p, dict) else {}
+
+            inc_rows = stmts.get("Income_Statement", [])
+            bal_rows = stmts.get("Balance_Sheet", [])
+            cf_rows  = stmts.get("Cash_Flow", [])
+            bundle.income    = _best_stmt(inc_rows)
+            bundle.balance   = _best_stmt(bal_rows)
+            bundle.cashflow  = _best_stmt(cf_rows)
+            # Keep prev-period rows for Piotroski YoY deltas
+            bundle.income_prev  = _best_stmt(inc_rows[1:]) if len(inc_rows) > 1 else {}
+            bundle.balance_prev = _best_stmt(bal_rows[1:]) if len(bal_rows) > 1 else {}
+            bundle.cf_prev      = _best_stmt(cf_rows[1:])  if len(cf_rows) > 1  else {}
+            logger.info(
+                "[QF] financial_statements for %s: IS=%d  BS=%d  CF=%d",
+                ticker, len(inc_rows), len(bal_rows), len(cf_rows),
+            )
+            # Build quarterly trends for QoQ/YoY analysis
+            try:
+                qt_rows = self.pg.fetch_quarterly_trends(ticker, limit=5)
+                bundle.quarterly_trends = qt_rows
+            except Exception as qt_exc:
+                logger.warning("Failed to fetch quarterly_trends for %s: %s", ticker, qt_exc)
+        except Exception as exc:
+            logger.warning("Failed to fetch financial_statements for %s: %s", ticker, exc)
 
         # === Benchmark price history (S&P 500 from market_eod_us) ===
         try:

@@ -32,11 +32,11 @@ Returned structure
     "timeseries_tickers": [str, ...],    # distinct ticker_symbols in raw_timeseries
     "market_eod_rows": int,              # rows in market_eod_us
   },
-  "ollama": {
+  "deepseek": {
     "reachable": bool,
     "available_models": [str, ...],
-    "embedding_model_ready": bool,       # all-MiniLM-L6-v2 (local ST, always True if installed)
-    "llm_model_ready": bool,             # deepseek-r1:8b or configured model
+    "embedding_model_ready": bool,       # sentence-transformers (local)
+    "llm_model_ready": bool,             # deepseek-reasoner or configured model
   },
   "tickers_fully_ready": [str, ...],     # tickers with neo4j chunks + pg fundamentals
   "tickers_partially_ready": [str, ...], # tickers with >=1 data source
@@ -57,21 +57,36 @@ import requests
 
 logger = logging.getLogger(__name__)
 
+# Load .env so env vars are available even when not set in the shell (e.g.
+# when this module is imported before any agent has had a chance to call
+# load_dotenv itself).
+try:
+    from dotenv import load_dotenv as _load_dotenv
+    _load_dotenv(Path(__file__).resolve().parents[1] / ".env", override=False)
+except ImportError:
+    pass  # python-dotenv not installed — rely on env vars being set externally
+
+# Determine if running inside Docker
+_IN_DOCKER = Path("/.dockerenv").exists()
+
 # ── defaults (mirror agents/business_analyst/config.py) ────────────────────
-_NEO4J_URI      = os.getenv("NEO4J_URI",            "bolt://localhost:7687")
+_NEO4J_URI      = os.getenv("NEO4J_URI",            "bolt://localhost:7687" if not _IN_DOCKER else "bolt://neo4j:7687")
 _NEO4J_USER     = os.getenv("NEO4J_USER",            "neo4j")
 _NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD",        "SecureNeo4jPass2025!")
-_PG_HOST        = os.getenv("POSTGRES_HOST",         "localhost")
+_PG_HOST        = os.getenv("POSTGRES_HOST",         "localhost" if not _IN_DOCKER else "postgres")
 _PG_PORT        = int(os.getenv("POSTGRES_PORT",     "5432"))
 _PG_DB          = os.getenv("POSTGRES_DB",           "airflow")
 _PG_USER        = os.getenv("POSTGRES_USER",         "airflow")
 _PG_PASS        = os.getenv("POSTGRES_PASSWORD",     "airflow")
-# Determine Ollama URL based on environment
-_IN_DOCKER = Path("/.dockerenv").exists()
-_DEFAULT_OLLAMA = "http://host.docker.internal:11434" if _IN_DOCKER else "http://localhost:11434"
-_OLLAMA_URL     = os.getenv("OLLAMA_BASE_URL",       _DEFAULT_OLLAMA)
-_LLM_MODEL      = os.getenv("LLM_MODEL_BUSINESS_ANALYST", "deepseek-r1:8b")
-_EMBED_MODEL    = os.getenv("EMBEDDING_MODEL",       "all-MiniLM-L6-v2")
+_DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+_LLM_MODEL      = os.getenv("LLM_MODEL_BUSINESS_ANALYST", "deepseek-reasoner")
+_EMBED_MODEL    = os.getenv("EMBEDDING_MODEL",       "nomic-embed-text:v1.5")
+
+# DeepSeek model mapping for compatibility
+_DEEPSEEK_MODELS = {
+    "deepseek-chat": "deepseek-chat",
+    "deepseek-reasoner": "deepseek-chat",  # fallback if reasoner not available
+}
 
 _SUPPORTED_TICKERS = ["AAPL", "MSFT", "GOOGL", "TSLA", "NVDA"]
 
@@ -189,29 +204,48 @@ def _check_postgres() -> Dict[str, Any]:
     return result
 
 
-def _check_ollama() -> Dict[str, Any]:
+def _check_deepseek() -> Dict[str, Any]:
     result: Dict[str, Any] = {
         "reachable": False,
         "available_models": [],
-        "embedding_model_ready": False,  # sentence-transformers (local, not Ollama)
+        "embedding_model_ready": False,
         "llm_model_ready": False,
         "error": None,
     }
+    # Re-read at call time so .env loaded after module import is respected
+    _DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
+    if not _DEEPSEEK_API_KEY:
+        result["error"] = "DEEPSEEK_API_KEY not set"
+        logger.debug("DeepSeek API key not configured")
+        return result
+    
     try:
-        resp = requests.get(f"{_OLLAMA_URL}/api/tags", timeout=5)
+        headers = {
+            "Authorization": f"Bearer {_DEEPSEEK_API_KEY}",
+            "Content-Type": "application/json",
+        }
+        resp = requests.get(
+            f"{_DEEPSEEK_BASE_URL}/v1/models",
+            headers=headers,
+            timeout=10,
+        )
         resp.raise_for_status()
         result["reachable"] = True
-        result["available_models"] = [m["name"] for m in resp.json().get("models", [])]
+        result["available_models"] = [m["id"] for m in resp.json().get("data", [])]
+        
+        # Check if configured model or its fallback is available
+        check_model = _DEEPSEEK_MODELS.get(_LLM_MODEL, _LLM_MODEL)
         result["llm_model_ready"] = any(
+            check_model in m for m in result["available_models"]
+        ) or any(
             _LLM_MODEL in m for m in result["available_models"]
         )
     except Exception as exc:
         result["error"] = str(exc)
-        logger.debug("Ollama availability check failed: %s", exc)
+        logger.debug("DeepSeek availability check failed: %s", exc)
 
-    # Check sentence-transformers locally (never requires Ollama)
     try:
-        from sentence_transformers import SentenceTransformer  # type: ignore[import]
+        from sentence_transformers import SentenceTransformer
         result["embedding_model_ready"] = True
     except ImportError:
         result["embedding_model_ready"] = False
@@ -224,7 +258,7 @@ def _check_ollama() -> Dict[str, Any]:
 def check_all(tickers: Optional[List[str]] = None) -> Dict[str, Any]:
     """Run all tier checks and return the consolidated availability report.
 
-    All three backend checks (Neo4j, PostgreSQL, Ollama) are executed
+    All three backend checks (Neo4j, PostgreSQL, DeepSeek) are executed
     concurrently via a ThreadPoolExecutor so one slow backend does not block
     the others.  Total wall-clock time is bounded by the slowest single check
     rather than their sum.
@@ -247,7 +281,7 @@ def check_all(tickers: Optional[List[str]] = None) -> Dict[str, Any]:
     with ThreadPoolExecutor(max_workers=3, thread_name_prefix="avail_check") as pool:
         fut_neo4j    = pool.submit(_check_neo4j)
         fut_postgres = pool.submit(_check_postgres)
-        fut_ollama   = pool.submit(_check_ollama)
+        fut_deepseek = pool.submit(_check_deepseek)
 
         def _safe_result(fut, name: str) -> Dict[str, Any]:
             """Return future result or a safe error dict if it times out."""
@@ -266,7 +300,7 @@ def check_all(tickers: Optional[List[str]] = None) -> Dict[str, Any]:
 
         neo4j    = _safe_result(fut_neo4j,    "neo4j")
         postgres = _safe_result(fut_postgres, "postgres")
-        ollama   = _safe_result(fut_ollama,   "ollama")
+        deepseek = _safe_result(fut_deepseek, "deepseek")
 
     # Derive per-ticker readiness
     tickers_with_chunks  = set(neo4j.get("tickers_with_chunks") or [])
@@ -294,10 +328,10 @@ def check_all(tickers: Optional[List[str]] = None) -> Dict[str, Any]:
     elif not postgres["fundamentals_tickers"]:
         degraded.append("postgres_no_fundamentals")
 
-    if not ollama["reachable"]:
-        degraded.append("ollama_unreachable")
-    elif not ollama["llm_model_ready"]:
-        degraded.append(f"ollama_missing_llm_{_LLM_MODEL}")
+    if not deepseek["reachable"]:
+        degraded.append("deepseek_unreachable")
+    elif not deepseek["llm_model_ready"]:
+        degraded.append(f"deepseek_missing_llm_{_LLM_MODEL}")
 
     # Human summary
     if not degraded:
@@ -317,7 +351,7 @@ def check_all(tickers: Optional[List[str]] = None) -> Dict[str, Any]:
     return {
         "neo4j":    neo4j,
         "postgres": postgres,
-        "ollama":   ollama,
+        "deepseek": deepseek,
         "tickers_fully_ready":    fully_ready,
         "tickers_partially_ready": partially_ready,
         "degraded_tiers":         degraded,
@@ -356,16 +390,16 @@ def availability_notice(avail: Dict[str, Any], tickers: List[str]) -> str:
             "all P/E, ROE, and factor computations will return null."
         )
 
-    ollama = avail.get("ollama") or {}
-    if "ollama_unreachable" in degraded:
+    deepseek = avail.get("deepseek") or {}
+    if "deepseek_unreachable" in degraded:
         lines.append(
-            f"  • Ollama is UNREACHABLE at {_OLLAMA_URL} — "
+            f"  • DeepSeek API is UNREACHABLE at {_DEEPSEEK_BASE_URL} — "
             "LLM summarization and query planning unavailable."
         )
-    elif any("ollama_missing_llm" in d for d in degraded):
+    elif any("deepseek_missing_llm" in d for d in degraded):
         lines.append(
-            f"  • Ollama LLM model '{_LLM_MODEL}' is NOT loaded. "
-            "Run: ollama pull " + _LLM_MODEL
+            f"  • DeepSeek LLM model '{_LLM_MODEL}' is NOT available. "
+            "Check DEEPSEEK_API_KEY and model configuration."
         )
 
     fully_ready = avail.get("tickers_fully_ready") or []
@@ -403,7 +437,7 @@ def ticker_data_profile(avail: Dict[str, Any], ticker: str) -> Dict[str, bool]:
     """
     neo4j    = avail.get("neo4j") or {}
     postgres = avail.get("postgres") or {}
-    ollama   = avail.get("ollama") or {}
+    deepseek = avail.get("deepseek") or {}
 
     has_neo4j   = ticker in (neo4j.get("tickers_with_chunks") or [])
     has_pg_fund = ticker in (postgres.get("fundamentals_tickers") or [])
@@ -417,7 +451,7 @@ def ticker_data_profile(avail: Dict[str, Any], ticker: str) -> Dict[str, bool]:
         "has_pg_sentiment":    has_pg_sent,
         "has_any_qualitative": has_neo4j,
         "has_any_quantitative": has_pg_fund or has_pg_ts,
-        "has_llm":             ollama.get("llm_model_ready", False),
+        "has_llm":             deepseek.get("llm_model_ready", False),
     }
 
 

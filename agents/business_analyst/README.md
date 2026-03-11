@@ -3,36 +3,6 @@
 > **Architecture:** Optimized Adaptive Agentic Graph RAG (v2)
 > **Status:** Live-tested, all 5 tickers validated
 > **LLM Backend:** DeepSeek API (`deepseek-reasoner`) — cloud API, no local GPU required
-
----
-
-## Role
-
-The Business Analyst Agent is the **qualitative intelligence layer** of the multi-agent equity research system. It answers structural questions about a company — competitive moat, business model, risk factors, strategic positioning, and earnings call highlights — by retrieving verified facts from local knowledge bases and synthesising them with an LLM.
-
-It does **NOT** make buy/sell judgements or produce price targets. It surfaces grounded analysis and data gaps for the Supervisor and Synthesizer to interpret.
-
-**Handled by this agent:**
-- Competitive moat depth and trajectory
-- Business model and revenue composition
-- Risk factor synthesis (from filings, earnings calls, broker reports)
-- Historical sentiment trends (bullish/bearish/neutral %)
-- Management guidance and earnings call Q&A
-- Broker research report synthesis
-- Qualitative narrative with cited source IDs
-
-**Not handled here (separate agents):**
-- Breaking news and real-time events → Web Search Agent
-- Financial ratios, DCF, valuation → Financial Modelling Agent
-- Macro environment → Phase 3 (not yet implemented)
-
----
-
-## Architecture: Optimized Adaptive Agentic Graph RAG
-
-The pipeline classifies every query into one of three paths before retrieving, then evaluates retrieval quality (CRAG) on the complex path and adaptively rewrites or falls back as needed.
-
-```
 Query + Ticker
     │
     ▼

@@ -63,7 +63,7 @@ class BusinessAnalystConfig:
     llm_model: str = field(default_factory=lambda: os.getenv("BUSINESS_ANALYST_MODEL", os.getenv("LLM_MODEL_BUSINESS_ANALYST", "deepseek-reasoner")))
     llm_temperature: float = field(default_factory=lambda: float(os.getenv("BUSINESS_ANALYST_TEMPERATURE", "0.2")))
     # max_tokens controls DeepSeek API output budget (replaces Ollama's num_predict/num_ctx).
-    llm_max_tokens: int = field(default_factory=lambda: int(os.getenv("BUSINESS_ANALYST_MAX_TOKENS", "8000")))
+    llm_max_tokens: int = field(default_factory=lambda: int(os.getenv("BUSINESS_ANALYST_MAX_TOKENS", "12000")))
 
     # DeepSeek API key — required for LLM generation.
     deepseek_api_key: str = field(default_factory=lambda: _env("DEEPSEEK_API_KEY", ""))
@@ -126,6 +126,14 @@ class BusinessAnalystConfig:
     # max_rewrite_loops: hard cap on CRAG rewrite cycles to prevent infinite loops.
     # Configurable via BA_MAX_REWRITE_LOOPS env var. Default: 3.
     max_rewrite_loops: int = field(default_factory=lambda: int(os.getenv("BA_MAX_REWRITE_LOOPS", "3")))
+    # time_decay_lambda: exponential decay rate for chunk age in time-decay re-ranking.
+    # Score multiplier = exp(-lambda * age_days / 365). Higher values penalise older chunks more.
+    # Set to 0.0 to disable time-decay. Override via BA_TIME_DECAY_LAMBDA env var.
+    time_decay_lambda: float = field(default_factory=lambda: float(os.getenv("BA_TIME_DECAY_LAMBDA", "0.5")))
+    # mmr_lambda: trade-off between relevance and diversity in MMR re-ranking.
+    # 1.0 = pure relevance (disables diversity), 0.0 = pure diversity.
+    # Override via BA_MMR_LAMBDA env var.
+    mmr_lambda: float = field(default_factory=lambda: float(os.getenv("BA_MMR_LAMBDA", "0.6")))
     # query_classifier_model: retained for reference but the classifier is rule-based only.
     # No LLM call is made for classification. This field is a no-op.
     query_classifier_model: str = field(default_factory=lambda: os.getenv("BA_QUERY_CLASSIFIER_MODEL", "rule-based"))

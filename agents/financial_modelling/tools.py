@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from contextlib import closing
 from typing import Any, Dict, List, Optional
 
@@ -595,7 +596,11 @@ class PostgresConnector:
         return result
 
     def fetch_valuation_metrics(self, ticker: str) -> Optional[Dict]:
-        """Fetch latest valuation metrics for the ticker (Row 19)."""
+        """Fetch latest valuation metrics for the ticker (Row 19).
+
+        Falls back to company_profile_neo4j.json Highlights + Valuation sections when
+        the valuation_metrics table row has all-NULL value columns.
+        """
         sql = """
         SELECT *
         FROM valuation_metrics
@@ -603,15 +608,213 @@ class PostgresConnector:
         ORDER BY as_of_date DESC
         LIMIT 1
         """
-        conn = self._connect()
-        with closing(conn), conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(sql, (ticker,))
-            row = cur.fetchone()
-            if not row:
-                return None
-            return {k: (float(v) if isinstance(v, (int, float)) and k not in ("ticker", "id") else
-                        str(v) if v is not None else None)
-                    for k, v in dict(row).items()}
+        try:
+            conn = self._connect()
+            with closing(conn), conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(sql, (ticker,))
+                row = cur.fetchone()
+                if row:
+                    result = {k: (float(v) if isinstance(v, (int, float)) and k not in ("ticker", "id") else
+                                  str(v) if v is not None else None)
+                              for k, v in dict(row).items()}
+                    # Check if any actual value fields are non-NULL
+                    value_keys = {k for k in result if k not in ("ticker", "id", "as_of_date", "ingested_at")}
+                    if any(result.get(k) is not None for k in value_keys):
+                        return result
+        except Exception as exc:
+            logger.debug("[FM] fetch_valuation_metrics primary query failed for %s: %s", ticker, exc)
+
+        # Fallback: company_profile_neo4j.json Highlights + Valuation sections
+        try:
+            base_dir = os.path.join(
+                os.path.dirname(__file__), "..", "..", "ingestion", "etl", "agent_data", ticker.upper()
+            )
+            neo4j_path = os.path.normpath(os.path.join(base_dir, "company_profile_neo4j.json"))
+            if os.path.exists(neo4j_path):
+                with open(neo4j_path, "r", encoding="utf-8") as f:
+                    neo4j_data = json.load(f)
+                h = neo4j_data.get("Highlights", {})
+                v = neo4j_data.get("Valuation", {})
+                if h or v:
+                    logger.info("[FM] fetch_valuation_metrics: using company_profile_neo4j.json fallback for %s", ticker)
+                    def _fn(x):
+                        try:
+                            return float(x) if x is not None else None
+                        except (TypeError, ValueError):
+                            return None
+                    return {
+                        "ticker": ticker,
+                        "trailing_pe":    _fn(v.get("TrailingPE") or h.get("PERatio")),
+                        "forward_pe":     _fn(v.get("ForwardPE")),
+                        "price_sales_ttm": _fn(v.get("PriceSalesTTM")),
+                        "price_book_mrq": _fn(v.get("PriceBookMRQ")),
+                        "enterprise_value": _fn(v.get("EnterpriseValue")),
+                        "ev_revenue":     _fn(v.get("EnterpriseValueRevenue")),
+                        "ev_ebitda":      _fn(v.get("EnterpriseValueEbitda")),
+                        "market_cap":     _fn(h.get("MarketCapitalization")),
+                        "ebitda":         _fn(h.get("EBITDA")),
+                        "pe_ratio":       _fn(h.get("PERatio")),
+                        "peg_ratio":      _fn(h.get("PEGRatio")),
+                        "eps":            _fn(h.get("EarningsShare")),
+                        "profit_margin":  _fn(h.get("ProfitMargin")),
+                        "operating_margin": _fn(h.get("OperatingMarginTTM")),
+                        "roa":            _fn(h.get("ReturnOnAssetsTTM")),
+                        "roe":            _fn(h.get("ReturnOnEquityTTM")),
+                        "revenue_ttm":    _fn(h.get("RevenueTTM")),
+                        "book_value":     _fn(h.get("BookValue")),
+                        "dividend_share": _fn(h.get("DividendShare")),
+                        "dividend_yield": _fn(h.get("DividendYield")),
+                        "wall_st_target": _fn(h.get("WallStreetTargetPrice")),
+                    }
+        except Exception as exc:
+            logger.debug("[FM] fetch_valuation_metrics neo4j json fallback failed for %s: %s", ticker, exc)
+        return None
+
+    def fetch_analyst_ratings(self, ticker: str) -> Optional[Dict]:
+        """Fetch latest analyst ratings for the ticker.
+
+        Falls back to raw_fundamentals data_name='analyst_ratings', then to
+        company_profile_neo4j.json AnalystRatings section.
+        """
+        sql = """
+        SELECT *
+        FROM analyst_ratings
+        WHERE ticker = %s
+        ORDER BY as_of_date DESC
+        LIMIT 1
+        """
+        try:
+            conn = self._connect()
+            with closing(conn), conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(sql, (ticker,))
+                row = cur.fetchone()
+                if row:
+                    return {k: (float(v) if isinstance(v, (int, float)) and k not in ("ticker", "id") else
+                                str(v) if v is not None else None)
+                            for k, v in dict(row).items()}
+        except Exception as exc:
+            logger.debug("[FM] fetch_analyst_ratings primary query failed for %s: %s", ticker, exc)
+
+        # Fallback 1: raw_fundamentals data_name='analyst_ratings'
+        try:
+            rows = self.fetch_latest_fundamental(ticker, "analyst_ratings", limit=1)
+            if rows:
+                payload = rows[0].get("payload", {})
+                if isinstance(payload, str):
+                    payload = json.loads(payload)
+                if isinstance(payload, dict) and payload:
+                    logger.info("[FM] fetch_analyst_ratings: using raw_fundamentals fallback for %s", ticker)
+                    def _fn(x):
+                        try:
+                            return float(x) if x is not None else None
+                        except (TypeError, ValueError):
+                            return None
+                    return {
+                        "ticker": ticker,
+                        "rating":           _fn(payload.get("Rating")),
+                        "target_price":     _fn(payload.get("TargetPrice")),
+                        "strong_buy_count": _fn(payload.get("StrongBuy")),
+                        "buy_count":        _fn(payload.get("Buy")),
+                        "hold_count":       _fn(payload.get("Hold")),
+                        "sell_count":       _fn(payload.get("Sell")),
+                        "strong_sell_count": _fn(payload.get("StrongSell")),
+                    }
+        except Exception as exc:
+            logger.debug("[FM] fetch_analyst_ratings raw_fundamentals fallback failed for %s: %s", ticker, exc)
+
+        # Fallback 2: company_profile_neo4j.json AnalystRatings section
+        try:
+            base_dir = os.path.join(
+                os.path.dirname(__file__), "..", "..", "ingestion", "etl", "agent_data", ticker.upper()
+            )
+            neo4j_path = os.path.normpath(os.path.join(base_dir, "company_profile_neo4j.json"))
+            if os.path.exists(neo4j_path):
+                with open(neo4j_path, "r", encoding="utf-8") as f:
+                    neo4j_data = json.load(f)
+                ar = neo4j_data.get("AnalystRatings", {})
+                if ar:
+                    logger.info("[FM] fetch_analyst_ratings: using company_profile_neo4j.json fallback for %s", ticker)
+                    def _fn(x):
+                        try:
+                            return float(x) if x is not None else None
+                        except (TypeError, ValueError):
+                            return None
+                    return {
+                        "ticker": ticker,
+                        "rating":           _fn(ar.get("Rating")),
+                        "target_price":     _fn(ar.get("TargetPrice")),
+                        "strong_buy_count": _fn(ar.get("StrongBuy")),
+                        "buy_count":        _fn(ar.get("Buy")),
+                        "hold_count":       _fn(ar.get("Hold")),
+                        "sell_count":       _fn(ar.get("Sell")),
+                        "strong_sell_count": _fn(ar.get("StrongSell")),
+                    }
+        except Exception as exc:
+            logger.debug("[FM] fetch_analyst_ratings neo4j json fallback failed for %s: %s", ticker, exc)
+        return None
+
+    def fetch_company_profile(self, ticker: str) -> Optional[Dict]:
+        """Fetch company profile for the ticker.
+
+        Falls back to company_profile_neo4j.json General section when the
+        company_profiles table is empty.
+        """
+        sql = """
+        SELECT *
+        FROM company_profiles
+        WHERE ticker = %s
+        LIMIT 1
+        """
+        try:
+            conn = self._connect()
+            with closing(conn), conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(sql, (ticker,))
+                row = cur.fetchone()
+                if row:
+                    return {k: (float(v) if isinstance(v, (int, float)) and k not in ("ticker", "id") else
+                                str(v) if v is not None else None)
+                            for k, v in dict(row).items()}
+        except Exception as exc:
+            logger.debug("[FM] fetch_company_profile primary query failed for %s: %s", ticker, exc)
+
+        # Fallback: company_profile_neo4j.json General section
+        try:
+            base_dir = os.path.join(
+                os.path.dirname(__file__), "..", "..", "ingestion", "etl", "agent_data", ticker.upper()
+            )
+            neo4j_path = os.path.normpath(os.path.join(base_dir, "company_profile_neo4j.json"))
+            if os.path.exists(neo4j_path):
+                with open(neo4j_path, "r", encoding="utf-8") as f:
+                    neo4j_data = json.load(f)
+                g = neo4j_data.get("General", {})
+                if g:
+                    logger.info("[FM] fetch_company_profile: using company_profile_neo4j.json fallback for %s", ticker)
+                    return {
+                        "ticker":              ticker,
+                        "name":                g.get("Name"),
+                        "exchange":            g.get("Exchange"),
+                        "sector":              g.get("Sector"),
+                        "industry":            g.get("Industry"),
+                        "gic_sector":          g.get("GicSector"),
+                        "description":         g.get("Description"),
+                        "address":             g.get("Address"),
+                        "city":                g.get("AddressData", {}).get("City") if isinstance(g.get("AddressData"), dict) else None,
+                        "state":               g.get("AddressData", {}).get("State") if isinstance(g.get("AddressData"), dict) else None,
+                        "country":             g.get("CountryName") or (g.get("AddressData", {}).get("Country") if isinstance(g.get("AddressData"), dict) else None),
+                        "phone":               g.get("Phone"),
+                        "web_url":             g.get("WebURL"),
+                        "full_time_employees": g.get("FullTimeEmployees"),
+                        "fiscal_year_end":     g.get("FiscalYearEnd"),
+                        "ipo_date":            g.get("IPODate"),
+                        "currency":            g.get("CurrencyCode"),
+                        "isin":                g.get("ISIN"),
+                        "cusip":               g.get("CUSIP"),
+                        "cik":                 g.get("CIK"),
+                        "is_delisted":         False,
+                    }
+        except Exception as exc:
+            logger.debug("[FM] fetch_company_profile neo4j json fallback failed for %s: %s", ticker, exc)
+        return None
 
     def fetch_outstanding_shares(self, ticker: str, limit: int = 10) -> List[Dict]:
         """Fetch outstanding shares history for the ticker (Row 22)."""
@@ -1320,6 +1523,55 @@ class FMDataFetcher:
         except Exception as exc:
             logger.warning("key_metrics_ttm fetch failed for %s: %s", ticker, exc)
 
+        # Fallback: synthesize key_metrics_ttm from company_profile_neo4j.json Highlights
+        if not bundle.key_metrics_ttm:
+            try:
+                base_dir = os.path.join(
+                    os.path.dirname(__file__), "..", "..", "ingestion", "etl", "agent_data", ticker.upper()
+                )
+                neo4j_path = os.path.normpath(os.path.join(base_dir, "company_profile_neo4j.json"))
+                if os.path.exists(neo4j_path):
+                    with open(neo4j_path, "r", encoding="utf-8") as f:
+                        neo4j_data = json.load(f)
+                    h = neo4j_data.get("Highlights", {})
+                    v = neo4j_data.get("Valuation", {})
+                    if h:
+                        bundle.key_metrics_ttm = {
+                            "ReturnOnEquityTTM":  h.get("ReturnOnEquityTTM"),
+                            "ReturnOnAssetsTTM":  h.get("ReturnOnAssetsTTM"),
+                            "OperatingMarginTTM": h.get("OperatingMarginTTM"),
+                            "ProfitMargin":       h.get("ProfitMargin"),
+                            "PERatio":            h.get("PERatio"),
+                            "RevenueTTM":         h.get("RevenueTTM"),
+                            "marketCapTTM":       h.get("MarketCapitalization"),
+                            "MarketCapitalization": h.get("MarketCapitalization"),
+                            "EarningsShare":      h.get("EarningsShare"),
+                            "DividendYield":      h.get("DividendYield"),
+                            "EBITDA":             h.get("EBITDA"),
+                            "enterpriseValueTTM": v.get("EnterpriseValue") if v else None,
+                            "QuarterlyRevenueGrowthYOY":   h.get("QuarterlyRevenueGrowthYOY"),
+                            "QuarterlyEarningsGrowthYOY":  h.get("QuarterlyEarningsGrowthYOY"),
+                        }
+                        logger.info("[FM] key_metrics_ttm: using company_profile_neo4j.json fallback for %s", ticker)
+                        # Backfill derived fields from the newly populated key_metrics_ttm
+                        mkt_cap = _safe_float(h.get("MarketCapitalization"))
+                        ev_ttm  = _safe_float(v.get("EnterpriseValue") if v else None)
+                        if mkt_cap:
+                            bundle.enterprise["marketCapitalization"] = mkt_cap
+                            if bundle.balance is not None:
+                                bundle.balance["marketCapitalization"] = mkt_cap
+                        if ev_ttm:
+                            if not bundle.enterprise.get("enterpriseValueTTM"):
+                                bundle.enterprise["enterpriseValueTTM"] = ev_ttm
+                        rev_ttm = _safe_float(h.get("RevenueTTM"))
+                        if rev_ttm and rev_ttm > 0 and bundle.income is not None:
+                            bundle.income["revenue"] = rev_ttm
+                            ebit = _safe_float(bundle.income.get("ebit"))
+                            if ebit and ebit > 0:
+                                bundle.income["ebitMargin"] = round(ebit / rev_ttm, 6)
+            except Exception as exc:
+                logger.debug("[FM] key_metrics_ttm neo4j json fallback failed for %s: %s", ticker, exc)
+
         # ── ratios_ttm (FMP) ──────────────────────────────────────────────────
         try:
             bundle.ratios_ttm = self._latest_payload(ticker, "ratios_ttm")
@@ -1327,6 +1579,35 @@ class FMDataFetcher:
                 bundle.income["effectiveTaxRate"] = bundle.ratios_ttm.get("effectiveTaxRateTTM")
         except Exception as exc:
             logger.warning("ratios_ttm fetch failed for %s: %s", ticker, exc)
+
+        # Fallback: synthesize ratios_ttm from company_profile_neo4j.json Highlights + Valuation
+        if not bundle.ratios_ttm:
+            try:
+                base_dir = os.path.join(
+                    os.path.dirname(__file__), "..", "..", "ingestion", "etl", "agent_data", ticker.upper()
+                )
+                neo4j_path = os.path.normpath(os.path.join(base_dir, "company_profile_neo4j.json"))
+                if os.path.exists(neo4j_path):
+                    with open(neo4j_path, "r", encoding="utf-8") as f:
+                        neo4j_data = json.load(f)
+                    h = neo4j_data.get("Highlights", {})
+                    v = neo4j_data.get("Valuation", {})
+                    if h or v:
+                        bundle.ratios_ttm = {
+                            "ReturnOnEquityTTM":  h.get("ReturnOnEquityTTM"),
+                            "ReturnOnAssetsTTM":  h.get("ReturnOnAssetsTTM"),
+                            "OperatingMarginTTM": h.get("OperatingMarginTTM"),
+                            "ProfitMargin":       h.get("ProfitMargin"),
+                            "PERatio":            h.get("PERatio"),
+                            "PriceSalesTTM":      v.get("PriceSalesTTM") if v else None,
+                            "PriceBookMRQ":       v.get("PriceBookMRQ") if v else None,
+                            "TrailingPE":         v.get("TrailingPE") if v else None,
+                            "ForwardPE":          v.get("ForwardPE") if v else None,
+                            "DividendYield":      h.get("DividendYield"),
+                        }
+                        logger.info("[FM] ratios_ttm: using company_profile_neo4j.json fallback for %s", ticker)
+            except Exception as exc:
+                logger.debug("[FM] ratios_ttm neo4j json fallback failed for %s: %s", ticker, exc)
 
         # ── enterprise_values (EODHD) — EnterpriseValue, TrailingPE, etc. ────
         try:

@@ -187,8 +187,6 @@ services:
         sleep 1; i=$$(($$i+1));
       done;
       echo 'Pulling models if missing...';
-      ollama pull llama3.2:latest || echo 'llama3.2 skipped/failed';
-      ollama pull deepseek-r1:8b || echo 'deepseek-r1 skipped/failed';
       ollama pull nomic-embed-text:v1.5 || echo 'nomic skipped/failed';
       echo 'Models pulled, ready!';
       wait $$SERVE_PID

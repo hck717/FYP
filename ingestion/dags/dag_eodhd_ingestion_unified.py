@@ -143,7 +143,7 @@ def _on_failure_callback(context):
 DATA_ENDPOINTS: list[tuple] = [
     # name                        endpoint                       params                                                     dest          description
     # ── Row 1: Company Profiles — stored in Neo4j ───────────────────────────────
-    ("company_profile",           "fundamentals/{ticker}",       {},                                                        "neo4j",      "Company fundamentals, EPS, valuation, highlights"),
+    ("company_profile_neo4j",   "fundamentals/{ticker}",       {},                                                        "neo4j",      "Company fundamentals, EPS, valuation, highlights"),
     # ── Row 2 & 19: Financial News + Real-Time News (shared HTTP call) ───────────
     ("financial_news",            "news",                        {"s": "{ticker_symbol}", "limit": 50},                     "postgresql", "Recent ticker-tagged financial news (last 50)"),
     ("realtime_news_feed",        "news",                        {"s": "{ticker_symbol}", "limit": 50},                     "postgresql", "Alias of financial_news — real-time news feed"),
@@ -188,6 +188,10 @@ DATA_ENDPOINTS: list[tuple] = [
     ("short_interest",            "fundamentals/{ticker}",       {"filter": "SharesStats"},                                 "postgresql", "Short interest, float, insider/institution ownership %"),
     # ── Row 22: Outstanding Shares History ──────────────────────────────────
     ("outstanding_shares",        "fundamentals/{ticker}",       {"filter": "outstandingShares"},                           "postgresql", "Historical outstanding shares count (annual + quarterly)"),
+    # ── NEW: Analyst Ratings ─────────────────────────────────────────────────
+    ("analyst_ratings",           "fundamentals/{ticker}",       {"filter": "AnalystRatings"},                             "postgresql", "Analyst consensus ratings (Rating, TargetPrice, StrongBuy, Buy, Hold, Sell, StrongSell)"),
+    # ── NEW: Company Profiles ─────────────────────────────────────────────────
+    ("company_profile",            "fundamentals/{ticker}",       {"filter": "General"},                                    "postgresql", "Company profile (Name, Exchange, Sector, Industry, Description, Address, Officers)"),
     # ── Row 7 (sentiment) — derived from financial_news aggregation ─────────────
     # sentiment_trends is populated by _aggregate_news_sentiment() called inside
     # _save_data() when data_name == "financial_news".  It groups the per-article
@@ -1003,13 +1007,13 @@ with DAG(
             task_id=f"textual_load_earnings_calls_{_symbol}",
             python_callable=load_textual_earnings_calls,
             op_kwargs={"ticker_symbol": _symbol},
-            execution_timeout=timedelta(minutes=10),
+            execution_timeout=timedelta(hours=6),
         )
         broker_report_tasks[_symbol] = PythonOperator(
             task_id=f"textual_load_broker_reports_{_symbol}",
             python_callable=load_textual_broker_reports,
             op_kwargs={"ticker_symbol": _symbol},
-            execution_timeout=timedelta(minutes=10),
+            execution_timeout=timedelta(hours=6),
         )
 
     # Wire up dependencies

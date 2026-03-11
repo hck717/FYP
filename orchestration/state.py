@@ -71,6 +71,10 @@ class OrchestrationState(TypedDict, total=False):
     # ── Errors ───────────────────────────────────────────────────────────────
     agent_errors: Dict[str, str]            # {agent_name: error_message}
 
+    # ── Thinking traces ──────────────────────────────────────────────────────
+    planner_trace: Optional[str]            # DeepSeek reasoning from node_planner
+    summarizer_trace: Optional[str]         # DeepSeek reasoning from node_summarizer
+
     # ── Final output ─────────────────────────────────────────────────────────
     final_summary: Optional[str]            # narrative from DeepSeek summarizer
     output: Optional[Dict[str, Any]]        # full structured response to UI

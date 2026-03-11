@@ -149,6 +149,21 @@ def build_graph() -> Any:
     return graph.compile()
 
 
+def get_graph() -> Any:
+    """Return the compiled orchestration graph for visualization.
+
+    The returned LangGraph compiled graph object supports:
+        - ``.get_graph()``                 → DrawableGraph
+        - ``.get_graph().draw_mermaid()``  → Mermaid diagram string
+        - ``.get_graph().draw_ascii()``    → ASCII art string
+
+    Example (Streamlit):
+        from orchestration.graph import get_graph
+        mermaid_str = get_graph().get_graph().draw_mermaid()
+    """
+    return _get_graph()
+
+
 # ── Public run helpers ────────────────────────────────────────────────────────
 
 # Module-level compiled graph (built once, reused across Streamlit reruns)

@@ -553,9 +553,23 @@ def _run_migrations() -> None:
         # 2026-03: raw_fundamentals - add period_type column for financial statements
         # This allows quarterly and yearly data for the same date
         "ALTER TABLE raw_fundamentals ADD COLUMN IF NOT EXISTS period_type TEXT",
-        # Drop old constraint and add new one with period_type
+        # Drop old constraints and add new one with period_type (idempotent)
         "ALTER TABLE raw_fundamentals DROP CONSTRAINT IF EXISTS raw_fundamentals_ticker_symbol_data_name_as_of_date_source_key",
-        "ALTER TABLE raw_fundamentals ADD UNIQUE (ticker_symbol, data_name, period_type, as_of_date, source)",
+        "ALTER TABLE raw_fundamentals DROP CONSTRAINT IF EXISTS raw_fundamentals_ticker_symbol_data_name_period_type_as_of__key",
+        """
+        DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_constraint
+                WHERE conname = 'raw_fundamentals_period_type_unique'
+                  AND conrelid = 'raw_fundamentals'::regclass
+            ) THEN
+                ALTER TABLE raw_fundamentals
+                    ADD CONSTRAINT raw_fundamentals_period_type_unique
+                    UNIQUE (ticker_symbol, data_name, period_type, as_of_date, source);
+            END IF;
+        END $$;
+        """,
         # 2026-03: insider_transactions - add shares and price to unique constraint
         # This handles multiple transactions for same insider/date/type with different amounts
         "ALTER TABLE insider_transactions DROP CONSTRAINT IF EXISTS insider_transactions_ticker_insider_name_transaction_date_transaction_type_key",
@@ -574,6 +588,55 @@ def _run_migrations() -> None:
         "ALTER TABLE corporate_bond_yields ADD COLUMN IF NOT EXISTS issue_date DATE",
         "ALTER TABLE corporate_bond_yields ADD COLUMN IF NOT EXISTS credit_rating TEXT",
         "ALTER TABLE corporate_bond_yields ADD COLUMN IF NOT EXISTS currency TEXT",
+        # NEW: Analyst Ratings table
+        """
+        CREATE TABLE IF NOT EXISTS analyst_ratings (
+            id SERIAL PRIMARY KEY,
+            ticker TEXT NOT NULL,
+            as_of_date DATE NOT NULL,
+            rating NUMERIC,
+            target_price NUMERIC,
+            strong_buy_count INTEGER,
+            buy_count INTEGER,
+            hold_count INTEGER,
+            sell_count INTEGER,
+            strong_sell_count INTEGER,
+            total_analysts INTEGER,
+            rating_scale_min NUMERIC,
+            rating_scale_max NUMERIC,
+            updated_at TIMESTAMP DEFAULT NOW(),
+            UNIQUE (ticker, as_of_date)
+        )
+        """,
+        # NEW: Company Profiles table
+        """
+        CREATE TABLE IF NOT EXISTS company_profiles (
+            id SERIAL PRIMARY KEY,
+            ticker TEXT NOT NULL UNIQUE,
+            code TEXT,
+            name TEXT,
+            exchange TEXT,
+            sector TEXT,
+            industry TEXT,
+            description TEXT,
+            address TEXT,
+            city TEXT,
+            state TEXT,
+            country TEXT,
+            zip_code TEXT,
+            phone TEXT,
+            web_url TEXT,
+            full_time_employees INTEGER,
+            ipo_date DATE,
+            is_delisted BOOLEAN DEFAULT FALSE,
+            currency_code TEXT,
+            currency_name TEXT,
+            lei TEXT,
+            cusip TEXT,
+            cik TEXT,
+            updated_at TIMESTAMP DEFAULT NOW()
+        )
+        """,
         # 2025-Q4: mv_daily_factor_scores materialized view for pre-computed factor scores.
         # Reads from financial_statements (always populated) + raw_fundamentals (FMP, optional).
         """
@@ -1277,16 +1340,16 @@ def _insert_forex_rates(df: pd.DataFrame, pair_name: str = "EURUSD") -> int:
                 datetime.utcnow().replace(hour=0, minute=0, second=idx, microsecond=0)
                 .strftime("%Y-%m-%d %H:%M:%S")
             )
-        rows_ts.append(("_GLOBAL", "forex_historical_rates", row_date, json.dumps(payload), "eodhd", row_date))
+        rows_ts.append(("eodhd", "_GLOBAL", "forex_historical_rates", row_date, json.dumps(payload), "eodhd", row_date))
     if not rows_ts:
         return 0
     with get_pg_conn() as conn:
         with conn.cursor() as cur:
             execute_values(cur, """
                 INSERT INTO raw_timeseries
-                    (ticker_symbol, data_name, ts_date, payload, source, ingested_at)
+                    (agent_name, ticker_symbol, data_name, ts_date, payload, source, ingested_at)
                 VALUES %s
-                ON CONFLICT (ticker_symbol, data_name, ts_date, source) DO UPDATE SET
+                ON CONFLICT (agent_name, ticker_symbol, data_name, ts_date, source) DO UPDATE SET
                     payload     = EXCLUDED.payload,
                     ingested_at = NOW()
             """, rows_ts)
@@ -1429,22 +1492,34 @@ def _insert_dataframe_generic(
             if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
                 v = None
             payload[c] = v
-        # timeseries: 6 columns
-        rows_ts.append((ticker_symbol, data_name, ts_val, json.dumps(payload), source, now))
-        # fundamentals: 7 columns (with period_type = None)
-        rows_fund.append((ticker_symbol, data_name, None, ts_val, json.dumps(payload), source, now))
+        # timeseries: 7 columns (agent_name first)
+        rows_ts.append(("eodhd", ticker_symbol, data_name, ts_val, json.dumps(payload), source, now))
+        # fundamentals: 8 columns (agent_name first, period_type = None)
+        rows_fund.append(("eodhd", ticker_symbol, data_name, None, ts_val, json.dumps(payload), source, now))
 
-    # Deduplicate within each batch
-    def deduplicate(rows):
+    # Deduplicate within each batch using the same key as the ON CONFLICT clause
+    def deduplicate_ts(rows):
+        # ON CONFLICT (agent_name, ticker_symbol, data_name, ts_date, source)
+        # row layout: (agent_name[0], ticker[1], data_name[2], ts_date[3], payload[4], source[5], ingested_at[6])
         seen = {}
         for r in rows:
-            key = tuple(r[:4]) + (r[5],)  # exclude payload and timestamp from key
+            key = (r[0], r[1], r[2], r[3], r[5])
             if key not in seen:
                 seen[key] = r
         return list(seen.values())
 
-    rows_ts = deduplicate(rows_ts)
-    rows_fund = deduplicate(rows_fund)
+    def deduplicate_fund(rows):
+        # ON CONFLICT (agent_name, ticker_symbol, data_name, as_of_date, source)
+        # row layout: (agent_name[0], ticker[1], data_name[2], period_type[3], as_of_date[4], payload[5], source[6], ingested_at[7])
+        seen = {}
+        for r in rows:
+            key = (r[0], r[1], r[2], r[4], r[6])
+            if key not in seen:
+                seen[key] = r
+        return list(seen.values())
+
+    rows_ts = deduplicate_ts(rows_ts)
+    rows_fund = deduplicate_fund(rows_fund)
 
     if not rows_ts and not rows_fund:
         return 0
@@ -1454,18 +1529,18 @@ def _insert_dataframe_generic(
             if date_col and rows_ts:
                 execute_values(cur, """
                     INSERT INTO raw_timeseries
-                        (ticker_symbol, data_name, ts_date, payload, source, ingested_at)
+                        (agent_name, ticker_symbol, data_name, ts_date, payload, source, ingested_at)
                     VALUES %s
-                    ON CONFLICT (ticker_symbol, data_name, ts_date, source) DO UPDATE SET
+                    ON CONFLICT (agent_name, ticker_symbol, data_name, ts_date, source) DO UPDATE SET
                         payload     = EXCLUDED.payload,
                         ingested_at = EXCLUDED.ingested_at
                 """, rows_ts)
             if not date_col and rows_fund:
                 execute_values(cur, """
                     INSERT INTO raw_fundamentals
-                        (ticker_symbol, data_name, period_type, as_of_date, payload, source, ingested_at)
+                        (agent_name, ticker_symbol, data_name, period_type, as_of_date, payload, source, ingested_at)
                     VALUES %s
-                    ON CONFLICT (ticker_symbol, data_name, period_type, as_of_date, source) DO UPDATE SET
+                    ON CONFLICT (agent_name, ticker_symbol, data_name, as_of_date, source) DO UPDATE SET
                         payload     = EXCLUDED.payload,
                         ingested_at = EXCLUDED.ingested_at
                 """, rows_fund)
@@ -1923,6 +1998,145 @@ def load_valuation_metrics_from_profile(ticker_symbol: str) -> int:
     return n
 
 
+def load_analyst_ratings_from_profile(ticker_symbol: str) -> int:
+    """
+    Extract analyst ratings data from company_profile.json and upsert
+    into the analyst_ratings table.
+    """
+    profile_path = BASE_ETL_DIR / ticker_symbol / "company_profile.json"
+    if not profile_path.exists():
+        return 0
+
+    try:
+        with open(profile_path) as f:
+            profile: dict = json.load(f)
+    except Exception as exc:
+        print(f"[PG Loader] {ticker_symbol}/analyst_ratings json read error: {exc}")
+        return 0
+
+    ar = profile.get("AnalystRatings", {}) or {}
+    gen = profile.get("General", {}) or {}
+
+    if not ar:
+        print(f"[PG Loader] {ticker_symbol}/analyst_ratings: No analyst ratings in profile")
+        return 0
+
+    total = (ar.get("StrongBuy", 0) or 0) + (ar.get("Buy", 0) or 0) + \
+            (ar.get("Hold", 0) or 0) + (ar.get("Sell", 0) or 0) + \
+            (ar.get("StrongSell", 0) or 0)
+
+    as_of = _safe_date(gen.get("UpdatedAt")) or date.today().isoformat()
+
+    conn = get_pg_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            INSERT INTO analyst_ratings 
+            (ticker, as_of_date, rating, target_price, strong_buy_count, buy_count, 
+             hold_count, sell_count, strong_sell_count, total_analysts)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (ticker, as_of_date) DO UPDATE SET
+                rating = EXCLUDED.rating,
+                target_price = EXCLUDED.target_price,
+                strong_buy_count = EXCLUDED.strong_buy_count,
+                buy_count = EXCLUDED.buy_count,
+                hold_count = EXCLUDED.hold_count,
+                sell_count = EXCLUDED.sell_count,
+                strong_sell_count = EXCLUDED.strong_sell_count,
+                total_analysts = EXCLUDED.total_analysts,
+                updated_at = NOW()
+        """, (
+            ticker_symbol, as_of, 
+            _safe_numeric(ar.get("Rating")),
+            _safe_numeric(ar.get("TargetPrice")),
+            ar.get("StrongBuy"), ar.get("Buy"), ar.get("Hold"), 
+            ar.get("Sell"), ar.get("StrongSell"), total
+        ))
+        conn.commit()
+        print(f"[PG Loader] {ticker_symbol}/analyst_ratings: 1 row upserted")
+        return 1
+    except Exception as exc:
+        print(f"[PG Loader] {ticker_symbol}/analyst_ratings error: {exc}")
+        conn.rollback()
+        return 0
+    finally:
+        cur.close()
+        conn.close()
+
+
+def load_company_profile_from_profile(ticker_symbol: str) -> int:
+    """
+    Extract company profile data from company_profile.json and upsert
+    into the company_profiles table.
+    """
+    profile_path = BASE_ETL_DIR / ticker_symbol / "company_profile.json"
+    if not profile_path.exists():
+        return 0
+
+    try:
+        with open(profile_path) as f:
+            profile: dict = json.load(f)
+    except Exception as exc:
+        print(f"[PG Loader] {ticker_symbol}/company_profile json read error: {exc}")
+        return 0
+
+    gen = profile.get("General", {}) or {}
+    addr = gen.get("AddressData", {}) or {}
+
+    conn = get_pg_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            INSERT INTO company_profiles 
+            (ticker, code, name, exchange, sector, industry, description, address,
+             city, state, country, zip_code, phone, web_url, full_time_employees,
+             ipo_date, is_delisted, currency_code, currency_name, lei, cusip, cik)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (ticker) DO UPDATE SET
+                code = EXCLUDED.code,
+                name = EXCLUDED.name,
+                exchange = EXCLUDED.exchange,
+                sector = EXCLUDED.sector,
+                industry = EXCLUDED.industry,
+                description = EXCLUDED.description,
+                address = EXCLUDED.address,
+                city = EXCLUDED.city,
+                state = EXCLUDED.state,
+                country = EXCLUDED.country,
+                zip_code = EXCLUDED.zip_code,
+                phone = EXCLUDED.phone,
+                web_url = EXCLUDED.web_url,
+                full_time_employees = EXCLUDED.full_time_employees,
+                ipo_date = EXCLUDED.ipo_date,
+                is_delisted = EXCLUDED.is_delisted,
+                currency_code = EXCLUDED.currency_code,
+                currency_name = EXCLUDED.currency_name,
+                lei = EXCLUDED.lei,
+                cusip = EXCLUDED.cusip,
+                cik = EXCLUDED.cik,
+                updated_at = NOW()
+        """, (
+            ticker_symbol, gen.get("Code"), gen.get("Name"), gen.get("Exchange"),
+            gen.get("Sector"), gen.get("Industry"), gen.get("Description"),
+            gen.get("Address"), addr.get("City"), addr.get("State"), 
+            addr.get("Country"), addr.get("ZIP"), gen.get("Phone"), 
+            gen.get("WebURL"), gen.get("FullTimeEmployees"),
+            _safe_date(gen.get("IPODate")), gen.get("IsDelisted", False),
+            gen.get("CurrencyCode"), gen.get("CurrencyName"), gen.get("LEI"),
+            gen.get("CUSIP"), gen.get("CIK")
+        ))
+        conn.commit()
+        print(f"[PG Loader] {ticker_symbol}/company_profile: 1 row upserted")
+        return 1
+    except Exception as exc:
+        print(f"[PG Loader] {ticker_symbol}/company_profile error: {exc}")
+        conn.rollback()
+        return 0
+    finally:
+        cur.close()
+        conn.close()
+
+
 # ── pgvector text chunk ingestion ────────────────────────────────────────────
 
 def _ollama_embed_batch(texts: list[str], model: str, base_url: str) -> list[list[float]]:
@@ -2207,12 +2421,12 @@ def _populate_raw_fundamentals_from_statements(ticker_symbol: str) -> int:
                                 source = v[5]
                                 cur.execute("""
                                     INSERT INTO raw_fundamentals
-                                        (ticker_symbol, data_name, period_type, as_of_date, payload, source)
-                                    VALUES (%s, %s, %s, %s, %s, %s)
-                                    ON CONFLICT (ticker_symbol, data_name, period_type, as_of_date, source) DO UPDATE SET
+                                        (agent_name, ticker_symbol, data_name, period_type, as_of_date, payload, source)
+                                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                                    ON CONFLICT (agent_name, ticker_symbol, data_name, as_of_date, source) DO UPDATE SET
                                         payload = EXCLUDED.payload,
                                         ingested_at = NOW()
-                                """, (ticker, data_name, period_type, as_of_date, payload, source))
+                                """, ('eodhd', ticker, data_name, period_type, as_of_date, payload, source))
                                 inserted += 1
                         conn.commit()
                     total += inserted
@@ -2251,6 +2465,7 @@ def _populate_raw_fundamentals_from_statements(ticker_symbol: str) -> int:
                     "DividendYield": highlights.get("DividendYield"),
                 }
                 rows_metrics.append((
+                    "eodhd",
                     ticker_symbol,
                     "financial_ratios",
                     None,  # period_type - null for snapshot metrics
@@ -2267,6 +2482,7 @@ def _populate_raw_fundamentals_from_statements(ticker_symbol: str) -> int:
                 }
                 if ratios_ttm:
                     rows_metrics.append((
+                        "eodhd",
                         ticker_symbol,
                         "ratios_ttm",
                         None,  # period_type
@@ -2278,6 +2494,7 @@ def _populate_raw_fundamentals_from_statements(ticker_symbol: str) -> int:
             # key_metrics_ttm: full Highlights section
             if highlights:
                 rows_metrics.append((
+                    "eodhd",
                     ticker_symbol,
                     "key_metrics_ttm",
                     None,  # period_type
@@ -2289,6 +2506,7 @@ def _populate_raw_fundamentals_from_statements(ticker_symbol: str) -> int:
             # enterprise_values: Valuation section
             if valuation:
                 rows_metrics.append((
+                    "eodhd",
                     ticker_symbol,
                     "enterprise_values",
                     None,  # period_type
@@ -2299,6 +2517,7 @@ def _populate_raw_fundamentals_from_statements(ticker_symbol: str) -> int:
             
             # financial_scores: placeholder
             rows_metrics.append((
+                "eodhd",
                 ticker_symbol,
                 "financial_scores",
                 None,  # period_type
@@ -2320,9 +2539,9 @@ def _populate_raw_fundamentals_from_statements(ticker_symbol: str) -> int:
                             for row in rows_metrics:
                                 cur.execute("""
                                     INSERT INTO raw_fundamentals
-                                        (ticker_symbol, data_name, period_type, as_of_date, payload, source)
-                                    VALUES (%s, %s, %s, %s, %s, %s)
-                                    ON CONFLICT (ticker_symbol, data_name, period_type, as_of_date, source) DO UPDATE SET
+                                        (agent_name, ticker_symbol, data_name, period_type, as_of_date, payload, source)
+                                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                                    ON CONFLICT (agent_name, ticker_symbol, data_name, as_of_date, source) DO UPDATE SET
                                         payload = EXCLUDED.payload,
                                         ingested_at = NOW()
                                 """, row)
@@ -2459,7 +2678,11 @@ def load_postgres_for_ticker(ticker_symbol: str) -> int:
 
         
     # Embed and upsert text chunks into pgvector text_chunks table
-    profile_path = BASE_ETL_DIR / ticker_symbol / "company_profile.json"
+    # company_profile_neo4j.json has the full nested structure (General/Highlights/Valuation)
+    # that _insert_text_chunks_pg expects; fall back to company_profile.json if not found
+    profile_path = BASE_ETL_DIR / ticker_symbol / "company_profile_neo4j.json"
+    if not profile_path.exists():
+        profile_path = BASE_ETL_DIR / ticker_symbol / "company_profile.json"
     if profile_path.exists():
         try:
             with open(profile_path) as f:
@@ -2612,15 +2835,15 @@ def load_postgres_macro() -> int:
                     payload['_constituent_code'] = code
                     # Use base timestamp + microsecond offset to ensure uniqueness
                     ts = base_ts.replace(microsecond=base_ts.microsecond + idx * 1000)
-                    rows_etf.append(("SPY", "etf_index_constituents", ts, json.dumps(payload), "eodhd", ts))
+                    rows_etf.append(("eodhd", "SPY", "etf_index_constituents", ts, json.dumps(payload), "eodhd", ts))
                 if rows_etf:
                     with get_pg_conn() as conn:
                         with conn.cursor() as cur:
                             execute_values(cur, """
                                 INSERT INTO raw_timeseries
-                                    (ticker_symbol, data_name, ts_date, payload, source, ingested_at)
+                                    (agent_name, ticker_symbol, data_name, ts_date, payload, source, ingested_at)
                                 VALUES %s
-                                ON CONFLICT (ticker_symbol, data_name, ts_date, source) DO UPDATE SET
+                                ON CONFLICT (agent_name, ticker_symbol, data_name, ts_date, source) DO UPDATE SET
                                     payload = EXCLUDED.payload,
                                     ingested_at = NOW()
                             """, rows_etf)

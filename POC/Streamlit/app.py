@@ -25,6 +25,10 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+# ── Load .env file for environment variables ───────────────────────────────
+from dotenv import load_dotenv
+load_dotenv(dotenv_path=_REPO_ROOT / ".env", override=False)
+
 import streamlit as st
 from charts import (
     # Core research charts
@@ -152,9 +156,8 @@ def _render_sidebar_availability() -> None:
 
     tiers = {
         "PostgreSQL":  report.get("postgres", {}),
-        "Qdrant":      report.get("qdrant", {}),
         "Neo4j":       report.get("neo4j", {}),
-        "Ollama":      report.get("ollama", {}),
+        "DeepSeek":    report.get("deepseek", {}),
     }
 
     for name, info in tiers.items():
@@ -181,6 +184,26 @@ def _render_sidebar_availability() -> None:
 
 
 # ── Agent result renderers ────────────────────────────────────────────────────
+
+def _render_thinking_trace(trace: List[Dict[str, Any]]) -> None:
+    """Render the pipeline thinking trace as a collapsible timeline."""
+    if not trace:
+        return
+    with st.expander("Thinking process", expanded=False):
+        for step in trace:
+            ts     = step.get("ts", "")
+            symbol = step.get("symbol", "OK")
+            name   = step.get("name", "")
+            detail = step.get("detail", "")
+            color  = "status-err" if symbol == "!!" else "status-ok"
+            icon   = "✗" if symbol == "!!" else "✓"
+            st.markdown(
+                f"<span class='{color}'>{icon}</span> "
+                f"<code>{ts}</code> **{name}**"
+                + (f"<br><span style='color:#888;font-size:0.85em;margin-left:1.5em'>{detail}</span>" if detail else ""),
+                unsafe_allow_html=True,
+            )
+
 
 def _render_business_analyst(output: Dict[str, Any], ticker: str) -> None:
     """Render Business Analyst agent card."""
@@ -245,6 +268,9 @@ def _render_business_analyst(output: Dict[str, Any], ticker: str) -> None:
         if missing:
             st.caption("Missing context: " + "; ".join(str(m) for m in missing[:3]))
 
+        # Thinking trace
+        _render_thinking_trace(output.get("thinking_trace") or [])
+
 
 def _render_quant_fundamental(output: Dict[str, Any], ticker: str) -> None:
     """Render Quant Fundamental agent card."""
@@ -262,7 +288,7 @@ def _render_quant_fundamental(output: Dict[str, Any], ticker: str) -> None:
             with col1:
                 st.markdown("*Value*")
                 v_rows = {
-                    "P/E":        vf.get("pe_ratio"),
+                    "P/E":        vf.get("pe_trailing") or vf.get("pe_ratio"),
                     "EV/EBITDA":  vf.get("ev_ebitda"),
                     "P/FCF":      vf.get("p_fcf"),
                     "EV/Revenue": vf.get("ev_revenue"),
@@ -290,8 +316,8 @@ def _render_quant_fundamental(output: Dict[str, Any], ticker: str) -> None:
             st.markdown("**Momentum & Risk**")
             c1, c2, c3 = st.columns(3)
             c1.metric("Beta (60d)",    _fmt(mr.get("beta_60d")))
-            c2.metric("Sharpe (12m)",  _fmt(mr.get("sharpe_12m")))
-            c3.metric("Return (12m)",  _pct(mr.get("return_12m")))
+            c2.metric("Sharpe (12m)",  _fmt(mr.get("sharpe_ratio_12m") or mr.get("sharpe_12m")))
+            c3.metric("Return (12m)",  _pct(mr.get("return_12m_pct") or mr.get("return_12m")))
 
         # Anomaly flags
         anomalies = output.get("anomaly_flags") or []
@@ -311,6 +337,9 @@ def _render_quant_fundamental(output: Dict[str, Any], ticker: str) -> None:
         if narrative:
             with st.expander("Quantitative narrative"):
                 st.markdown(narrative)
+
+        # Thinking trace
+        _render_thinking_trace(output.get("thinking_trace") or [])
 
 
 def _render_financial_modelling(output: Dict[str, Any], ticker: str) -> None:
@@ -365,13 +394,13 @@ def _render_financial_modelling(output: Dict[str, Any], ticker: str) -> None:
         # Comps
         if comps:
             st.markdown("**Comparable Analysis**")
-            peer_ev_ebitda = comps.get("peer_ev_ebitda_median")
-            peer_pe        = comps.get("peer_pe_median")
+            peer_ev_ebitda = comps.get("peer_ev_ebitda_median") or comps.get("ev_ebitda")
+            peer_pe        = comps.get("peer_pe_median") or comps.get("pe_trailing")
             implied_ev     = comps.get("implied_ev_ebitda_value")
 
             c1, c2, c3 = st.columns(3)
-            c1.metric("Peer EV/EBITDA (median)", _fmt(peer_ev_ebitda))
-            c2.metric("Peer P/E (median)",        _fmt(peer_pe))
+            c1.metric("EV/EBITDA",        _fmt(peer_ev_ebitda))
+            c2.metric("P/E (trailing)",   _fmt(peer_pe))
             c3.metric("Implied Price (EV/EBITDA)", f"${_fmt(implied_ev)}")
 
         # Technicals
@@ -379,8 +408,8 @@ def _render_financial_modelling(output: Dict[str, Any], ticker: str) -> None:
             st.markdown("**Technicals**")
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("RSI (14)",  _fmt(technicals.get("rsi_14")))
-            c2.metric("MACD",      _fmt(technicals.get("macd")))
-            c3.metric("ATR",       _fmt(technicals.get("atr")))
+            c2.metric("MACD",      _fmt(technicals.get("macd") or technicals.get("macd_histogram")))
+            c3.metric("ATR",       _fmt(technicals.get("atr_14") or technicals.get("atr")))
             c4.metric("SMA 50",    _fmt(technicals.get("sma_50")))
 
             signal = technicals.get("trend_signal") or technicals.get("signal")
@@ -415,6 +444,9 @@ def _render_financial_modelling(output: Dict[str, Any], ticker: str) -> None:
         if narrative:
             with st.expander("Full narrative"):
                 st.markdown(narrative)
+
+        # Thinking trace
+        _render_thinking_trace(output.get("thinking_trace") or [])
 
 
 def _render_web_search(output: Dict[str, Any], ticker: str) -> None:
@@ -652,7 +684,7 @@ def _render_visualisations(state: Dict[str, Any]) -> None:
                     st.plotly_chart(
                         chart_dcf_waterfall(dcf, current_price, ticker),
                         width="stretch",
-                        key=f"dcf_{ticker}_{idx}",
+                        key=f"dcf_{hint}_{ticker}_{idx}",
                     )
                     rendered = True
 
@@ -706,7 +738,7 @@ def _render_visualisations(state: Dict[str, Any]) -> None:
                     st.plotly_chart(
                         chart_factor_scorecard(qf, ticker),
                         width="stretch",
-                        key=f"factor_{ticker}_{idx}",
+                        key=f"factor_{hint}_{ticker}_{idx}",
                     )
                     rendered = True
 
@@ -749,9 +781,28 @@ def _render_agent_outputs(state: Dict[str, Any]) -> None:
     # ── Planner Reasoning ────────────────────────────────────────────────────
     plan = state.get("plan") or {}
     plan_reasoning = plan.get("reasoning") or ""
-    if plan_reasoning:
+    planner_trace  = state.get("planner_trace") or ""
+    if plan_reasoning or planner_trace:
         with st.expander("Planner reasoning", expanded=False):
-            st.markdown(plan_reasoning)
+            if planner_trace:
+                st.markdown("**Chain-of-thought (DeepSeek reasoner):**")
+                st.markdown(
+                    f"<div style='font-size:0.85em;color:#9ca3af;white-space:pre-wrap'>{planner_trace}</div>",
+                    unsafe_allow_html=True,
+                )
+                if plan_reasoning:
+                    st.divider()
+            if plan_reasoning:
+                st.markdown(plan_reasoning)
+
+    # ── Summarizer Thinking Trace ─────────────────────────────────────────────
+    summarizer_trace = state.get("summarizer_trace") or ""
+    if summarizer_trace:
+        with st.expander("Summarizer reasoning (chain-of-thought)", expanded=False):
+            st.markdown(
+                f"<div style='font-size:0.85em;color:#9ca3af;white-space:pre-wrap'>{summarizer_trace}</div>",
+                unsafe_allow_html=True,
+            )
 
     # ── Business Analyst ─────────────────────────────────────────────────────
     ba_outputs: List[Dict] = state.get("business_analyst_outputs") or []
@@ -1034,7 +1085,7 @@ def main() -> None:
     # ── Sidebar ───────────────────────────────────────────────────────────────
     with st.sidebar:
         st.title("Agentic Investment Analyst")
-        st.caption("Powered by LangGraph · Ollama · Qdrant · Neo4j · PostgreSQL")
+        st.caption("Powered by LangGraph · DeepSeek · Neo4j · PostgreSQL")
         st.divider()
         _render_sidebar_availability()
         st.divider()
@@ -1143,6 +1194,21 @@ def main() -> None:
                 for i, step in enumerate(react_steps):
                     st.markdown(f"**Step {i+1}:** `{step.get('tool', '?')}` — "
                                 f"{str(step.get('observation', ''))[:200]}")
+
+        # Pipeline graph (orchestration DAG visualisation)
+        with st.expander("Pipeline graph (orchestration DAG)", expanded=False):
+            try:
+                from orchestration.graph import get_graph as _get_orch_graph
+                _compiled = _get_orch_graph()
+                mermaid_str = _compiled.get_graph().draw_mermaid()
+                st.markdown(
+                    f"```mermaid\n{mermaid_str}\n```",
+                    help="Mermaid diagram of the orchestration pipeline. "
+                         "Copy and paste into https://mermaid.live to render.",
+                )
+                st.caption("Copy the Mermaid source above into https://mermaid.live to render interactively.")
+            except Exception as _graph_err:
+                st.caption(f"Pipeline graph unavailable: {_graph_err}")
 
 
 if __name__ == "__main__":

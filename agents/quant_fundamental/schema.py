@@ -105,12 +105,22 @@ class MomentumRiskFactors:
     beta_60d: Optional[float] = None
     sharpe_ratio_12m: Optional[float] = None
     return_12m_pct: Optional[float] = None
+    sma_50: Optional[float] = None
+    sma_200: Optional[float] = None
+    golden_cross: Optional[bool] = None   # True = golden (SMA50 > SMA200), False = death
+    avg_volume_20d: Optional[float] = None
+    volume_ratio: Optional[float] = None  # latest volume / avg_volume_20d
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "beta_60d": self.beta_60d,
             "sharpe_ratio_12m": self.sharpe_ratio_12m,
             "return_12m_pct": self.return_12m_pct,
+            "sma_50": self.sma_50,
+            "sma_200": self.sma_200,
+            "golden_cross": self.golden_cross,
+            "avg_volume_20d": self.avg_volume_20d,
+            "volume_ratio": self.volume_ratio,
         }
 
 
@@ -195,6 +205,12 @@ class FinancialsBundle:
     short_interest: Dict[str, Any] = field(default_factory=dict)
     # ── EODHD data (Row 21): Earnings History & Surprises (earnings_surprises table)
     earnings_surprises: List[Dict[str, Any]] = field(default_factory=list)
+    # ── Analyst Ratings (analyst_ratings table)
+    analyst_ratings: Optional[Dict[str, Any]] = None
+    # ── Prior-period financial statements (for Piotroski YoY delta signals)
+    income_prev: Dict[str, Any] = field(default_factory=dict)
+    balance_prev: Dict[str, Any] = field(default_factory=dict)
+    cf_prev: Dict[str, Any] = field(default_factory=dict)
 
     def is_empty(self) -> bool:
         return not any([

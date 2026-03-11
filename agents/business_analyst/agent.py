@@ -87,6 +87,8 @@ logger = logging.getLogger(__name__)
 _VERBOSE: bool = False
 
 _STEP_COUNTER: int = 0
+# Per-run thinking trace — collected across all nodes, embedded in final output
+_THINKING_TRACE: List[Dict[str, Any]] = []
 
 
 def _print_progress(step: str, detail: str = "", *, symbol: str = ">>") -> None:
@@ -94,21 +96,34 @@ def _print_progress(step: str, detail: str = "", *, symbol: str = ">>") -> None:
 
     Output goes to stderr so it does not pollute the JSON stdout output.
     Format:  [step N] >> STEP_NAME  detail
+
+    Also appends a record to the module-level _THINKING_TRACE list so that the
+    Streamlit UI can surface each step without needing verbose mode.
     """
-    if not _VERBOSE:
-        return
-    global _STEP_COUNTER
+    global _STEP_COUNTER, _THINKING_TRACE
     _STEP_COUNTER += 1
     ts = datetime.now().strftime("%H:%M:%S")
-    line = f"[{ts}] [{_STEP_COUNTER:02d}] {symbol} {step}"
+    step_num = _STEP_COUNTER
+    # Always record to trace (regardless of _VERBOSE)
+    _THINKING_TRACE.append({
+        "step": step_num,
+        "ts": ts,
+        "symbol": symbol.strip(),
+        "name": step,
+        "detail": detail,
+    })
+    if not _VERBOSE:
+        return
+    line = f"[{ts}] [{step_num:02d}] {symbol} {step}"
     if detail:
         line += f"  |  {detail}"
     print(line, file=sys.stderr, flush=True)
 
 
 def _reset_step_counter() -> None:
-    global _STEP_COUNTER
+    global _STEP_COUNTER, _THINKING_TRACE
     _STEP_COUNTER = 0
+    _THINKING_TRACE = []
 
 
 
@@ -148,6 +163,9 @@ class AgentState(TypedDict, total=False):
     llm_output: Optional[Dict[str, Any]]
     fallback_triggered: bool
     web_search_result: Optional[Dict[str, Any]]
+
+    # Thinking trace — list of step dicts appended by each node for UI display
+    thinking_trace: List[Dict[str, Any]]
 
     # Final output
     output: Optional[Dict[str, Any]]
@@ -292,18 +310,115 @@ def _node_precheck_data_coverage(state: AgentState) -> AgentState:
     data_coverage_warning: Optional[str] = "; ".join(warnings_parts) if warnings_parts else None
 
     # -----------------------------------------------------------------------
+    # 2.5  Ticker / query mismatch validation
+    # -----------------------------------------------------------------------
+    # Check if the query explicitly mentions a company whose ticker does NOT
+    # match the requested ticker.  This catches accidental mismatches like
+    # "Tell me about Microsoft" with ticker=AAPL.
+    # We only warn — we do NOT block the pipeline, as the user may have
+    # intentionally asked about a competitor while scoping to ticker data.
+    _TICKER_ALIASES: Dict[str, List[str]] = {
+        "AAPL":  ["apple", "apple inc"],
+        "MSFT":  ["microsoft", "microsoft corp"],
+        "GOOGL": ["google", "alphabet", "alphabet inc"],
+        "GOOG":  ["google", "alphabet", "alphabet inc"],
+        "AMZN":  ["amazon", "amazon.com"],
+        "NVDA":  ["nvidia", "nvidia corp"],
+        "META":  ["meta", "meta platforms", "facebook"],
+        "TSLA":  ["tesla", "tesla inc", "tesla motors"],
+        "NFLX":  ["netflix", "netflix inc"],
+        "BABA":  ["alibaba", "alibaba group"],
+        "TSM":   ["tsmc", "taiwan semiconductor"],
+        "INTC":  ["intel", "intel corp"],
+        "AMD":   ["amd", "advanced micro devices"],
+        "CRM":   ["salesforce", "salesforce.com"],
+        "ORCL":  ["oracle", "oracle corp"],
+        "SAP":   ["sap", "sap se"],
+        "SONY":  ["sony", "sony group"],
+        "TCEHY": ["tencent", "tencent holdings"],
+        "BIDU":  ["baidu", "baidu inc"],
+        "JD":    ["jd.com", "jingdong"],
+    }
+    if ticker:
+        ticker_upper = ticker.upper()
+        query_lower_check = query.lower()
+        # Names that belong to OTHER tickers but appear in the query
+        foreign_company_mentions: List[str] = []
+        for other_ticker, aliases in _TICKER_ALIASES.items():
+            if other_ticker == ticker_upper:
+                continue  # skip own ticker aliases
+            for alias in aliases:
+                # Use word-boundary matching to avoid false positives (e.g. "apple" in "pineapple")
+                if re.search(r"\b" + re.escape(alias) + r"\b", query_lower_check):
+                    foreign_company_mentions.append(f"{alias} ({other_ticker})")
+                    break  # one match per ticker is enough
+        if foreign_company_mentions:
+            mismatch_msg = (
+                f"Query mentions {', '.join(foreign_company_mentions)} "
+                f"but analysis is scoped to ticker={ticker_upper}. "
+                "Results will only reflect data for the requested ticker. "
+                "If you intended a different company, re-run with the correct ticker."
+            )
+            if data_coverage_warning:
+                data_coverage_warning = data_coverage_warning + "; " + mismatch_msg
+            else:
+                data_coverage_warning = mismatch_msg
+            logger.warning("[PreCheck] Ticker mismatch: %s", mismatch_msg)
+
+    # -----------------------------------------------------------------------
     # 3. Query-type-aware short-circuit for sentiment-only queries
     # -----------------------------------------------------------------------
     # If the query is primarily about sentiment/news AND the DB snapshot is
     # fresh, pre-set crag_status=CORRECT so the complex retrieval path is
     # skipped entirely for this lightweight query type.
-    _SENTIMENT_KEYWORDS = (
-        "sentiment", "bullish", "bearish", "market view", "investor sentiment",
-        "analyst sentiment", "news sentiment", "how is the market feeling",
-        "what does the market think", "crowd sentiment", "wall street view",
+    # IMPORTANT: do NOT short-circuit multi-pillar / comprehensive analysis
+    # queries — these contain the word "sentiment" as one of many pillars but
+    # require full RAG retrieval to produce meaningful output.
+    # Keywords that indicate the query is PURELY about sentiment/market-feel.
+    # The short-circuit should ONLY fire when the query is exclusively asking
+    # about sentiment numbers/trends — NOT when "sentiment" appears alongside
+    # analytical topics like risks, business model, competitive position, etc.
+    _PURE_SENTIMENT_KEYWORDS = (
+        "how is the market feeling",
+        "what does the market think",
+        "what is the sentiment",
+        "current sentiment",
+        "sentiment score",
+        "sentiment trend",
+        "sentiment breakdown",
+        "crowd sentiment",
+        "wall street view",
+        "investor sentiment",
+        "analyst sentiment",
+        "news sentiment",
+        "overall sentiment",
+        "market sentiment",
+    )
+    # Keywords that signal a BROADER analytical question — presence of any of
+    # these means the query is NOT a pure-sentiment query even if it also
+    # mentions sentiment in passing.
+    _ANALYTICAL_TOPIC_MARKERS = (
+        "risk", "business model", "competitive", "moat", "revenue", "growth",
+        "margin", "valuation", "earnings", "guidance", "management", "strategy",
+        "products", "services", "market share", "regulation", "macro",
+        "financial", "profitability", "supply chain", "demand", "esg",
+        "opportunities", "threats", "strengths", "weaknesses", "swot",
+        "explain", "analyze", "assessment", "overview", "summary",
+        "how does", "why does", "what are", "describe",
+        "pillar", "all pillars", "comprehensive", "all of the following",
+        "covering all", "full analysis", "deeply comprehensive",
     )
     query_lower = query.lower()
-    is_sentiment_query = any(kw in query_lower for kw in _SENTIMENT_KEYWORDS)
+    # A query is "pure sentiment" only when it contains a sentiment-specific
+    # phrase AND does NOT contain any broader analytical topic markers.
+    is_pure_sentiment_query = (
+        any(kw in query_lower for kw in _PURE_SENTIMENT_KEYWORDS)
+        and not any(m in query_lower for m in _ANALYTICAL_TOPIC_MARKERS)
+    )
+    is_comprehensive_query = any(m in query_lower for m in _ANALYTICAL_TOPIC_MARKERS)
+    # Also treat very long queries as comprehensive (run_full_analysis task is ~4 KB)
+    if len(query) > 1000:
+        is_comprehensive_query = True
 
     base: Dict[str, Any] = {
         **cast(dict, state),
@@ -312,7 +427,7 @@ def _node_precheck_data_coverage(state: AgentState) -> AgentState:
         "sentiment_is_fresh": sentiment_fresh,
     }
 
-    if is_sentiment_query and sentiment_fresh:
+    if is_pure_sentiment_query and sentiment_fresh and not is_comprehensive_query:
         logger.info(
             "[PreCheck] Sentiment-focused query with fresh DB snapshot for %s — "
             "pre-setting crag_status=CORRECT to skip complex RAG.",
@@ -1205,7 +1320,44 @@ def _node_format_json_output(state: AgentState) -> AgentState:
                 else:
                     logger.debug("Removing ungrounded competitive_moat source: %s", src)
             competitive_moat = {**competitive_moat, "sources": grounded_sources}
-    
+
+    # Repair null/missing competitive_moat.rating when the LLM obeyed the "use null"
+    # hard constraint but we still have a valid competitive_moat block.
+    # Strategy: (1) scan qualitative_summary for explicit moat-rating keywords,
+    # (2) scan qualitative_analysis.narrative, (3) default to "unknown".
+    if isinstance(competitive_moat, dict) and not competitive_moat.get("rating"):
+        _rating_inferred: Optional[str] = None
+        _scan_texts = [
+            llm_output.get("qualitative_summary") or "",
+            (llm_output.get("qualitative_analysis") or {}).get("narrative") or ""
+            if isinstance(llm_output.get("qualitative_analysis"), dict) else "",
+        ]
+        for _scan_text in _scan_texts:
+            if not isinstance(_scan_text, str):
+                continue
+            _t = _scan_text.lower()
+            if "wide moat" in _t or "wide competitive moat" in _t or "rating: wide" in _t or '"wide"' in _t:
+                _rating_inferred = "wide"
+                break
+            if "narrow moat" in _t or "narrow competitive moat" in _t or "rating: narrow" in _t or '"narrow"' in _t:
+                _rating_inferred = "narrow"
+                break
+            if "no moat" in _t or "rating: none" in _t or '"none"' in _t or "moat: none" in _t:
+                _rating_inferred = "none"
+                break
+        if _rating_inferred:
+            logger.info(
+                "[FormatJSON] Inferred competitive_moat.rating=%r from prose text for ticker=%s",
+                _rating_inferred, ticker,
+            )
+        else:
+            _rating_inferred = "unknown"
+            logger.info(
+                "[FormatJSON] competitive_moat.rating was null/empty for ticker=%s — defaulting to 'unknown'",
+                ticker,
+            )
+        competitive_moat = {**competitive_moat, "rating": _rating_inferred}
+
     # Fallback: if LLM put moat analysis in qualitative_summary instead of competitive_moat
     # Use llm_output directly so the guard isn't blocked by the INSUFFICIENT_DATA default
     # that may have already been assigned to the local `qualitative_summary` variable.
@@ -1343,6 +1495,8 @@ def _node_format_json_output(state: AgentState) -> AgentState:
         "qualitative_summary": qualitative_summary or "INSUFFICIENT_DATA: No analysis generated.",
         # Pre-check layer diagnostics (None when data is healthy)
         "data_coverage_warning": state.get("data_coverage_warning"),
+        # Thinking trace — pipeline steps for UI display
+        "thinking_trace": list(_THINKING_TRACE),
     }
 
     # Option B backstop: strip any remaining ungrounded inline citations from all
@@ -1356,8 +1510,15 @@ def _node_format_json_output(state: AgentState) -> AgentState:
     else:
         logger.debug("Skipping inline citation post-processor: real_chunk_ids is empty")
 
-    # Verbose: citation grounding summary
+    # Verbose: citation grounding summary — also surfaced in output for downstream consumers
     citation_report = validate_citations(output, retrieval)
+    output["citation_report"] = {
+        "total_cited": citation_report["total_cited"],
+        "grounded": citation_report["grounded"],
+        "ungrounded": citation_report["ungrounded"],
+        "grounding_rate_pct": round(citation_report["grounding_rate_pct"], 1),
+        "ungrounded_ids": citation_report.get("ungrounded_ids", []),
+    }
     _print_progress(
         "CITATION GROUNDING",
         f"cited={citation_report['total_cited']}  grounded={citation_report['grounded']}  "

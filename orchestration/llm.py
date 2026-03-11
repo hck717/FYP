@@ -4,8 +4,8 @@ Used by:
   - planner_node: parse user query → structured plan + tool selection
   - summarizer_node: synthesise all agent outputs → final narrative with citations
 
-Planner uses llama3.2:latest (fast, ~3-5s).
-Summarizer uses deepseek-r1:8b for deeper reasoning on the final report.
+Planner uses deepseek-chat for planning.
+Summarizer uses deepseek-chat for generating the final report.
 """
 
 from __future__ import annotations
@@ -21,28 +21,20 @@ import requests
 
 logger = logging.getLogger(__name__)
 
-# Determine Ollama URL based on environment
-from pathlib import Path
-_IN_DOCKER = Path("/.dockerenv").exists()
-_DEFAULT_OLLAMA = "http://host.docker.internal:11434" if _IN_DOCKER else "http://localhost:11434"
-_OLLAMA_BASE_URL  = os.getenv("OLLAMA_BASE_URL", _DEFAULT_OLLAMA)
-_PLANNER_MODEL    = os.getenv(
+_DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
+_DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+_PLANNER_MODEL = os.getenv(
     "ORCHESTRATION_PLANNER_MODEL",
-    # Use llama3.2:latest for planning — it is fast (~3s) and reliable.
-    # deepseek-r1:8b is reserved for deep analysis nodes but times out when used
-    # for the lightweight JSON planning task.
-    "llama3.2:latest",
+    "deepseek-chat",
 )
 _SUMMARIZER_MODEL = os.getenv(
     "ORCHESTRATION_SUMMARIZER_MODEL",
-    # deepseek-r1:8b produces substantially deeper, more analytical prose than llama3.2:latest
-    # (3B params). Timeout raised to 1200 s to accommodate ~600 s generation time at 8k tokens.
-    "deepseek-r1:8b",
+    "deepseek-chat",
 )
 _REQUEST_TIMEOUT_ENV = os.getenv("ORCHESTRATION_LLM_TIMEOUT", "").strip()
-_REQUEST_TIMEOUT: Optional[int] = int(_REQUEST_TIMEOUT_ENV) if _REQUEST_TIMEOUT_ENV else None  # no cap — planner is fast but shouldn't hang the pipeline if Ollama is busy
+_REQUEST_TIMEOUT: Optional[int] = int(_REQUEST_TIMEOUT_ENV) if _REQUEST_TIMEOUT_ENV else 60
 _SUMMARIZER_TIMEOUT_ENV = os.getenv("ORCHESTRATION_SUMMARIZER_TIMEOUT", "").strip()
-_SUMMARIZER_TIMEOUT: Optional[int] = int(_SUMMARIZER_TIMEOUT_ENV) if _SUMMARIZER_TIMEOUT_ENV else None  # no hard cap — let the report run to completion
+_SUMMARIZER_TIMEOUT: Optional[int] = int(_SUMMARIZER_TIMEOUT_ENV) if _SUMMARIZER_TIMEOUT_ENV else 1200
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -128,40 +120,57 @@ def _extract_json(text: str) -> Dict[str, Any]:
     raise json.JSONDecodeError("No valid JSON in LLM response", cleaned, 0)
 
 
-def _ollama_generate(
+def _deepseek_generate(
     model: str,
     prompt: str,
     max_tokens: int = 1024,
     temperature: float = 0.1,
     timeout: Optional[int] = None,
-    num_ctx: Optional[int] = None,
-) -> str:
-    """Call Ollama /api/generate and return the raw response text."""
+    system_prompt: Optional[str] = None,
+    return_reasoning: bool = False,
+) -> Any:
+    """Call DeepSeek API and return the raw response text.
+
+    If ``return_reasoning`` is True, returns a tuple ``(content, reasoning_content)``
+    where ``reasoning_content`` is the model's chain-of-thought string (non-empty
+    only when using deepseek-reasoner; empty string otherwise).
+    """
+    headers = {
+        "Authorization": f"Bearer {_DEEPSEEK_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    messages = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": prompt})
+    
     payload: Dict[str, Any] = {
         "model": model,
-        "prompt": prompt,
+        "messages": messages,
         "temperature": temperature,
-        "num_predict": max_tokens,
+        "max_tokens": max_tokens,
         "stream": False,
-        "think": False,
     }
-    if num_ctx is not None:
-        payload["options"] = {"num_ctx": num_ctx}
     _timeout = timeout if timeout is not None else _REQUEST_TIMEOUT
-    # _timeout=None → requests uses no socket timeout (runs until Ollama responds)
     try:
         resp = requests.post(
-            f"{_OLLAMA_BASE_URL}/api/generate",
+            f"{_DEEPSEEK_BASE_URL}/v1/chat/completions",
             json=payload,
+            headers=headers,
             timeout=_timeout,
         )
         resp.raise_for_status()
-        return resp.json().get("response", "")
+        message = resp.json().get("choices", [{}])[0].get("message", {})
+        content: str = message.get("content", "")
+        if return_reasoning:
+            reasoning: str = message.get("reasoning_content", "") or ""
+            return content, reasoning
+        return content
     except requests.exceptions.ConnectionError:
-        logger.error("Ollama not reachable at %s", _OLLAMA_BASE_URL)
+        logger.error("DeepSeek API not reachable at %s", _DEEPSEEK_BASE_URL)
         raise
     except requests.exceptions.Timeout:
-        logger.error("Ollama request timed out after %ss", _timeout)
+        logger.error("DeepSeek request timed out after %ss", _timeout)
         raise
 
 
@@ -673,12 +682,17 @@ def plan_query(user_query: str) -> Dict[str, Any]:
     accuracy over time as user feedback accumulates.
 
     Returns a safe default plan on any LLM failure.
+
+    The returned plan dict always contains a ``"planner_trace"`` key with the
+    model's chain-of-thought reasoning string (empty string if unavailable or
+    served from the semantic router cache).
     """
     # --- semantic router (1C) ----------------------------------------------
     cached = _semantic_router.lookup(user_query)
     if cached is not None:
         logger.info("[planner] Semantic router cache hit (similarity>%.2f) — skipping LLM.",
                     SEMANTIC_ROUTER_THRESHOLD)
+        cached.setdefault("planner_trace", "")
         return cached
 
     today_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -733,7 +747,10 @@ def plan_query(user_query: str) -> Dict[str, Any]:
         _default_complexity = 2
 
     try:
-        raw = _ollama_generate(_PLANNER_MODEL, prompt, max_tokens=512, temperature=0.1)
+        raw, reasoning = _deepseek_generate(
+            _PLANNER_MODEL, prompt, max_tokens=512, temperature=0.1,
+            system_prompt=_PLANNER_SYSTEM, return_reasoning=True,
+        )
         plan = _extract_json(raw)
         plan.setdefault("run_business_analyst", True)
         plan.setdefault("run_quant_fundamental", True)
@@ -757,6 +774,8 @@ def plan_query(user_query: str) -> Dict[str, Any]:
                 "for comprehensive/fundamental query: %r", user_query[:80]
             )
             plan["run_financial_modelling"] = True
+        # Attach reasoning trace (empty string if deepseek-chat, non-empty for deepseek-reasoner)
+        plan["planner_trace"] = reasoning or ""
         # Store in semantic router cache for future bypass
         _semantic_router.store(user_query, plan)
         # Ensure chart_hints is always present (may be absent in older cached plans)
@@ -775,6 +794,7 @@ def plan_query(user_query: str) -> Dict[str, Any]:
             "run_financial_modelling": _is_comprehensive,
             "complexity": _default_complexity,
             "reasoning": "Fallback: planner LLM unavailable, running core agents.",
+            "planner_trace": "",
             "chart_hints": _infer_chart_hints(_query_lower, {
                 "run_financial_modelling": _is_comprehensive,
             }),
@@ -1895,12 +1915,17 @@ def summarise_results(
     quant_output: Optional[Dict[str, Any]] = None,
     web_output: Optional[Dict[str, Any]] = None,
     data_availability: Optional[Dict[str, Any]] = None,
+    _trace_out: Optional[List[str]] = None,
 ) -> str:
     """Call DeepSeek summarizer with all agent outputs and return the narrative + citations.
 
     Accepts multi-ticker lists (ba_outputs, quant_outputs, web_outputs, fm_outputs).
     Legacy single-value keyword arguments are accepted for backward-compatibility but
     are ignored when the list parameters are non-empty.
+
+    If ``_trace_out`` is provided (a list), the model's reasoning trace string is
+    appended to it so the caller can surface it in the UI without changing the
+    return type.
     """
     from .citations import build_citation_block, inject_inline_numbers
 
@@ -2061,18 +2086,26 @@ def summarise_results(
 
     prompt = _trim_prompt_to_window(prompt)
 
-    # deepseek-r1:8b at ~10-15 tok/s (think=False) on Apple Silicon:
+    # deepseek-reasoner:
     #   single:     3000 tok ≈ 200-300s + ~45s prefill ≈ 4-6 min  → target 8-12 min total
     #   comparison: 3000 tok ≈ 200-300s + ~45s prefill ≈ 4-6 min
-    max_tokens = 3000
+    max_tokens = 6000
     try:
-        raw     = _ollama_generate(_SUMMARIZER_MODEL, prompt, max_tokens=max_tokens, temperature=0.2, timeout=_SUMMARIZER_TIMEOUT)
+        raw, reasoning = _deepseek_generate(
+            _SUMMARIZER_MODEL, prompt, max_tokens=max_tokens, temperature=0.2,
+            timeout=_SUMMARIZER_TIMEOUT, system_prompt=_SUMMARIZER_SYSTEM,
+            return_reasoning=True,
+        )
+        if _trace_out is not None:
+            _trace_out.append(reasoning or "")
         cleaned = _strip_think(raw).strip()
         if not cleaned:
             cleaned = "Summary unavailable (LLM returned empty response)."
     except Exception as exc:
         logger.error("Summarizer LLM failed: %s", exc)
         cleaned = f"Summary unavailable ({type(exc).__name__}: {exc})."
+        if _trace_out is not None:
+            _trace_out.append("")
 
     # ── 4. Strip any LLM-generated References / Sources section ─────────────
     cleaned = re.sub(

@@ -1,3 +1,10 @@
+====================================================================================================
+EODHD API DATA INGESTION - COMPLETE REFERENCE GUIDE
+====================================================================================================
+
+## SECTION 1: ALL DATA TYPES FROM EODHD API
+====================================================================================================
+
 Data Type                                      | Source | Destination     | Date Range / Coverage                  | What It Unlocks
 -----------------------------------------------|--------|-----------------|----------------------------------------|----------------------------------------------
 Company Profiles / Tickers                     | EODHD  | PostgreSQL      | Current snapshot                       | Global 150k+ tickers across 70+ exchanges (Code, Type, Name, Exchange, CurrencyCode, CurrencyName, CurrencySymbol, CountryName, CountryISO, OpenFigi, ISIN, LEI, PrimaryTicker, CUSIP, CIK, EmployerIdNumber, FiscalYearEnd, IPODate, InternationalDomestic, Sector, Industry, GicSector, GicGroup, GicIndustry, GicSubIndustry, HomeCategory, IsDelisted, Description, Address Street, Address City, Address State, Address Country, Address ZIP, Listings Code, Listings Exchange, Listings Name, Officers Name, Officers Title, Officers YearBorn, Phone, WebURL, LogoURL, FullTimeEmployees, UpdatedAt)
@@ -22,29 +29,151 @@ Valuation Metrics                              | EODHD  | PostgreSQL      | Last
 Short Interest & Shares Stats                  | EODHD  | PostgreSQL      | Current + recent months                | Short squeeze potential, float analysis, contrarian signals (SharesOutstanding, SharesFloat, PercentInsiders, PercentInstitutions, SharesShort, SharesShortPriorMonth, ShortRatio, ShortPercentOutstanding, ShortPercentFloat, short interest update date)
 Earnings History & Surprises                   | EODHD  | PostgreSQL      | Last 1–2 years (historical quarters)   | EPS surprises, beats/misses patterns for post-earnings strategies (quarter end date, eps actual, eps estimate, surprise percent, revenue actual, revenue estimate, revenue surprise percent, earnings call date)
 Outstanding Shares History                     | EODHD  | PostgreSQL      | Last 1–2 years                         | Accurate per-share metrics, dilution tracking for DCF share count (Date, NumberOfOutstandingShares)
+Analyst Ratings                                | EODHD  | PostgreSQL      | Current snapshot                       | Consensus ratings (Rating, TargetPrice, StrongBuy, Buy, Hold, Sell, StrongSell counts)
 
 
-Company Profiles / Tickers → 3. Business Analysts (company context, sector/industry, peer grouping)
-Financial News (Ticker-Tagged) → 3. Business Analysts (news sentiment, narrative, RAG retrieval)
-Insider Transactions → 3. Business Analysts (management confidence, alignment signals)
-Major Institutional / Mutual Fund Holders → 3. Business Analysts (smart money positioning, ownership structure)
-Historical Stock Prices (EOD) → 1. Fundamental Math Agent (short-term momentum, viz inputs)
-Intraday / Delayed Live Quotes → 1. Fundamental Math Agent (anomaly detection, short-term monitoring)
-Beta & Volatility / Technicals → 1. Fundamental Math Agent (volatility, momentum indicators)
-Screener API (Bulk) → 1. Fundamental Math Agent (universe filtering, cross-sectional screening)
-Basic Fundamentals (EPS, key metrics) → 1. Fundamental Math Agent & 2. Financial Modelling Agent (EPS trends, ratios, growth rates)
-Dividend History / Stock Splits → 2. Financial Modelling Agent (corporate actions adjustment, dividend modeling)
-Treasury Rates / Macro Indicators → 2. Financial Modelling Agent (risk-free rate, scenario assumptions)
-Economic Events Data API → 2. Financial Modelling Agent (macro surprises, DCF scenario inputs)
-Bonds Data (Yields, Pricing) → 2. Financial Modelling Agent (cost of debt, WACC inputs)
-Forex Historical Rates (EOD) → 2. Financial Modelling Agent (multi-currency conversion)
-ETF & Index Constituent Holdings → 3. Business Analysts (peer grouping, passive flow impact)
-Financial Calendar → 3. Business Analysts (event-driven catalysts, earnings triggers)
-Real-Time News Feed → 3. Business Analysts (recent news context, sentiment)
-Financial Statements (IS/BS/CF) → 2. Financial Modelling Agent (detailed DCF inputs, FCF projections)
-Valuation Metrics → 2. Financial Modelling Agent (relative multiples, terminal value)
-Short Interest & Shares Stats → 1. Fundamental Math Agent (short squeeze, contrarian signals)
-Earnings History & Surprises → 1. Fundamental Math Agent (post-earnings drift, surprise patterns)
-Outstanding Shares History → 2. Financial Modelling Agent (per-share accuracy, dilution tracking)
-Sentiment Trends → 3. Business Analysts (brand/moat, narrative enrichment)
-Textual Documents Metadata → 3. Business Analysts (RAG retrieval, textual chunking)
+## SECTION 2: TEXTUAL DATA (BROKER REPORTS, EARNINGS CALLS)
+====================================================================================================
+
+Data Type                                      | Source | Destination     | Description                                | What It Unlocks
+-----------------------------------------------|--------|-----------------|-------------------------------------------|----------------------------------------------
+Broker Reports                                 | PDF    | Neo4j + Qdrant | Institutional research reports           | RAG retrieval, competitive moat analysis
+Earnings Call Transcripts                      | PDF    | Neo4j + Qdrant | Quarterly earnings call transcripts      | Management sentiment, forward guidance
+Textual Documents Metadata                     | -      | PostgreSQL      | Document index (ticker, type, institution) | Document tracking
+Text Chunks                                    | -      | PostgreSQL      | Chunked text with embeddings              | Semantic search
+
+
+## SECTION 3: AGENT DATA USAGE MAPPING
+====================================================================================================
+
+### AGENT 1: QUANTITATIVE FUNDAMENTAL AGENT
+---------------------------------------
+Data Type                                      | Current Status | After Update
+-----------------------------------------------|----------------|--------------
+raw_fundamentals (EPS, margins)                | ✓ Present      | + Enhanced
+valuation_metrics (P/E, EV/EBITDA)            | ✓ Present      | + Complete
+short_interest (short squeeze)                 | ✓ Present      | + Full
+earnings_surprises (EPS beats)                 | ✓ Present      | ✓
+dividends_history                              | ✓ Present      | ✓
+splits_history                                 | ✓ Present      | ✓
+raw_timeseries (prices)                        | ✓ Present      | ✓
+institutional_holders (smart money)           | ✓ Present      | ✓
+insider_transactions (management)              | ✓ Present      | ✓
+analyst_ratings                                | ✗ MISSING      | + ADD
+Beta & Technicals (RSI, MACD, Bollinger)     | ✗ MISSING      | + ADD
+Shares Stats (Outstanding, Float)              | ✗ MISSING      | + ADD
+
+
+### AGENT 2: FINANCIAL MODELLING AGENT
+---------------------------------------
+Data Type                                      | Current Status | After Update
+-----------------------------------------------|----------------|--------------
+raw_fundamentals                               | ✓ Present      | + Enhanced
+valuation_metrics                              | ✓ Present      | + Complete
+financial_statements (IS/BS/CF)                | ✓ Present      | ✓
+dividends_history                             | ✓ Present      | ✓
+splits_history                                 | ✓ Present      | ✓
+outstanding_shares                             | ✓ Present      | ✓
+treasury_rates                                | ✓ Present      | ✓
+corporate_bond_yields                         | ✓ Present      | ✓
+forex_rates                                   | ✓ Present      | ✓
+economic_events                               | ✓ Present      | ✓
+financial_calendar                             | ✓ Present      | ✓
+analyst_ratings                               | ✗ MISSING      | + ADD
+Beta & Technicals (SMA, EMA, ATR)             | ✗ MISSING      | + ADD
+Company Profiles                               | ✗ MISSING      | + ADD
+
+
+### AGENT 3: BUSINESS ANALYST AGENT
+---------------------------------------
+Data Type                                      | Current Status | After Update
+-----------------------------------------------|----------------|--------------
+Neo4j Chunks (RAG retrieval)                 | ✓ Present      | 5,044 chunks
+PostgreSQL text_chunks                         | ⚠ Partial      | 48 (need sync)
+textual_documents (metadata)                   | ✓ Present      | 40 docs
+sentiment_trends                               | ✓ Present      | 177 rows
+broker_reports                                 | ✓ Present      | Neo4j
+earnings_calls                                 | ✓ Present      | Neo4j
+analyst_ratings                               | ✗ MISSING      | + ADD
+Company Profiles                               | ✗ MISSING      | + ADD
+institutional_holders (smart money)           | ✓ Present      | ✓
+insider_transactions (management)             | ✓ Present      | ✓
+
+
+## SECTION 4: POSTGRESQL TABLES STATUS
+====================================================================================================
+
+Table Name                     | Row Count | Status
+-------------------------------|-----------|------------------------
+raw_fundamentals               | 2,524     | ✓ Present (JSON payload)
+valuation_metrics              | 15        | ⚠ Partial
+short_interest                 | 30        | ⚠ Partial
+earnings_surprises             | 521       | ✓ Present
+insider_transactions           | 3,627     | ✓ Present
+institutional_holders          | 243       | ✓ Present
+financial_statements           | 2,229     | ✓ Present
+dividends_history              | 394       | ✓ Present
+splits_history                 | 39        | ✓ Present
+outstanding_shares             | ?         | Need check
+corporate_bond_yields         | 1,005     | ✓ Present
+treasury_rates                | 176       | ✓ Present
+forex_rates                   | 36        | ✓ Present
+economic_events               | 26        | ✓ Present
+financial_calendar            | 3,637     | ✓ Present
+news_articles                 | 713       | ✓ Present
+text_chunks                   | 48        | ⚠ Need sync with Neo4j
+textual_documents             | 40        | ✓ Present
+sentiment_trends              | 177       | ✓ Present
+market_eod_us                 | 504       | ✓ Present
+raw_timeseries               | 884,073   | ✓ Present
+
+
+## SECTION 5: NEO4J DATA STATUS
+====================================================================================================
+
+Node Type    | Count  | Status
+-------------|--------|-------
+Company      | 51     | ✓ Present
+Chunk        | 5,044  | ✓ Present (with embeddings)
+
+
+## SECTION 6: DATA FIELDS TO ADD
+====================================================================================================
+
+### NEW DATA TYPES TO INGEST FROM EODHD:
+
+1. **Analyst Ratings** (NEW)
+   - Fields: Rating, TargetPrice, StrongBuy, Buy, Hold, Sell, StrongSell
+   - For: All 3 agents
+
+2. **Company Profiles** (NEW)
+   - Fields: Code, Name, Exchange, Sector, Industry, Description, Address, Officers, Listings
+   - For: Business Analyst, Financial Modelling
+
+3. **Full Technical Indicators** (NEW)
+   - Fields: Beta, 52WeekHigh, 52WeekLow, 50DayMA, 200DayMA, RSI, MACD, Bollinger
+   - For: Quant Fundamental, Financial Modelling
+
+4. **Shares Stats** (NEW)
+   - Fields: SharesOutstanding, SharesFloat, PercentInsiders, PercentInstitutions
+   - For: All 3 agents
+
+5. **Enhanced Valuation Metrics** (UPDATE)
+   - Fields: Add missing fields from EODHD Highlights and Valuation sections
+   - For: Financial Modelling
+
+6. **Dividend Details** (UPDATE)
+   - Fields: ForwardAnnualDividendRate, ForwardAnnualDividendYield, PayoutRatio
+   - For: Financial Modelling
+
+
+## SECTION 7: IMPLEMENTATION PRIORITY
+====================================================================================================
+
+Priority | Data Type              | Agent Impact
+---------|----------------------|--------------
+1        | Analyst Ratings       | All 3 agents
+2        | Company Profiles      | BA, FM
+3        | Full Technicals       | Quant, FM
+4        | Shares Stats          | All 3 agents
+5        | Text Chunk Sync       | BA (RAG)

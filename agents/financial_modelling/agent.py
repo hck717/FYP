@@ -85,6 +85,30 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Thinking-trace helpers — lightweight per-run step recorder
+# ---------------------------------------------------------------------------
+
+_FM_THINKING_TRACE: List[Dict[str, Any]] = []
+
+
+def _trace_fm(step: str, detail: str = "", *, ok: bool = True) -> None:
+    """Append a pipeline step record to the module-level FM trace list."""
+    global _FM_THINKING_TRACE
+    _FM_THINKING_TRACE.append({
+        "ts": datetime.now(timezone.utc).strftime("%H:%M:%S"),
+        "symbol": "OK" if ok else "!!",
+        "name": step,
+        "detail": detail,
+    })
+    logger.debug("[FM] %s  %s", step, detail)
+
+
+def _reset_trace_fm() -> None:
+    global _FM_THINKING_TRACE
+    _FM_THINKING_TRACE = []
+
+
+# ---------------------------------------------------------------------------
 # Graph state
 # ---------------------------------------------------------------------------
 
@@ -113,6 +137,9 @@ class AgentState(TypedDict, total=False):
     # Final output
     output: Optional[Dict[str, Any]]
 
+    # Thinking trace — pipeline steps for UI display
+    thinking_trace: List[Dict[str, Any]]
+
 
 # ---------------------------------------------------------------------------
 # Node 1: fetch_price_history
@@ -124,6 +151,7 @@ def _node_fetch_price_history(
 ) -> AgentState:
     """Fetch EOD price history, Treasury rates, and benchmark from PostgreSQL."""
     ticker = state.get("ticker", "")
+    _trace_fm("FETCH PRICE HISTORY", f"ticker={ticker}")
     try:
         # Price history, treasury rates, and benchmark are all fetched by FMDataFetcher.fetch()
         # We start with an empty bundle here and the next node fills fundamentals.
@@ -154,10 +182,15 @@ def _node_fetch_price_history(
             "fetch_price_history: %s prices=%d treasury=%d benchmark=%d",
             ticker, len(bundle.price_history), len(bundle.treasury_rates), len(bundle.benchmark_history),
         )
+        _trace_fm(
+            "FETCH PRICE HISTORY done",
+            f"prices={len(bundle.price_history)}  treasury={len(bundle.treasury_rates)}  benchmark={len(bundle.benchmark_history)}",
+        )
         return {**state, "bundle": bundle, "fetch_error": None}
 
     except Exception as exc:
         logger.error("fetch_price_history failed for %s: %s", ticker, exc, exc_info=True)
+        _trace_fm("FETCH PRICE HISTORY done", f"ERROR: {exc}", ok=False)
         return {**state, "bundle": FMDataBundle(ticker=ticker), "fetch_error": str(exc)}
 
 
@@ -172,6 +205,7 @@ def _node_fetch_fundamentals(
     """Fetch all fundamentals data from PostgreSQL into the bundle."""
     ticker = state.get("ticker", "")
     bundle: FMDataBundle = state.get("bundle") or FMDataBundle(ticker=ticker)
+    _trace_fm("FETCH FUNDAMENTALS", f"ticker={ticker}")
 
     try:
         full_bundle = toolkit.fetch_data(ticker)
@@ -188,10 +222,15 @@ def _node_fetch_fundamentals(
             ticker, len(full_bundle.income), len(full_bundle.scores),
             len(full_bundle.peer_fundamentals),
         )
+        _trace_fm(
+            "FETCH FUNDAMENTALS done",
+            f"income_keys={len(full_bundle.income)}  scores_keys={len(full_bundle.scores)}  peers={len(full_bundle.peer_fundamentals)}",
+        )
         return {**state, "bundle": full_bundle}
 
     except Exception as exc:
         logger.error("fetch_fundamentals failed for %s: %s", ticker, exc, exc_info=True)
+        _trace_fm("FETCH FUNDAMENTALS done", f"ERROR: {exc}", ok=False)
         return {**state, "fetch_error": str(exc)}
 
 
@@ -203,10 +242,16 @@ def _node_fetch_earnings_history(state: AgentState) -> AgentState:
     """Parse earnings history from bundle and compute EPS surprise + streaks."""
     bundle: Optional[FMDataBundle] = state.get("bundle")
     if bundle is None or bundle.is_empty():
+        _trace_fm("FETCH EARNINGS HISTORY", "no bundle — skipped", ok=False)
         return {**state, "earnings": EarningsRecord()}
 
     record = _compute_earnings_record(bundle)
     logger.debug("earnings for %s: %s", bundle.ticker, record.to_dict())
+    _trace_fm(
+        "FETCH EARNINGS HISTORY",
+        f"beat_streak={record.beat_streak}  miss_streak={record.miss_streak}"
+        f"  surprise_pct={record.surprise_pct}  next_date={record.next_earnings_date}",
+    )
     return {**state, "earnings": record}
 
 
@@ -347,11 +392,16 @@ def _node_calculate_technicals(state: AgentState) -> AgentState:
     """Run technical indicator computation."""
     bundle: Optional[FMDataBundle] = state.get("bundle")
     if bundle is None:
+        _trace_fm("CALCULATE TECHNICALS", "no bundle — skipped", ok=False)
         return {**state, "technicals": TechnicalSnapshot()}
 
     engine = TechnicalEngine()
     snap = engine.compute(bundle)
     logger.debug("technicals for %s: trend=%s rsi=%s", bundle.ticker, snap.trend, snap.rsi_14)
+    _trace_fm(
+        "CALCULATE TECHNICALS",
+        f"trend={snap.trend}  rsi={snap.rsi_14}  macd={snap.macd}",
+    )
     return {**state, "technicals": snap}
 
 
@@ -432,9 +482,103 @@ def _node_macro_environment(state: AgentState) -> AgentState:
         "mrp_delta": round(delta, 5),
         "vix_adjusted_mrp": adjusted_mrp,
     }
+
+    # ── Sector-specific macro factors ────────────────────────────────────
+    # Derive sector from bundle for context
+    sector: Optional[str] = None
+    for d in [bundle.scores, bundle.enterprise]:
+        if d:
+            for key in ("sector", "Sector", "GicSector", "gicSector", "General_Sector"):
+                v = d.get(key)
+                if v and isinstance(v, str):
+                    sector = v
+                    break
+        if sector:
+            break
+
+    # ── FX impact ────────────────────────────────────────────────────────
+    fx_summary: Optional[str] = None
+    if bundle.forex_rates:
+        # Pick the most recent EUR/USD and USD/CNY rates as proxy
+        eur_usd = next(
+            (_sf(r.get("close") or r.get("rate")) for r in bundle.forex_rates
+             if str(r.get("pair", "") or r.get("ticker", "")).upper() in ("EURUSD", "EUR.USD")), None
+        )
+        usd_cny = next(
+            (_sf(r.get("close") or r.get("rate")) for r in bundle.forex_rates
+             if str(r.get("pair", "") or r.get("ticker", "")).upper() in ("USDCNY", "USD.CNY", "CNYUSD")), None
+        )
+        if eur_usd or usd_cny:
+            parts = []
+            if eur_usd:
+                parts.append(f"EUR/USD={eur_usd:.4f}")
+            if usd_cny:
+                parts.append(f"USD/CNY={usd_cny:.4f}")
+            fx_summary = ", ".join(parts)
+    macro_env["fx_rates_summary"] = fx_summary
+
+    # ── Interest rate sensitivity ─────────────────────────────────────────
+    # 2Y yield spread (yield curve slope) — if available from macro_indicators
+    rate_2y: Optional[float] = None
+    cpi_yoy: Optional[float] = None
+    ppi_yoy: Optional[float] = None
+    if bundle.macro_indicators:
+        for row in bundle.macro_indicators:
+            key_name = str(row.get("indicator") or row.get("name") or "").lower()
+            val = _sf(row.get("value"))
+            if val is None:
+                continue
+            if "2y" in key_name or "2 year" in key_name or "two_year" in key_name:
+                rate_2y = val / 100 if val > 1 else val
+            elif "cpi" in key_name and "yoy" in key_name:
+                cpi_yoy = val / 100 if val > 10 else val
+            elif "ppi" in key_name and "yoy" in key_name:
+                ppi_yoy = val / 100 if val > 10 else val
+
+    yield_curve_slope = round(rf - rate_2y, 5) if rate_2y is not None else None  # 10Y - 2Y
+    macro_env["yield_curve_slope_10y_2y"] = yield_curve_slope
+    macro_env["rate_2y"] = rate_2y
+    macro_env["interest_rate_sensitivity"] = (
+        "high" if yield_curve_slope is not None and yield_curve_slope < 0 else
+        "moderate" if yield_curve_slope is not None and yield_curve_slope < 0.01 else
+        "normal"
+    )
+
+    # ── Inflation impact on input costs ──────────────────────────────────
+    macro_env["cpi_yoy"] = cpi_yoy
+    macro_env["ppi_yoy"] = ppi_yoy
+    if ppi_yoy is not None:
+        if ppi_yoy > 0.05:
+            macro_env["input_cost_pressure"] = "elevated"
+        elif ppi_yoy > 0.02:
+            macro_env["input_cost_pressure"] = "moderate"
+        else:
+            macro_env["input_cost_pressure"] = "low"
+    else:
+        macro_env["input_cost_pressure"] = "unknown"
+
+    # ── China-US trade relations risk ─────────────────────────────────────
+    # Flag elevated risk for sectors with high China exposure
+    _china_exposed_sectors = {
+        "information technology", "technology", "consumer electronics",
+        "semiconductors", "materials", "industrials", "consumer discretionary",
+    }
+    china_trade_risk: str = "unknown"
+    if sector:
+        china_trade_risk = (
+            "elevated" if sector.lower() in _china_exposed_sectors else "low"
+        )
+    macro_env["china_us_trade_risk"] = china_trade_risk
+    macro_env["sector"] = sector
+
     logger.info(
-        "[Macro] rf=%.3f hv30=%s regime=%s mrp=%.4f → %.4f",
-        rf, hv30, regime, base_mrp, adjusted_mrp,
+        "[Macro] rf=%.3f hv30=%s regime=%s mrp=%.4f→%.4f  fx=%s  yield_slope=%s  cpi=%s  china_risk=%s",
+        rf, hv30, regime, base_mrp, adjusted_mrp, fx_summary, yield_curve_slope, cpi_yoy, china_trade_risk,
+    )
+    _trace_fm(
+        "MACRO ENVIRONMENT",
+        f"rf={rf:.3f}  hv30={hv30}  regime={regime}  mrp={base_mrp:.4f}→{adjusted_mrp:.4f}"
+        f"  fx={fx_summary}  yield_slope={yield_curve_slope}  china_risk={china_trade_risk}",
     )
     return {**state, "bundle": bundle, "macro_environment": macro_env}
 
@@ -450,6 +594,7 @@ def _node_run_dcf_model(
     """Run DCF engine: WACC, FCF projections, scenario table, sensitivity matrix."""
     bundle: Optional[FMDataBundle] = state.get("bundle")
     if bundle is None:
+        _trace_fm("RUN DCF MODEL", "no bundle — skipped", ok=False)
         return {**state, "dcf_result": DCFResult()}
 
     engine = DCFEngine(config)
@@ -458,7 +603,23 @@ def _node_run_dcf_model(
         "dcf for %s: base=%s wacc=%s",
         bundle.ticker, result.intrinsic_value_base, result.wacc_used,
     )
-    return {**state, "dcf_result": result}
+    _trace_fm(
+        "RUN DCF MODEL",
+        f"bear={result.intrinsic_value_bear}  base={result.intrinsic_value_base}"
+        f"  bull={result.intrinsic_value_bull}  wacc={result.wacc_used}"
+        f"  roic_wacc_spread={result.roic_wacc_spread}",
+    )
+
+    # ── Beta consistency: sync DCF-computed beta into TechnicalSnapshot ──
+    # TechnicalEngine runs before DCF and computes beta independently.
+    # Override with DCF beta so both sections show the identical value.
+    updated_state: AgentState = {**state, "dcf_result": result}
+    if result.beta_used is not None:
+        tech_snap: Optional[TechnicalSnapshot] = state.get("technicals")
+        if tech_snap is not None:
+            tech_snap.beta = result.beta_used
+            updated_state["technicals"] = tech_snap
+    return updated_state
 
 
 # ---------------------------------------------------------------------------
@@ -481,6 +642,20 @@ _MOE_PERSONAS: Dict[str, Dict[str, float]] = {
         "terminal_growth_rate_delta":  0.0,
         "discount_rate_delta":         0.0,
         "revenue_growth_multiplier":   1.0,
+    },
+    "InnovationCycle": {
+        # Focuses on product/innovation cycle acceleration:
+        # elevated near-term revenue growth + margin expansion from scale economies
+        "terminal_growth_rate_delta": +0.008,   # +0.8% TGR — durable competitive advantage
+        "discount_rate_delta":        -0.005,   # -0.5% WACC — reduced risk from innovation moat
+        "revenue_growth_multiplier":   1.40,    # 40% revenue uplift from product cycle tailwinds
+    },
+    "RegulatoryRisk": {
+        # Focuses on regulatory headwinds: antitrust, data privacy, AI regulation,
+        # tariffs, or sector-specific compliance costs
+        "terminal_growth_rate_delta": -0.008,   # -0.8% TGR — regulatory drag on long-run growth
+        "discount_rate_delta":        +0.020,   # +2% WACC — higher risk premium for regulatory uncertainty
+        "revenue_growth_multiplier":   0.80,    # 20% revenue haircut from regulatory constraints
     },
 }
 
@@ -623,7 +798,7 @@ def _node_moe_consensus(
         return state
 
     persona_results: List[Dict[str, Any]] = []
-    with ThreadPoolExecutor(max_workers=3, thread_name_prefix="moe") as executor:
+    with ThreadPoolExecutor(max_workers=5, thread_name_prefix="moe") as executor:
         futures = {
             executor.submit(
                 _moe_persona_valuation, name, params, base_result, config
@@ -656,7 +831,7 @@ def _node_moe_consensus(
         f"  {p['persona']}: {p['narrative']}" for p in sorted(persona_results, key=lambda x: x["persona"])
     )
     synthesis_prompt = (
-        f"Three analysts have produced DCF scenario estimates:\n{narratives_block}\n\n"
+        f"{len(persona_results)} analysts have produced DCF scenario estimates:\n{narratives_block}\n\n"
         f"Synthesise their views into a 3-sentence Bear/Base/Bull consensus:\n"
         f"  Bear consensus: ${consensus_bear}\n"
         f"  Base consensus: ${consensus_base}\n"
@@ -711,6 +886,10 @@ def _node_moe_consensus(
         "[MoE] Consensus: bear=%s base=%s bull=%s",
         consensus_bear, consensus_base, consensus_bull,
     )
+    _trace_fm(
+        "MOE CONSENSUS",
+        f"personas={len(persona_results)}  bear={consensus_bear}  base={consensus_base}  bull={consensus_bull}",
+    )
     return {**state, "moe_consensus": moe_consensus}
 
 def _node_run_comparable_analysis(
@@ -753,6 +932,11 @@ def _node_run_comparable_analysis(
         bundle.ticker, result.ev_ebitda, result.pe_trailing, result.pe_forward,
         result.vs_sector_avg, result.peer_group,
     )
+    _trace_fm(
+        "RUN COMPARABLE ANALYSIS",
+        f"ev_ebitda={result.ev_ebitda}  pe_trailing={result.pe_trailing}"
+        f"  peers={result.peer_group}  vs_sector={result.vs_sector_avg}",
+    )
     return {**state, "comps_result": result}
 
 
@@ -780,6 +964,11 @@ def _node_assess_analyst_estimates(state: AgentState) -> AgentState:
         bundle.ticker, dividends.dividend_yield,
         scores.piotroski_f_score, scores.beneish_m_score, scores.altman_z_score,
     )
+    _trace_fm(
+        "ASSESS ANALYST ESTIMATES",
+        f"div_yield={dividends.dividend_yield}  piotroski={scores.piotroski_f_score}"
+        f"  beneish={scores.beneish_m_score}  altman={scores.altman_z_score}  price={current_price}",
+    )
     return {
         **state,
         "dividends": dividends,
@@ -805,6 +994,11 @@ def _node_build_three_statement_model(state: AgentState) -> AgentState:
         bundle.ticker,
         len(model.income_statements),
         [(c.period, c.bs_balance_holds, c.cash_linkage_holds) for c in model.linkage_checks],
+    )
+    _trace_fm(
+        "BUILD THREE STATEMENT MODEL",
+        f"is_periods={len(model.income_statements)}  "
+        f"linkage_checks={len(model.linkage_checks)}",
     )
     return {**state, "three_statement": model}
 
@@ -1338,6 +1532,119 @@ def _generate_summary(config: FinancialModellingConfig, factor_table: Dict[str, 
         return _generate_summary_ollama(config, prompt)
 
 
+_EXECUTIVE_BLOCK_SYSTEM = """You are a senior equity research analyst.
+Given the factor table below, produce a JSON object with exactly two keys:
+
+"executive_summary": A 2-3 sentence high-level verdict that states (a) the single most
+  critical quantitative finding with a specific number, (b) the valuation standing
+  (cheap/fair/expensive) with a reference multiple, and (c) the primary risk that could
+  invalidate the current picture. Be direct and specific — no banned words (robust, solid,
+  compelling, impressive, notable, remarkable, standout, well-positioned, healthy,
+  exceptional, outstanding, stellar). No buy/sell/hold recommendation.
+
+"investment_recommendation": An object with these four string fields:
+  "thesis": 1-2 sentences — the primary reason an investor would find this stock
+    interesting right now, grounded in specific numbers from the factor table.
+  "catalysts": 1-2 sentences — 2-3 concrete near-term catalysts (earnings date, product
+    cycle, macro shift) that could cause the thesis to play out, with time horizon.
+  "risks": 1-2 sentences — the 2-3 most material risks that could invalidate the thesis,
+    each with a quantified financial magnitude where possible.
+  "time_horizon": A string — "short-term (0-3 months)", "medium-term (3-12 months)", or
+    "long-term (1-3 years)". Pick the horizon that best matches the available catalysts.
+
+Output ONLY valid JSON. No preamble, no markdown fences, no commentary.
+"""
+
+
+def _generate_executive_block(
+    config: FinancialModellingConfig,
+    factor_table: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Call LLM to produce executive_summary + investment_recommendation fields.
+
+    Returns a dict with keys 'executive_summary' (str) and 'investment_recommendation'
+    (dict). Falls back to empty strings on any failure — never raises.
+    """
+    _default: Dict[str, Any] = {
+        "executive_summary": "",
+        "investment_recommendation": {
+            "thesis": "", "catalysts": "", "risks": "", "time_horizon": "",
+        },
+    }
+    try:
+        lines: List[str] = []
+        for section, val in factor_table.items():
+            if isinstance(val, dict):
+                for k, v in val.items():
+                    lines.append(f"  {k}: {v}" if v is not None else f"  {k}: null")
+            elif isinstance(val, list):
+                lines.append(f"  {section}: {json.dumps(val, default=str)}" if val else f"  {section}: (none)")
+            else:
+                lines.append(f"  {section}: {val}")
+
+        prompt = (
+            f"--- FACTOR TABLE ---\n"
+            f"{chr(10).join(lines)}\n"
+            f"--- END FACTOR TABLE ---\n\n"
+            f"Produce the JSON object now:"
+        )
+
+        if config.llm_provider == "deepseek" and config.deepseek_api_key:
+            from openai import OpenAI
+            client = OpenAI(api_key=config.deepseek_api_key, base_url="https://api.deepseek.com")
+            # Use deepseek-chat for structured JSON tasks — deepseek-reasoner puts
+            # output in reasoning_content which is not suitable for JSON extraction.
+            _exec_model = "deepseek-chat"
+            response = client.chat.completions.create(
+                model=_exec_model,
+                messages=[
+                    {"role": "system", "content": _EXECUTIVE_BLOCK_SYSTEM},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.1,
+                max_tokens=600,
+            )
+            msg = response.choices[0].message
+            raw = msg.content or getattr(msg, "reasoning_content", None) or ""
+        else:
+            # Fallback: Ollama
+            payload = {
+                "model": config.llm_model,
+                "prompt": f"{_EXECUTIVE_BLOCK_SYSTEM}\n\n{prompt}",
+                "temperature": 0.1,
+                "num_predict": 600,
+                "stream": False,
+                "think": False,
+            }
+            resp = requests.post(
+                f"{config.ollama_base_url}/api/generate",
+                json=payload,
+                timeout=config.request_timeout,
+            )
+            resp.raise_for_status()
+            raw = resp.json().get("response", "")
+
+        # Strip think tags and markdown fences
+        cleaned = _strip_think_tags(raw)
+        cleaned = _strip_markdown_fences(cleaned)
+        result = json.loads(cleaned)
+        # Validate structure
+        exec_sum = result.get("executive_summary", "")
+        inv_rec = result.get("investment_recommendation", {})
+        if not isinstance(exec_sum, str):
+            exec_sum = str(exec_sum)
+        if not isinstance(inv_rec, dict):
+            inv_rec = {}
+        inv_rec.setdefault("thesis", "")
+        inv_rec.setdefault("catalysts", "")
+        inv_rec.setdefault("risks", "")
+        inv_rec.setdefault("time_horizon", "")
+        return {"executive_summary": exec_sum, "investment_recommendation": inv_rec}
+    except Exception as exc:
+        logger.warning("[FM] _generate_executive_block failed (non-fatal): %s", exc)
+        return _default
+
+
 def _generate_summary_deepseek(config: FinancialModellingConfig, prompt: str) -> str:
     """Call DeepSeek API to produce the quantitative_summary narrative."""
     try:
@@ -1364,7 +1671,8 @@ def _generate_summary_deepseek(config: FinancialModellingConfig, prompt: str) ->
             temperature=config.llm_temperature,
             max_tokens=config.llm_max_tokens,
         )
-        content = response.choices[0].message.content
+        msg = response.choices[0].message
+        content = msg.content or getattr(msg, "reasoning_content", None) or ""
         if not content or not content.strip():
             return "Quantitative summary unavailable (LLM returned empty response)."
         cleaned = _clean_response(content)
@@ -1415,6 +1723,7 @@ def _node_format_json_output(
     """Assemble final JSON output and call LLM for narrative summary."""
     ticker = state.get("ticker", "UNKNOWN")
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    _trace_fm("FORMAT JSON OUTPUT", f"ticker={ticker}  generating quantitative_summary via LLM")
 
     bundle: Optional[FMDataBundle] = state.get("bundle")
     technicals: TechnicalSnapshot = state.get("technicals") or TechnicalSnapshot()
@@ -1462,6 +1771,7 @@ def _node_format_json_output(
     }
 
     quantitative_summary = _generate_summary(config, factor_table)
+    executive_block = _generate_executive_block(config, factor_table)
 
     data_sources: Dict[str, Any] = {
         "price_data": "postgresql:raw_timeseries",
@@ -1469,7 +1779,7 @@ def _node_format_json_output(
         "peer_group": "neo4j:COMPETES_WITH",
         "treasury_rates": "postgresql:raw_timeseries (FMP treasury endpoint)",
         "market_risk_premium": "postgresql:raw_fundamentals (FMP market risk premium endpoint)",
-        "llm_scope": "quantitative_summary narrative only",
+        "llm_scope": "quantitative_summary narrative + executive_summary + investment_recommendation",
         "llm_model": config.llm_model,
     }
     if fetch_error:
@@ -1488,6 +1798,8 @@ def _node_format_json_output(
         "dividends": dividends.to_dict(),
         "factor_scores": factor_scores.to_dict(),
         "quantitative_summary": quantitative_summary,
+        "executive_summary": executive_block.get("executive_summary", ""),
+        "investment_recommendation": executive_block.get("investment_recommendation", {}),
         "three_statement_model": three_stmt.to_dict() if three_stmt is not None else None,
         "data_sources": data_sources,
         # Price series forwarded for Streamlit charts (serialised OHLCV, oldest-first)
@@ -1497,9 +1809,10 @@ def _node_format_json_output(
         "benchmark_history": _serialise_price_history(
             bundle.benchmark_history if bundle else []
         ),
+        "thinking_trace": list(_FM_THINKING_TRACE),
     }
 
-    return {**state, "output": output}
+    return {**state, "output": output, "thinking_trace": list(_FM_THINKING_TRACE)}
 
 
 # ---------------------------------------------------------------------------
@@ -1667,6 +1980,7 @@ def _run_single(
     toolkit: FMToolkit,
 ) -> Dict[str, Any]:
     """Run the pipeline for one resolved ticker."""
+    _reset_trace_fm()
     compiled = build_graph(toolkit, config)
     initial_state: AgentState = {"ticker": ticker}
     final_state = compiled.invoke(initial_state)

@@ -1,4 +1,5 @@
-"""Momentum and risk factor calculations: Beta (60-day), Sharpe Ratio (12m), 12m return.
+"""Momentum and risk factor calculations: Beta (60-day), Sharpe Ratio (12m), 12m return,
+SMA-50, SMA-200, golden/death cross, and volume analysis.
 
 All calculations use price data from raw_timeseries (ticker) and market_eod_us (S&P 500 benchmark).
 """
@@ -61,6 +62,41 @@ def _parse_price_rows(
             continue
 
     # Sort ascending (oldest first)
+    parsed.sort(key=lambda x: x[0])
+    return parsed
+
+
+def _parse_price_volume_rows(
+    rows: List[Dict[str, Any]],
+) -> List[Tuple[datetime, float, Optional[float]]]:
+    """Parse price rows into sorted (date, close, volume) tuples, oldest first.
+
+    Volume may be None if not present in the payload.
+    """
+    parsed: List[Tuple[datetime, float, Optional[float]]] = []
+    for row in rows:
+        p = row if isinstance(row, dict) else {}
+        date_str = p.get("date") or p.get("ts_date") or p.get("timestamp")
+        close = (
+            p.get("adjClose")
+            or p.get("adjusted_close")
+            or p.get("close")
+            or p.get("adj_close")
+        )
+        volume = p.get("volume")
+        if date_str is None or close is None:
+            continue
+        try:
+            if isinstance(date_str, datetime):
+                dt = date_str
+            else:
+                dt = datetime.fromisoformat(str(date_str).split("T")[0])
+            price = float(close)
+            vol = float(volume) if volume is not None else None
+            if price > 0:
+                parsed.append((dt, price, vol))
+        except (ValueError, TypeError):
+            continue
     parsed.sort(key=lambda x: x[0])
     return parsed
 
@@ -223,6 +259,72 @@ def compute_return_12m(
 
 
 # ---------------------------------------------------------------------------
+# SMA-50, SMA-200 and golden/death cross
+# ---------------------------------------------------------------------------
+
+def compute_sma(prices: List[float], period: int) -> Optional[float]:
+    """Simple moving average of the last `period` prices."""
+    if len(prices) < period:
+        return None
+    window = prices[-period:]
+    return round(sum(window) / period, 4)
+
+
+def compute_sma_cross(
+    ticker_prices: List[Tuple[datetime, float]],
+) -> Tuple[Optional[float], Optional[float], Optional[bool]]:
+    """Compute SMA-50, SMA-200, and golden/death cross from price history.
+
+    Returns:
+        (sma_50, sma_200, golden_cross)
+        golden_cross = True  → SMA-50 > SMA-200 (bullish)
+        golden_cross = False → SMA-50 < SMA-200 (death cross, bearish)
+        golden_cross = None  → insufficient data
+    """
+    prices = [p for _, p in ticker_prices]
+    sma50 = compute_sma(prices, 50)
+    sma200 = compute_sma(prices, 200)
+    if sma50 is not None and sma200 is not None:
+        golden = sma50 > sma200
+    else:
+        golden = None
+    return sma50, sma200, golden
+
+
+# ---------------------------------------------------------------------------
+# Volume analysis
+# ---------------------------------------------------------------------------
+
+def compute_volume_analysis(
+    rows: List[Dict[str, Any]],
+    avg_window: int = 20,
+) -> Tuple[Optional[float], Optional[float]]:
+    """Compute 20-day average volume and latest-day volume ratio.
+
+    Args:
+        rows:       Raw price history rows (dicts with 'volume' field).
+        avg_window: Window for average volume (default 20 trading days).
+
+    Returns:
+        (avg_volume_20d, volume_ratio)
+        volume_ratio = latest_volume / avg_volume_20d
+    """
+    price_vol = _parse_price_volume_rows(rows)
+    volumes = [v for _, _, v in price_vol if v is not None and v > 0]
+    if len(volumes) < avg_window:
+        if not volumes:
+            return None, None
+        # Use what we have
+        avg_window = len(volumes)
+
+    window_vols = volumes[-avg_window:]
+    avg_vol = sum(window_vols) / len(window_vols)
+    latest_vol = volumes[-1]
+    ratio = round(latest_vol / avg_vol, 4) if avg_vol > 0 else None
+    return round(avg_vol, 0), ratio
+
+
+# ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
 
@@ -251,19 +353,32 @@ def compute_momentum_risk(
     beta = compute_beta_60d(ticker_parsed, bench_parsed, lookback_days=beta_lookback)
     sharpe = compute_sharpe_12m(ticker_parsed, lookback_days=sharpe_lookback)
     ret_12m = compute_return_12m(ticker_parsed, lookback_days=sharpe_lookback)
+    sma50, sma200, golden = compute_sma_cross(ticker_parsed)
+    avg_vol, vol_ratio = compute_volume_analysis(bundle.price_history)
 
     logger.debug(
-        "Momentum/risk for %s: beta_60d=%.3f, sharpe_12m=%.3f, return_12m=%.2f%%",
+        "Momentum/risk for %s: beta_60d=%.3f, sharpe_12m=%.3f, return_12m=%.2f%%, "
+        "sma50=%.2f, sma200=%.2f, golden_cross=%s, avg_vol=%.0f, vol_ratio=%.2f",
         bundle.ticker,
         beta or float("nan"),
         sharpe or float("nan"),
         ret_12m or float("nan"),
+        sma50 or float("nan"),
+        sma200 or float("nan"),
+        golden,
+        avg_vol or float("nan"),
+        vol_ratio or float("nan"),
     )
 
     return MomentumRiskFactors(
         beta_60d=beta,
         sharpe_ratio_12m=sharpe,
         return_12m_pct=ret_12m,
+        sma_50=sma50,
+        sma_200=sma200,
+        golden_cross=golden,
+        avg_volume_20d=avg_vol,
+        volume_ratio=vol_ratio,
     )
 
 
@@ -272,4 +387,6 @@ __all__ = [
     "compute_beta_60d",
     "compute_sharpe_12m",
     "compute_return_12m",
+    "compute_sma_cross",
+    "compute_volume_analysis",
 ]

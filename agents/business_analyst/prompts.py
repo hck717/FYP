@@ -136,7 +136,7 @@ Return ONLY a valid JSON object matching this structure (no markdown, no extra k
     "confidence": "HIGH|MEDIUM|LOW — with a 1-sentence justification about the {{ticker}} evidence quality"
   },
   "competitive_moat": {
-    "rating": "wide|narrow|none — choose the single most defensible rating given all retrieved evidence about {{ticker}}",
+    "rating": "wide|narrow|none — REQUIRED, never null. Choose the single most defensible rating given all retrieved evidence about {{ticker}}. If evidence is ambiguous, default to 'narrow'.",
     "key_strengths": [
       "Strength 1: Name the moat driver precisely for {{ticker}}, explain the mechanism in 2 sentences, quantify its magnitude where evidence allows, and cite the chunk_id verbatim from the Valid chunk IDs list.",
       "Strength 2: A different moat driver from Strength 1 — do not repeat the same mechanism. Follow the same format: mechanism + magnitude + citation.",

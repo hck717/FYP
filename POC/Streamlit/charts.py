@@ -471,6 +471,10 @@ def chart_peer_comps(
     """
     peer_group = comps.get("peer_group") or []
 
+    # Safety check: if peer_group is not a list or is empty strings, skip peer processing
+    if not isinstance(peer_group, list) or not peer_group or any(isinstance(p, str) for p in peer_group):
+        peer_group = []
+
     metrics = [
         ("ev_ebitda",   "EV/EBITDA"),
         ("pe_trailing", "P/E Trailing"),

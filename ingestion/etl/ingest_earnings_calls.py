@@ -331,7 +331,7 @@ def _embed_with_retry(texts: list[str], model: str, base_url: str) -> list[list[
         resp = requests.post(
             url,
             json={"model": model, "input": texts},
-            timeout=120,
+            timeout=60,
         )
         resp.raise_for_status()
         data = resp.json()
@@ -369,15 +369,17 @@ def embed_texts(texts: list[str], model: str, base_url: str) -> list[list[float]
         return []
 
     embeddings = []
-    batch_size = 8
+    batch_size = 1
+    total_batches = (len(texts) + batch_size - 1) // batch_size
 
-    for start in range(0, len(texts), batch_size):
+    for i, start in enumerate(range(0, len(texts), batch_size), 1):
         batch = texts[start:start + batch_size]
+        logger.info("  [Embed] batch %d/%d (chunk %d-%d of %d)", i, total_batches, start + 1, min(start + batch_size, len(texts)), len(texts))
         try:
             batch_embeddings = _embed_with_retry(batch, model, base_url)
             embeddings.extend(batch_embeddings)
         except Exception as e:
-            logger.error("  [Ollama Error] batch %d: %s", start, e)
+            logger.error("  [Ollama Error] batch %d: %s", i, e)
             embeddings.extend([[0.0] * EMBEDDING_DIM] * len(batch))
 
     return embeddings

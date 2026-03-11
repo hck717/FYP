@@ -116,6 +116,11 @@ class BalanceSheetRow:
     net_working_capital: Optional[float] = None   # current assets - current liabilities
     net_debt: Optional[float] = None              # total debt - cash
     book_value_per_share: Optional[float] = None
+    # Working capital efficiency metrics (requires revenue / COGS from IS)
+    dso: Optional[float] = None   # Days Sales Outstanding = (AR / Revenue) × 365
+    dpo: Optional[float] = None   # Days Payable Outstanding = (AP / COGS) × 365
+    dio: Optional[float] = None   # Days Inventory Outstanding = (Inventory / COGS) × 365
+    cash_conversion_cycle: Optional[float] = None  # DSO + DIO − DPO
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -140,6 +145,10 @@ class BalanceSheetRow:
             "net_working_capital": self.net_working_capital,
             "net_debt": self.net_debt,
             "book_value_per_share": self.book_value_per_share,
+            "dso": self.dso,
+            "dpo": self.dpo,
+            "dio": self.dio,
+            "cash_conversion_cycle": self.cash_conversion_cycle,
         }
 
 
@@ -172,6 +181,9 @@ class CashFlowRow:
     # Derived ratios
     fcf_margin: Optional[float] = None            # free_cash_flow / revenue
     capex_intensity: Optional[float] = None       # |capex| / revenue
+    # Cash flow quality metrics
+    cfo_ni_ratio: Optional[float] = None          # OCF / Net Income — >1 = high quality earnings
+    accruals_ratio: Optional[float] = None        # (Net Income − OCF) / Total Assets — lower = better
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -197,6 +209,8 @@ class CashFlowRow:
             "ending_cash": self.ending_cash,
             "fcf_margin": self.fcf_margin,
             "capex_intensity": self.capex_intensity,
+            "cfo_ni_ratio": self.cfo_ni_ratio,
+            "accruals_ratio": self.accruals_ratio,
         }
 
 
@@ -300,8 +314,15 @@ class ThreeStatementEngine:
             period_label = str(inc.get("date") or inc.get("period") or label)
 
             is_row = self._build_income_statement(inc, period_label, shares)
-            bs_row = self._build_balance_sheet(bal, period_label, shares)
-            cf_row = self._build_cash_flow(cf, period_label, is_row.revenue)
+            bs_row = self._build_balance_sheet(
+                bal, period_label, shares,
+                revenue=is_row.revenue,
+                cost_of_revenue=is_row.cost_of_revenue,
+            )
+            cf_row = self._build_cash_flow(
+                cf, period_label, is_row.revenue,
+                total_assets=bs_row.total_assets,
+            )
 
             model.income_statements.append(is_row)
             model.balance_sheets.append(bs_row)
@@ -373,6 +394,8 @@ class ThreeStatementEngine:
         bal: Dict[str, Any],
         period: str,
         shares: Optional[float],
+        revenue: Optional[float] = None,
+        cost_of_revenue: Optional[float] = None,
     ) -> BalanceSheetRow:
         row = BalanceSheetRow(period=period)
 
@@ -401,6 +424,20 @@ class ThreeStatementEngine:
         if row.total_equity and shares and shares > 0:
             row.book_value_per_share = round(row.total_equity / shares, 4)
 
+        # Working capital efficiency: DSO, DPO, DIO
+        # DSO = (Accounts Receivable / Revenue) × 365
+        if row.net_receivables is not None and revenue and revenue > 0:
+            row.dso = round(row.net_receivables / revenue * 365, 1)
+        # DPO = (Accounts Payable / COGS) × 365
+        if row.accounts_payable is not None and cost_of_revenue and cost_of_revenue > 0:
+            row.dpo = round(row.accounts_payable / cost_of_revenue * 365, 1)
+        # DIO = (Inventory / COGS) × 365
+        if row.inventory is not None and cost_of_revenue and cost_of_revenue > 0:
+            row.dio = round(row.inventory / cost_of_revenue * 365, 1)
+        # Cash Conversion Cycle = DSO + DIO − DPO
+        if row.dso is not None and row.dio is not None and row.dpo is not None:
+            row.cash_conversion_cycle = round(row.dso + row.dio - row.dpo, 1)
+
         return row
 
     def _build_cash_flow(
@@ -408,6 +445,7 @@ class ThreeStatementEngine:
         cf: Dict[str, Any],
         period: str,
         revenue: Optional[float],
+        total_assets: Optional[float] = None,
     ) -> CashFlowRow:
         row = CashFlowRow(period=period)
 
@@ -470,6 +508,14 @@ class ThreeStatementEngine:
                 row.fcf_margin = round(row.free_cash_flow / revenue, 4)
             if row.capital_expenditures is not None:
                 row.capex_intensity = round(abs(row.capital_expenditures) / revenue, 4)
+
+        # Cash flow quality metrics
+        # CFO/NI ratio: >1.0 indicates earnings backed by cash; <1 may indicate accrual inflation
+        if row.operating_cash_flow is not None and row.net_income and row.net_income != 0:
+            row.cfo_ni_ratio = round(row.operating_cash_flow / row.net_income, 4)
+        # Accruals ratio = (Net Income − OCF) / Total Assets; lower (more negative) = higher quality
+        if row.net_income is not None and row.operating_cash_flow is not None and total_assets and total_assets > 0:
+            row.accruals_ratio = round((row.net_income - row.operating_cash_flow) / total_assets, 4)
 
         return row
 

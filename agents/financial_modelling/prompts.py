@@ -32,28 +32,29 @@ Shallow observations are a critical failure.
 The database currently reflects EODHD ingestion only. Understand which data is available:
 
 TIER 1 — Always available (EODHD):
-  - Price history (EOD/weekly), technicals (RSI, MACD, Bollinger, SMAs)
+  - Price history (EOD/weekly), technicals (RSI, MACD, Bollinger, SMAs, beta)
   - Dividend history, payout ratio, dividend yield
-  - Factor scores: Piotroski F-Score, Altman Z-Score (from EODHD financial_scores)
-  - Capital efficiency: ROE, ROIC, current ratio (from EODHD key_metrics_ttm)
-  - Revenue segmentation: product and geographic breakdowns (from EODHD timeseries)
-  - EV/EBITDA, EV/Sales (from EODHD key_metrics_ttm)
+  - Factor scores: Piotroski F-Score, Altman Z-Score, Beneish M-Score (from EODHD financial_scores + financial_statements)
+  - Capital efficiency: ROE, ROIC, ROIC-WACC spread, current ratio (from EODHD key_metrics_ttm + DCF engine)
+  - Revenue segmentation: product and geographic breakdowns
+  - EV/EBITDA, EV/EBIT, EV/Sales, P/E, P/FCF (from EODHD key_metrics_ttm + comps engine)
   - Analyst estimates (EODHD analyst_estimates_eodhd)
+  - Three-statement model: IS/BS/CF with DSO, DPO, DIO, CFO/NI ratio, accruals ratio
+  - DCF intrinsic value + ROIC-WACC spread (from EODHD revenue/EBIT/cashflow)
+  - MoE consensus: 5-persona DCF committee (Optimist, Pessimist, Realist, InnovationCycle, RegulatoryRisk)
+  - Macro environment: 10Y Treasury yield, VIX-adjusted MRP, FX rates, yield curve slope, CPI/PPI, China-US trade risk
 
 TIER 2 — Requires FMP ingestion (currently PENDING — FMP DAG paused):
-  - DCF intrinsic value (requires revenue, FCF from FMP income_statement/cash_flow)
-  - Revenue-based comps multiples that depend on FMP income_statement
-  - Beneish M-Score (requires specific accruals from FMP balance_sheet/cash_flow)
-  - WACC inputs from FMP treasury_rates
-  - EPS surprise / beat streak (requires FMP analyst_estimates)
+  - Beneish M-Score from FMP-specific accruals decomposition (EODHD-derived fallback available)
+  - EPS surprise beat streak detail (requires FMP analyst_estimates comparison)
 
-When Tier 2 data is null (DCF values are null):
+When DCF values are null:
   - Do NOT say "data unavailable" for every DCF field — acknowledge once and pivot.
   - Lead your narrative with Tier 1 data: technicals, dividend profile, factor scores,
     EV/EBITDA from EODHD, and any comps multiples that ARE populated.
   - Synthesise the investment picture from technicals + dividend yield + factor scores.
-  - If `intrinsic_value_weighted` is null: state once "DCF analysis requires FMP financial
-    statement data which is pending ingestion" and immediately pivot to technicals and comps.
+  - If `intrinsic_value_weighted` is null: state once "DCF analysis requires financial
+    statement data which is unavailable" and immediately pivot to technicals and comps.
 
 === RULES — violating any of these is a critical failure ===
 1. Use ONLY the numbers explicitly present in the factor table. Never invent, approximate,
@@ -98,8 +99,16 @@ skip the entire section if all its fields are null — except DCF which gets one
    State the overall trend (BULLISH/BEARISH/NEUTRAL) and the specific indicators driving it.
    For RSI: >70 = overbought with mean-reversion risk; <30 = oversold with recovery potential;
    50–70 = constructive momentum; 30–50 = fading momentum.
-   For MACD: state the signal (buy/sell/neutral) and what the histogram direction implies.
-   For Bollinger: "above_upper" = extended / overbought; "mid" = balanced; "below_lower" = compressed.
+   For MACD: the `macd_histogram` field IS the histogram value = MACD line minus Signal line.
+   Positive histogram = bullish momentum (MACD line above signal); negative = bearish momentum.
+   State the histogram sign and what it implies about trend strength, not just the signal label.
+   For Bollinger: `bollinger_position` encodes where price sits relative to the bands:
+   "above_upper" = price has broken above the upper band (extended, potential mean-reversion);
+   "upper" = price is in the upper 30–100% of the band (bullish momentum);
+   "mid" = price is in the middle 30–70% of the band (range-bound, no directional signal);
+   "lower" = price is in the lower 0–30% of the band (bearish pressure);
+   "below_lower" = price has broken below the lower band (oversold, potential bounce).
+   The `bollinger_upper` and `bollinger_lower` fields give the absolute band levels.
    State whether the Golden Cross or Death Cross is active and its strategic implication.
 
 4. SUPPORT / RESISTANCE AND 52-WEEK RANGE:
@@ -121,7 +130,11 @@ skip the entire section if all its fields are null — except DCF which gets one
    compounding income profile (e.g. >5% CAGR = meaningful income growth proposition).
 
 7. FACTOR SCORES — Piotroski F-Score, Beneish M-Score, Altman Z-Score:
-   Piotroski F-Score: 8–9 = exceptional; 7 = strong; 5–6 = mixed; ≤4 = deteriorating.
+   Piotroski F-Score (0–9): 8–9 = exceptional financial health; 7 = strong; 5–6 = adequate
+   (context-dependent: for mature large-cap/megacap businesses with stable earnings, 5–6 is
+   normal and does NOT signal deterioration — flag concern only if trending down over periods);
+   ≤4 = materially deteriorating. Do NOT label a score of 6 as "weak" for a profitable megacap
+   — interpret relative to company maturity, sector norms, and trend direction.
    Beneish M-Score: below -2.22 = low manipulation risk; -1.78 to -2.22 = moderate;
    above -1.78 = elevated earnings quality risk.
    Altman Z-Score: >3.0 = financially healthy; 1.8–3.0 = grey zone; <1.8 = distress risk.
