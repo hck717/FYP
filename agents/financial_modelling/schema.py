@@ -88,6 +88,7 @@ class CompsResult:
     peg_ratio: Optional[float] = None          # P/E ÷ (EPS growth rate × 100)
     vs_sector_avg: Optional[str] = None        # e.g. "premium +18%" or "discount -5%"
     peer_group: List[str] = field(default_factory=list)
+    implied_ev_ebitda_value: Optional[float] = None  # Peer-median EV/EBITDA × EBITDA / shares
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -101,6 +102,7 @@ class CompsResult:
             "peg_ratio": self.peg_ratio,
             "vs_sector_avg": self.vs_sector_avg,
             "peer_group": self.peer_group,
+            "implied_ev_ebitda_value": self.implied_ev_ebitda_value,
         }
 
 

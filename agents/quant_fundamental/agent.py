@@ -72,6 +72,29 @@ from .tools import QuantFundamentalToolkit
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Thinking-trace helpers — lightweight per-run step recorder
+# ---------------------------------------------------------------------------
+
+_QF_THINKING_TRACE: List[Dict[str, Any]] = []
+
+
+def _trace(step: str, detail: str = "", *, ok: bool = True) -> None:
+    """Append a pipeline step record to the module-level trace list."""
+    global _QF_THINKING_TRACE
+    _QF_THINKING_TRACE.append({
+        "ts": datetime.now(timezone.utc).strftime("%H:%M:%S"),
+        "symbol": "OK" if ok else "!!",
+        "name": step,
+        "detail": detail,
+    })
+    logger.debug("[QF] %s  %s", step, detail)
+
+
+def _reset_trace() -> None:
+    global _QF_THINKING_TRACE
+    _QF_THINKING_TRACE = []
+
 
 # ---------------------------------------------------------------------------
 # Graph state
@@ -113,6 +136,9 @@ class AgentState(TypedDict, total=False):
     # Anomalies
     anomaly_flags: List[Dict[str, Any]]
 
+    # Thinking trace — pipeline steps for UI display
+    thinking_trace: List[Dict[str, Any]]
+
     # Final output
     output: Optional[Dict[str, Any]]
 
@@ -131,6 +157,7 @@ def _node_fetch_financials(
     profile indicates that no PG fundamentals exist for this ticker.
     """
     ticker = state["ticker"]
+    _trace("FETCH FINANCIALS", f"ticker={ticker}")
 
     # Availability-aware early exit: skip the DB round-trip when we know there's nothing
     profile: Optional[Dict[str, bool]] = state.get("availability_profile")
@@ -139,6 +166,7 @@ def _node_fetch_financials(
             "[QF] Skipping fetch_financials for ticker=%s — no PG fundamentals or timeseries data.",
             ticker,
         )
+        _trace("FETCH FINANCIALS done", "no PG fundamentals", ok=False)
         return {
             **state,
             "bundle": FinancialsBundle(ticker=ticker),
@@ -153,19 +181,24 @@ def _node_fetch_financials(
         # Use the simplified fetch method that only accesses allowed data types
         bundle = toolkit.fetch_financials(ticker)
         
-        # Since we only have allowed data now, quarterly_trends requires earnings_history
-        # which may not be available - set empty for now
-        bundle.quarterly_trends = []
-        
-        # No prior-year data available without income_statement
-        inc_prev = {}
-        bal_prev = {}
-        cf_prev = {}
-        quarterly_trends: List[QuarterlyPeriod] = []
+        # quarterly_trends are built from financial_statements (Income_Statement, quarterly)
+        # in FinancialDataFetcher.fetch() via fetch_quarterly_trends()
+        quarterly_trends: List[QuarterlyPeriod] = bundle.quarterly_trends or []
+
+        # Prior-period data for Piotroski YoY deltas — now populated by FinancialDataFetcher
+        inc_prev = bundle.income_prev if hasattr(bundle, "income_prev") else {}
+        bal_prev = bundle.balance_prev if hasattr(bundle, "balance_prev") else {}
+        cf_prev  = bundle.cf_prev if hasattr(bundle, "cf_prev") else {}
 
         logger.debug(
             "fetch_financials: bundle loaded for %s (key_metrics_ttm=%s, ratios_ttm=%s, price_history=%d)",
             ticker, bool(bundle.key_metrics_ttm), bool(bundle.ratios_ttm), len(bundle.price_history),
+        )
+        _trace(
+            "FETCH FINANCIALS done",
+            f"key_metrics_ttm={bool(bundle.key_metrics_ttm)}  ratios_ttm={bool(bundle.ratios_ttm)}"
+            f"  price_rows={len(bundle.price_history)}  technicals={len(bundle.technicals)}"
+            f"  analyst_ratings={bool(bundle.analyst_ratings)}",
         )
         return {
             **state,
@@ -178,6 +211,7 @@ def _node_fetch_financials(
         }
     except Exception as exc:
         logger.error("fetch_financials failed for %s: %s", ticker, exc, exc_info=True)
+        _trace("FETCH FINANCIALS done", f"ERROR: {exc}", ok=False)
         return {**state, "bundle": FinancialsBundle(ticker=ticker), "quarterly_trends": [], "fetch_error": str(exc)}
 
 
@@ -297,6 +331,32 @@ def _node_chain_of_table_reasoning(state: AgentState) -> AgentState:
     qoq_deltas: Dict[str, Any] = {}
     yoy_deltas: Dict[str, Any] = {}
 
+    # Compute QoQ and YoY deltas from quarterly trends (newest-first order)
+    def _pct_chg(a: Optional[float], b: Optional[float]) -> Optional[float]:
+        if a is not None and b is not None and b != 0:
+            return round((a - b) / abs(b) * 100, 2)
+        return None
+
+    if len(qt_list) >= 2:
+        curr = qt_list[0]
+        prev_q = qt_list[1]  # one quarter ago
+        qoq_deltas = {
+            "revenue_qoq_pct":          _pct_chg(curr.revenue,          prev_q.revenue),
+            "gross_profit_qoq_pct":     _pct_chg(curr.gross_profit,     prev_q.gross_profit),
+            "operating_income_qoq_pct": _pct_chg(curr.operating_income, prev_q.operating_income),
+            "net_income_qoq_pct":       _pct_chg(curr.net_income,       prev_q.net_income),
+        }
+
+    if len(qt_list) >= 5:
+        curr = qt_list[0]
+        prev_yr = qt_list[4]  # same quarter ~1 year ago
+        yoy_deltas = {
+            "revenue_yoy_pct":          _pct_chg(curr.revenue,          prev_yr.revenue),
+            "gross_profit_yoy_pct":     _pct_chg(curr.gross_profit,     prev_yr.gross_profit),
+            "operating_income_yoy_pct": _pct_chg(curr.operating_income, prev_yr.operating_income),
+            "net_income_yoy_pct":       _pct_chg(curr.net_income,       prev_yr.net_income),
+        }
+
     cot_summary = {
         "status": "OK",
         "ticker": ticker,
@@ -311,6 +371,11 @@ def _node_chain_of_table_reasoning(state: AgentState) -> AgentState:
     }
     logger.debug("chain_of_table: %s quality_tier=%s, tables=%s, quarterly_periods=%d",
                  ticker, quality_tier, available_tables, len(qt_summary))
+    issues_str = ("; ".join(data_issues)) if data_issues else "none"
+    _trace(
+        "CHAIN-OF-TABLE REASONING",
+        f"tables={available_tables}  quality_tier={quality_tier}  issues={issues_str}",
+    )
     return {**state, "cot_summary": cot_summary}
 
 
@@ -349,6 +414,12 @@ def _node_data_quality_check(
         quality.checks_total,
         len(quality.issues),
     )
+    _trace(
+        "DATA QUALITY CHECK",
+        f"status={quality.status.value}  passed={quality.checks_passed}/{quality.checks_total}"
+        + (f"  issues={quality.issues[:2]}" if quality.issues else ""),
+        ok=quality.status.value not in ("FAILED",),
+    )
     return {**state, "data_quality": quality}
 
 
@@ -362,6 +433,10 @@ def _node_calculate_value_factors(state: AgentState) -> AgentState:
         return {**state, "value_factors": ValueFactors()}
     value = compute_value_factors(bundle)
     logger.debug("value_factors for %s: %s", bundle.ticker, value.to_dict())
+    _trace(
+        "CALCULATE VALUE FACTORS",
+        f"pe={value.pe_trailing}  ev_ebitda={value.ev_ebitda}  p_fcf={value.p_fcf}",
+    )
     return {**state, "value_factors": value}
 
 
@@ -411,13 +486,18 @@ def _node_calculate_quality_factors(
         }
         key_metrics = KeyMetrics(**{k: v for k, v in km_dict.items() if v is not None})
         logger.debug("quality_factors from MV for %s: %s", ticker, quality.to_dict())
+        _trace(
+            "CALCULATE QUALITY FACTORS",
+            f"source=materialized_view  piotroski={quality.piotroski_f_score}  roe={quality.roe}  roic={quality.roic}",
+        )
         return {**state, "quality_factors": quality, "key_metrics": key_metrics}
 
     # --- Fallback: compute in-memory from FinancialsBundle ---
     logger.info("[QF] MV empty for ticker=%s — computing quality factors in-memory", ticker)
-    inc_prev = state.get("inc_prev") or {}
-    bal_prev = state.get("bal_prev") or {}
-    cf_prev = state.get("cf_prev") or {}
+    # Use prior-period statements stored on the bundle (populated by FinancialDataFetcher)
+    inc_prev = getattr(bundle, "income_prev", None) or state.get("inc_prev") or {}
+    bal_prev = getattr(bundle, "balance_prev", None) or state.get("bal_prev") or {}
+    cf_prev  = getattr(bundle, "cf_prev", None)  or state.get("cf_prev")  or {}
 
     quality = compute_quality_factors(
         bundle,
@@ -429,6 +509,10 @@ def _node_calculate_quality_factors(
     key_metrics = KeyMetrics(**km_dict)
 
     logger.debug("quality_factors (in-memory) for %s: %s", ticker, quality.to_dict())
+    _trace(
+        "CALCULATE QUALITY FACTORS",
+        f"source=in_memory  piotroski={quality.piotroski_f_score}  roe={quality.roe}  roic={quality.roic}",
+    )
     return {**state, "quality_factors": quality, "key_metrics": key_metrics}
 
 
@@ -460,6 +544,10 @@ def _node_calculate_momentum_risk(
         sharpe_lookback=config.sharpe_lookback_days,
     )
     logger.debug("momentum_risk for %s: %s", bundle.ticker, momentum.to_dict())
+    _trace(
+        "CALCULATE MOMENTUM & RISK",
+        f"beta_60d={momentum.beta_60d}  sharpe_12m={momentum.sharpe_ratio_12m}  return_12m={momentum.return_12m_pct}",
+    )
     return {**state, "momentum_risk": momentum}
 
 
@@ -570,6 +658,12 @@ def _node_flag_anomalies(
             pass
 
     logger.debug("flag_anomalies: %d flags for %s", len(anomaly_flags), ticker)
+    _trace(
+        "FLAG ANOMALIES",
+        f"anomaly_count={len(anomaly_flags)}"
+        + (f"  flags={[f.get('metric') for f in anomaly_flags]}" if anomaly_flags else ""),
+        ok=len(anomaly_flags) == 0,
+    )
     return {**state, "anomaly_flags": anomaly_flags}
 
 
@@ -584,6 +678,7 @@ def _node_format_json_output(
     """Assemble the final JSON output and call LLM for the narrative summary."""
     ticker = state.get("ticker", "UNKNOWN")
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    _trace("FORMAT JSON OUTPUT", f"ticker={ticker}  generating quantitative_summary via LLM")
 
     bundle: Optional[FinancialsBundle] = state.get("bundle")
     value: ValueFactors = state.get("value_factors") or ValueFactors()
@@ -614,6 +709,8 @@ def _node_format_json_output(
             "short_percent_outstanding": si.get("short_percent_outstanding"),
             "short_ratio": si.get("short_ratio"),
             "shares_short": si.get("shares_short"),
+            "shares_outstanding": si.get("shares_outstanding"),
+            "shares_float": si.get("shares_float"),
             "as_of_date": si.get("as_of_date"),
         }
 
@@ -623,6 +720,13 @@ def _node_format_json_output(
     earnings_surprises_out: List[Dict[str, Any]] = []
     if bundle and bundle.earnings_surprises:
         earnings_surprises_out = bundle.earnings_surprises[:8]
+
+    # ---------------------------------------------------------------------------
+    # Extract analyst_ratings from bundle
+    # ---------------------------------------------------------------------------
+    analyst_ratings_out: Optional[Dict[str, Any]] = None
+    if bundle and bundle.analyst_ratings:
+        analyst_ratings_out = bundle.analyst_ratings
 
     # ---------------------------------------------------------------------------
     # Extract RSI and MACD from bundle.technicals
@@ -648,6 +752,14 @@ def _node_format_json_output(
                     technicals_out["macd_signal"] = round(float(s), 4)
                 if d is not None:
                     technicals_out["macd_divergence"] = round(float(d), 4)
+            elif dn == "technical_beta" and "beta_precomputed" not in technicals_out:
+                v = payload.get("beta") or payload.get("value")
+                if v is not None:
+                    technicals_out["beta_precomputed"] = round(float(v), 4)
+            elif dn == "technical_volatility" and "volatility" not in technicals_out:
+                v = payload.get("volatility") or payload.get("value")
+                if v is not None:
+                    technicals_out["volatility"] = round(float(v), 4)
 
     # ---------------------------------------------------------------------------
     # CoT Self-Validation: check internal consistency across factors and flag tensions
@@ -767,6 +879,11 @@ def _node_format_json_output(
         "qoq_deltas": qoq_deltas,
         "yoy_deltas": yoy_deltas,
         "cot_validation_notes": cot_validation_notes,
+        # Include technicals so LLM knows RSI/MACD are available and can comment on them
+        "technicals": technicals_out,
+        "short_interest": short_interest_out,
+        "earnings_surprises": earnings_surprises_out,
+        "analyst_ratings": analyst_ratings_out,
     }
 
     # LLM writes ONLY the quantitative_summary narrative
@@ -807,12 +924,14 @@ def _node_format_json_output(
         "cot_validation_notes": cot_validation_notes,
         "short_interest": short_interest_out,
         "earnings_surprises": earnings_surprises_out,
+        "analyst_ratings": analyst_ratings_out,
         "technicals": technicals_out,
         "quantitative_summary": quantitative_summary,
         "data_sources": data_sources,
+        "thinking_trace": list(_QF_THINKING_TRACE),
     }
 
-    return {**state, "output": output}
+    return {**state, "output": output, "thinking_trace": list(_QF_THINKING_TRACE)}
 
 
 # ---------------------------------------------------------------------------
@@ -1044,6 +1163,7 @@ def _run_single(
     availability_profile: Optional[Dict[str, bool]] = None,
 ) -> Dict[str, Any]:
     """Run the pipeline for one resolved ticker, reusing shared toolkit/llm."""
+    _reset_trace()
     compiled = build_graph(toolkit, llm, config)
     initial_state: AgentState = {
         "ticker": ticker,

@@ -139,7 +139,8 @@ def compute_piotroski(
         signals_computed += 1
 
     # Signal 2: Operating Cash Flow > 0
-    ocf = _get(cf, "operatingCashFlow", "netCashProvidedByOperatingActivities")
+    ocf = _get(cf, "operatingCashFlow", "netCashProvidedByOperatingActivities",
+               "totalCashFromOperatingActivities")
     if ocf is not None:
         if ocf > 0:
             score += 1
@@ -192,12 +193,14 @@ def compute_piotroski(
             signals_computed += 1
 
     # Signal 7: No dilution (shares outstanding not increasing)
-    shares = _get(inc, "weightedAverageShsOut", "weightedAverageSharesOutstanding")
+    shares = _get(inc, "weightedAverageShsOut", "weightedAverageSharesOutstanding",
+                  "commonStockSharesOutstanding")
     if bal_prev and shares is not None:
         shares_prev = _get(
             inc_prev or {},
             "weightedAverageShsOut",
             "weightedAverageSharesOutstanding",
+            "commonStockSharesOutstanding",
         )
         if shares_prev is not None:
             if shares <= shares_prev:
@@ -206,11 +209,11 @@ def compute_piotroski(
 
     # Signal 8: Gross margin improving YoY (requires prev year)
     gross_profit = _get(inc, "grossProfit")
-    revenue = _get(inc, "revenue")
+    revenue = _get(inc, "revenue", "totalRevenue")
     if inc_prev and gross_profit is not None and revenue and revenue > 0:
         gm_curr = gross_profit / revenue
         gp_prev = _get(inc_prev, "grossProfit")
-        rev_prev = _get(inc_prev, "revenue")
+        rev_prev = _get(inc_prev, "revenue", "totalRevenue")
         if gp_prev is not None and rev_prev and rev_prev > 0:
             gm_prev = gp_prev / rev_prev
             if gm_curr > gm_prev:
@@ -219,7 +222,7 @@ def compute_piotroski(
 
     # Signal 9: Asset turnover improving YoY (requires prev year)
     if inc_prev and bal_prev and revenue is not None and total_assets > 0:
-        rev_prev = _get(inc_prev, "revenue")
+        rev_prev = _get(inc_prev, "revenue", "totalRevenue")
         total_assets_prev = _get(bal_prev, "totalAssets")
         if rev_prev is not None and total_assets_prev and total_assets_prev > 0:
             at_curr = revenue / total_assets
@@ -262,27 +265,29 @@ def compute_beneish_m_score(
         return None
 
     # Current year
-    revenue = _g(inc, "revenue")
+    revenue = _g(inc, "revenue", "totalRevenue")
     gross_profit = _g(inc, "grossProfit")
     accounts_receivable = _g(bal, "netReceivables", "accountsReceivable")
     total_assets = _g(bal, "totalAssets")
-    pp_and_e = _g(bal, "propertyPlantEquipmentNet", "netPPE")
-    dep_amort = _g(cf, "depreciationAndAmortization")
-    sga = _g(inc, "sellingGeneralAndAdministrativeExpenses", "generalAndAdministrativeExpenses")
+    pp_and_e = _g(bal, "propertyPlantEquipmentNet", "propertyPlantAndEquipmentNet", "netPPE")
+    dep_amort = _g(cf, "depreciationAndAmortization", "reconciledDepreciation")
+    sga = _g(inc, "sellingGeneralAndAdministrativeExpenses", "sellingGeneralAdministrative",
+             "generalAndAdministrativeExpenses")
     long_term_debt = _g(bal, "longTermDebt", "longTermDebtAndCapitalLeaseObligation")
     current_liabilities = _g(bal, "totalCurrentLiabilities")
     current_assets = _g(bal, "totalCurrentAssets")
     net_income = _g(inc, "netIncome")
-    ocf = _g(cf, "operatingCashFlow")
+    ocf = _g(cf, "operatingCashFlow", "totalCashFromOperatingActivities")
 
     # Prior year
-    revenue_p = _g(inc_prev, "revenue")
+    revenue_p = _g(inc_prev, "revenue", "totalRevenue")
     gross_profit_p = _g(inc_prev, "grossProfit")
     ar_p = _g(bal_prev, "netReceivables", "accountsReceivable")
     total_assets_p = _g(bal_prev, "totalAssets")
-    pp_and_e_p = _g(bal_prev, "propertyPlantEquipmentNet", "netPPE")
-    dep_amort_p = _g(cf, "depreciationAndAmortization")  # use current as proxy if missing
-    sga_p = _g(inc_prev, "sellingGeneralAndAdministrativeExpenses", "generalAndAdministrativeExpenses")
+    pp_and_e_p = _g(bal_prev, "propertyPlantEquipmentNet", "propertyPlantAndEquipmentNet", "netPPE")
+    dep_amort_p = _g(cf, "depreciationAndAmortization", "reconciledDepreciation")  # use current as proxy if missing
+    sga_p = _g(inc_prev, "sellingGeneralAndAdministrativeExpenses", "sellingGeneralAdministrative",
+               "generalAndAdministrativeExpenses")
     long_term_debt_p = _g(bal_prev, "longTermDebt", "longTermDebtAndCapitalLeaseObligation")
     current_liabilities_p = _g(bal_prev, "totalCurrentLiabilities")
     current_assets_p = _g(bal_prev, "totalCurrentAssets")
@@ -442,6 +447,66 @@ def compute_key_metrics_quality(
 
 
 # ---------------------------------------------------------------------------
+# Altman Z-Score (public manufacturing/non-manufacturing model)
+# ---------------------------------------------------------------------------
+
+def _compute_altman_z_from_stmts(
+    inc: Dict,
+    bal: Dict,
+    km_ttm: Optional[Dict] = None,
+) -> Optional[float]:
+    """Altman Z-Score: Z = 1.2*X1 + 1.4*X2 + 3.3*X3 + 0.6*X4 + 1.0*X5.
+
+    Uses balance sheet + income statement.  Requires total_assets > 0.
+    """
+    km = km_ttm or {}
+
+    def _g(*args):
+        for d, *keys in args:
+            for k in keys:
+                v = _safe_float((d or {}).get(k))
+                if v is not None:
+                    return v
+        return None
+
+    total_assets      = _g((bal, "totalAssets"))
+    if not total_assets or total_assets <= 0:
+        return None
+
+    current_assets     = _g((bal, "totalCurrentAssets", "currentAssets"))
+    current_liabilities = _g((bal, "totalCurrentLiabilities", "currentLiabilities"))
+    retained_earnings  = _g((bal, "retainedEarnings", "retainedEarningsAccumulatedDeficit"))
+    ebit               = _g((inc, "operatingIncome", "ebit"))
+    market_cap         = _g((km, "marketCapTTM", "MarketCapitalizationTTM"))
+    total_liabilities  = _g((bal, "totalLiabilities", "totalDebt"))
+    revenue            = _g((inc, "revenue", "totalRevenue"))
+
+    wc: float = 0.0
+    if current_assets is not None and current_liabilities is not None:
+        wc = current_assets - current_liabilities
+    else:
+        wc_direct = _g((bal, "workingCapital"))
+        wc = wc_direct if wc_direct is not None else 0.0
+
+    x1 = wc / total_assets
+    x2 = (retained_earnings or 0.0) / total_assets
+    x3 = (ebit or 0.0) / total_assets
+    x4 = (market_cap or 0.0) / (total_liabilities or 1.0) if (total_liabilities and total_liabilities > 0) else None
+    x5 = (revenue or 0.0) / total_assets
+
+    if x4 is None:
+        # Without market cap, fall back to book equity / total liabilities
+        equity = _g((bal, "totalStockholdersEquity", "totalShareholdersEquity", "stockholdersEquity"))
+        if equity is not None and total_liabilities and total_liabilities > 0:
+            x4 = equity / total_liabilities
+        else:
+            return None  # Cannot compute without book equity or market cap
+
+    z = 1.2 * x1 + 1.4 * x2 + 3.3 * x3 + 0.6 * x4 + 1.0 * x5
+    return round(z, 3)
+
+
+# ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
 
@@ -454,16 +519,21 @@ def compute_quality_factors(
 ) -> QualityFactors:
     """Compute quality factors from the FinancialsBundle.
 
-    RESTRICTED: Uses only allowed data types (key_metrics_ttm, ratios_ttm,
-    valuation_metrics). Financial statements are excluded.
-
-    ROE is sourced from key_metrics_ttm (ReturnOnEquityTTM) or valuation_metrics.roe.
-    ROIC is not directly available — remains null.
-    Piotroski/Beneish/Altman require financial statements — remain null.
+    Now uses financial statements (bundle.income, bundle.balance, bundle.cashflow)
+    when available to compute Piotroski F-Score, Beneish M-Score, Altman Z-Score,
+    and ROIC.  Falls back gracefully to TTM metrics when statements are absent.
     """
     rt = bundle.ratios_ttm or {}
     km_ttm = bundle.key_metrics_ttm or {}
     vm = bundle.valuation_metrics or {}
+
+    # Use financial statements from bundle if available; caller-supplied overrides respected
+    inc  = bundle.income   or {}
+    bal  = bundle.balance  or {}
+    cf   = bundle.cashflow or {}
+    _inc_prev = inc_prev  if inc_prev  is not None else (getattr(bundle, "income_prev",  None) or {})
+    _bal_prev = bal_prev  if bal_prev  is not None else (getattr(bundle, "balance_prev", None) or {})
+    _cf_prev  = cf_prev   if cf_prev   is not None else (getattr(bundle, "cf_prev",      None) or {})
 
     # ROE: EODHD payloads use PascalCase (ReturnOnEquityTTM)
     roe_raw = (
@@ -472,19 +542,62 @@ def compute_quality_factors(
         or km_ttm.get("roeTTM")
         or vm.get("roe")
     )
+    if roe_raw is None and inc and bal:
+        roe_raw = _compute_roe(inc, bal, rt, km_ttm)
     _roe = _safe_float(roe_raw)
     roe = round(_roe, 4) if _roe is not None else None
 
-    # ROIC: not in key_metrics_ttm or valuation_metrics — remains null
+    # ROIC: try pre-computed TTM first, then derive from statements
     roic: Optional[float] = None
+    roic_raw = (
+        km_ttm.get("returnOnInvestedCapitalTTM") or km_ttm.get("ReturnOnInvestedCapitalTTM")
+        or km_ttm.get("roicTTM")
+        or rt.get("returnOnCapitalEmployedTTM")
+    )
+    if roic_raw is not None:
+        v = _safe_float(roic_raw)
+        roic = round(v, 4) if v is not None else None
+    elif inc and bal and cf:
+        roic = _compute_roic(inc, bal, cf, rt, km_ttm)
 
-    # Piotroski and Beneish scores require financial statements - not available
+    # Piotroski F-Score: requires full financial statements
     piotroski: Optional[int] = None
-    beneish: Optional[float] = None
-    altman_z: Optional[float] = None
-    manipulation_risk: Optional[str] = None
+    if inc and bal and cf:
+        try:
+            piotroski = compute_piotroski(
+                inc=inc, bal=bal, cf=cf,
+                inc_prev=_inc_prev or None,
+                bal_prev=_bal_prev or None,
+            )
+        except Exception as exc:
+            logger.warning("[QualityFactors] Piotroski computation failed: %s", exc)
 
-    logger.info("[QualityFactors] roe=%.4f roic=None (not available from allowed data)", roe or 0)
+    # Beneish M-Score: requires both current and prior-period statements
+    beneish: Optional[float] = None
+    manipulation_risk: Optional[str] = None
+    if inc and bal and cf and _inc_prev and _bal_prev:
+        try:
+            beneish = compute_beneish_m_score(
+                inc=inc, bal=bal, cf=cf,
+                inc_prev=_inc_prev, bal_prev=_bal_prev,
+            )
+            if beneish is not None:
+                manipulation_risk = "HIGH" if beneish > beneish_threshold else "LOW"
+        except Exception as exc:
+            logger.warning("[QualityFactors] Beneish computation failed: %s", exc)
+
+    # Altman Z-Score: requires balance sheet + income statement
+    altman_z: Optional[float] = None
+    if inc and bal:
+        try:
+            altman_z = _compute_altman_z_from_stmts(inc=inc, bal=bal, km_ttm=km_ttm)
+        except Exception as exc:
+            logger.warning("[QualityFactors] Altman Z-Score computation failed: %s", exc)
+
+    logger.info(
+        "[QualityFactors] roe=%s  roic=%s  piotroski=%s  beneish=%s  altman_z=%s",
+        roe, roic, piotroski, beneish, altman_z,
+    )
 
     return QualityFactors(
         roe=roe,

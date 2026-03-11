@@ -81,7 +81,8 @@ class CompsEngine:
 
         # ── vs_sector_avg: use EV/EBITDA if available, else P/E trailing ────
         target_multiple = result.ev_ebitda
-        peer_median = _median(peer_ev_ebitdas)
+        peer_median_evebitda = _median(peer_ev_ebitdas)
+        peer_median = peer_median_evebitda
 
         if target_multiple is None or peer_median is None:
             target_multiple = result.pe_trailing
@@ -92,6 +93,33 @@ class CompsEngine:
             sign = "+" if pct >= 0 else ""
             label = "premium" if pct >= 0 else "discount"
             result.vs_sector_avg = f"{label} {sign}{pct:.0f}%"
+
+        # ── Implied price from peer EV/EBITDA median ─────────────────────────
+        # implied_ev_ebitda_value = peer_median_ev_ebitda × EBITDA / shares_outstanding
+        if peer_median_evebitda is not None and peer_median_evebitda > 0:
+            income_annual = bundle.income_annual or {}
+            ebitda = _safe_float(
+                income.get("ebitda")
+                or income.get("EBITDA")
+                or income_annual.get("ebitda")
+                or income_annual.get("EBITDA")
+                or km_ttm.get("ebitdaTTM")
+                or km_ttm.get("EBITDA")
+            )
+            shares = _safe_float(
+                km_ttm.get("weightedAverageSharesOutstanding")
+                or km_ttm.get("weightedAverageSharesDiluted")
+                or km_ttm.get("sharesOutstanding")
+                or km_ttm.get("SharesOutstanding")
+            )
+            if ebitda and ebitda > 0 and shares and shares > 0:
+                net_debt = _safe_float(
+                    enterprise.get("netDebt")
+                    or enterprise.get("NetDebt")
+                ) or 0.0
+                implied_ev = peer_median_evebitda * ebitda
+                implied_equity = implied_ev - net_debt
+                result.implied_ev_ebitda_value = round(implied_equity / shares, 2)
 
         return result
 
