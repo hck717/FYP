@@ -37,6 +37,16 @@ class DCFResult:
     reverse_dcf_implied_cagr: Optional[float] = None
     # Beta and WACC components for transparency
     beta_used: Optional[float] = None
+    # ROIC-WACC spread: positive = value creation; negative = value destruction
+    roic_wacc_spread: Optional[float] = None
+    roic_used: Optional[float] = None
+    # Stage PV breakdown — useful for debugging and output transparency
+    pv_stage1: Optional[float] = None      # PV of explicit Stage 1 FCFs (years 1–10)
+    pv_stage2: Optional[float] = None      # PV of Stage 2 transition FCFs (years 11–20)
+    pv_terminal: Optional[float] = None    # PV of Terminal Value (Gordon Growth perpetuity)
+    equity_value_base: Optional[float] = None  # Total equity value = pv_s1+pv_s2+tv − debt + cash
+    # Input validation warnings (non-fatal; logged and surfaced in output)
+    validation_warnings: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -54,6 +64,13 @@ class DCFResult:
             "sensitivity_matrix": self.sensitivity_matrix,
             "reverse_dcf_implied_cagr": self.reverse_dcf_implied_cagr,
             "beta_used": self.beta_used,
+            "roic_wacc_spread": self.roic_wacc_spread,
+            "roic_used": self.roic_used,
+            "pv_stage1": self.pv_stage1,
+            "pv_stage2": self.pv_stage2,
+            "pv_terminal": self.pv_terminal,
+            "equity_value_base": self.equity_value_base,
+            "validation_warnings": self.validation_warnings,
         }
 
 

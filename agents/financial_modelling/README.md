@@ -9,7 +9,7 @@
 
 The Financial Modelling Agent is the **quantitative valuation layer** of the multi-agent equity research system. It reads historical prices, fundamentals, and earnings data exclusively from PostgreSQL, executes deterministic calculations (DCF, WACC, Comps, 3-Statement Model, Factor Scores), and returns a fully computed valuation package to the Supervisor.
 
-It does **NOT** generate numbers via LLM. The LLM is only used to interpret the computed outputs and write the `quantitative_summary` narrative and MoE persona narratives. Every numeric output has a traceable formula.
+It does **NOT** generate numbers via LLM. The LLM is only used to interpret the computed outputs and write the `quantitative_summary` narrative, `executive_summary`, `investment_recommendation`, and MoE persona narratives. Every numeric output has a traceable formula.
 
 **Handled by this agent:**
 - DCF (Discounted Cash Flow) intrinsic value with Bear / Base / Bull scenarios + sensitivity matrix
@@ -159,7 +159,8 @@ The `FMDataBundle` dataclass (defined in `schema.py`) carries all data between p
 | `valuation_metrics` | `valuation_metrics` table | Fill-null fallback for comps multiples |
 | `price_history` | `raw_timeseries` weekly EOD (fallback: daily) | Technical indicators |
 | `benchmark_history` | `market_eod_us` | S&P 500 rolling beta, HV30 for VIX proxy |
-| `treasury_rates` | `raw_timeseries` or `treasury_rates` dedicated table | 10Y yield → risk-free rate |
+| `treasury_rates_dedicated` | `treasury_rates` PG table (dedicated ingestion) | US10Y → risk-free rate (primary source) |
+| `treasury_rates` | `raw_timeseries` lookup for treasury data | 10Y yield fallback (often empty in practice) |
 
 ---
 
@@ -173,11 +174,15 @@ The `FMDataBundle` dataclass (defined in `schema.py`) carries all data between p
 WACC = (E/V) × Re + (D/V) × Rd × (1 − T)
 
 Re  = Rf + β × (Rm − Rf)          [CAPM]
-Rf  = 10Y Treasury yield           [treasury_rates table]
-β   = 60-day rolling vs. S&P 500   [market_eod_us]
-Rm−Rf = VIX-adjusted MRP           [base MRP from raw_fundamentals, adjusted by HV30 regime]
-Rd  = Interest Expense / Total Debt [raw_fundamentals]
-T   = Effective tax rate            [raw_fundamentals]
+Rf  = US10Y yield from treasury_rates table (treasury_rates_dedicated field)
+      → fallback: raw_timeseries treasury rows → hardcoded 4.3%
+β   = Regression vs. S&P 500 benchmark (all available daily rows, ~400)
+      → Damodaran sector beta fallback if no price history
+Rm−Rf = Base MRP 4.5% (Damodaran January 2026 implied US ERP)
+        adjusted by HV30 regime (VIX-proxy from macro_environment node)
+Rd  = Interest Expense / Total Debt  [annual IS preferred; EBIT−IBT gap fallback]
+      → 3.5% fallback for companies where interest is not separately reported
+T   = Effective tax rate from annual IS (annual preferred over quarterly IS)
 ```
 
 **VIX Regime MRP Adjustment (macro_environment node):**
@@ -195,17 +200,76 @@ T   = Effective tax rate            [raw_fundamentals]
 TV = FCFn × (1 + g) / (WACC − g)    [Gordon Growth Model]
 ```
 
-**Scenario Engine:**
+**Terminal Growth Rate — Sector-Adjusted (`_sector_terminal_growth` in `dcf.py`):**
 
-| Scenario | Revenue Growth | EBIT Margin | WACC Offset |
+The terminal growth rate is no longer a flat global default. It is resolved from the company's sector classification, falling back to `config.terminal_growth_rate` (default 3.0%) for unknown sectors:
+
+| Sector | Terminal Growth | Rationale |
+|---|---|---|
+| Software / SaaS | 3.5% | Pricing power + recurring revenue |
+| Semiconductors | 3.3% | AI/data-center secular tailwinds |
+| Information Technology | 3.2% | Broad tech; hardware commoditises faster |
+| Communication Services | 3.0% | Digital-growth tailwind, mature base |
+| Health Care / Biotech | 3.0% | Demographics-driven; regulatory risk offset |
+| Consumer Discretionary | 2.8% | Cyclical; margins mean-revert |
+| Consumer Staples / Food | 2.7% | Defensive, inflation pass-through |
+| Financials | 2.7% | GDP-linked, rate-cycle sensitive |
+| Industrials / Aerospace | 2.7% | GDP-linked, capex-intensive |
+| Energy / Oil & Gas | 2.5% | Commodity-linked; energy transition headwind |
+| Materials / Mining | 2.5% | Commodity-linked |
+| Real Estate / REIT | 2.5% | Rent inflation-linked |
+| Utilities | 2.3% | Regulated; rate-case dependent |
+| Unknown / Default | 3.0% | Fallback |
+
+> No ticker-specific values. Rate is derived purely from sector classification.
+
+**Stage 2 ROIC Convergence — Data-Driven Tiers (`_three_stage_pv` in `dcf.py`):**
+
+In Stage 2 (years 11–20), ROIC fades from the current computed value to a stable terminal ROIC. The terminal ROIC premium over WACC is determined by the company's *demonstrated* ROIC level — not by ticker name:
+
+| Computed ROIC | stable_roic | Interpretation |
+|---|---|---|
+| > 30% | WACC + 9% | Exceptional moat (e.g. AAPL at 38.9%) |
+| 20–30% | WACC + 7% | Strong moat |
+| 10–20% | WACC + 4% | Moderate moat (e.g. MSFT at ~16.5%) |
+| < 10% | WACC + 2% | Thin moat / commodity business |
+
+**Base Growth Rate — Priority Chain (`_derive_base_growth` in `dcf.py`):**
+
+The base revenue growth rate used across scenarios is resolved by the following priority chain (first non-null value wins):
+
+| Priority | Source | Notes |
+|---|---|---|
+| 1 | Analyst consensus mean revenue growth | From `bundle.analyst_estimates` |
+| 2 | `revenueGrowthTTM` (key_metrics_ttm) | TTM revenue growth; excluded if null or zero |
+| 3 | Annual IS YoY: `income_annual.revenue / income_prior.revenue − 1` | Clean fiscal-year-over-fiscal-year comparison (e.g. AAPL FY2025 vs FY2024 = 6.4%) |
+| 3b | TTM / prior-annual fallback: `RevenueTTM / income_annual.revenue − 1` | Only if annual IS pair unavailable |
+| 4 | `revenueGrowthAnnual` / `revenue_growth_annual` (key_metrics) | From pre-computed key metrics |
+| 5 | Sector default | Tech 12%, Health 8%, Energy 4%, otherwise 6% |
+
+> **Intentionally excluded:** `QuarterlyRevenueGrowthYOY` — this is a single-quarter YoY metric (e.g. Dec-2025 vs Dec-2024), not an annual growth rate. Using it would overstate or misrepresent the company's trend-line growth.
+
+**Scenario Engine (data-driven, not hardcoded):**
+
+Scenarios apply deltas to the data-derived `base_growth`:
+
+| Scenario | Revenue Growth | EBIT Margin Multiplier | WACC Offset |
 |---|---|---|---|
-| Bear | −5% | 10% | +2% |
-| Base | +8% | 18% | 0% |
-| Bull | +20% | 25% | −1% |
+| Bear | `base_growth − 7pp` (floor: −3%) | 0.70× actual TTM margin | +1.5% |
+| Base | `base_growth` | 1.00× actual TTM margin | 0% |
+| Bull | `base_growth + 8pp` (cap: 35%) | 1.15× actual TTM margin | −1.5% |
+
+Example for AAPL (base_growth = 6.4%, TTM EBIT margin = 35.4%, WACC = 9.35%):
+
+| Scenario | Revenue Growth | EBIT Margin | WACC |
+|---|---|---|---|
+| Bear | −0.6% | 24.8% | 10.85% |
+| Base | 6.4% | 35.4% | 9.35% |
+| Bull | 14.4% | 40.7% | 7.85% |
 
 **Sensitivity Matrix:** WACC (4 levels) × Terminal Growth Rate (4 levels) → implied intrinsic value grid.
 
-**Reverse DCF:** Implied revenue CAGR at current market price.
+**Reverse DCF:** Independently solves "what revenue CAGR justifies the current market price?" using the same 3-stage model. A high reverse CAGR (e.g. ~35% for AAPL) is a valid analytical signal indicating the market prices in growth well above the DCF base case — not a bug.
 
 ---
 
@@ -335,8 +399,17 @@ fallback_model = "deepseek-chat"
 fallback_provider = "ollama"   # localhost:11434
 ```
 
+**Dual LLM calls in `format_json_output` node:**
+
+| Call | Model | Output field | Notes |
+|---|---|---|---|
+| `_generate_summary_deepseek()` | `deepseek-reasoner` | `quantitative_summary` | Chain-of-thought reasoning over the full numeric context; `reasoning_content` fallback if `content` is empty (see Design Decisions) |
+| `_generate_executive_block()` | `deepseek-chat` | `executive_summary` + `investment_recommendation` | Lighter model for structured prose; avoids `deepseek-reasoner` token overhead for short outputs |
+
 **LLM scope is strictly limited:**
 - `quantitative_summary` — 10–15 sentence interpretation of the pre-computed factor table
+- `executive_summary` — 3–5 sentence plain-English summary of the overall investment picture
+- `investment_recommendation` — one of: Strong Buy / Buy / Hold / Sell / Strong Sell, with a 1–2 sentence rationale
 - MoE persona narratives — 2-sentence justification per persona (Optimist / Pessimist / Realist)
 - MoE synthesis — 3-sentence Bear/Base/Bull consensus narrative
 
@@ -354,17 +427,22 @@ The LLM receives fully computed numeric outputs as context. It does **not** perf
   "current_price": 218.50,
   "valuation": {
     "dcf": {
-      "intrinsic_value_base": 195.20,
-      "intrinsic_value_bear": 148.00,
-      "intrinsic_value_bull": 253.00,
-      "intrinsic_value_weighted": 195.85,
-      "upside_pct_base": -10.7,
-      "wacc_used": 0.098,
-      "terminal_growth_rate": 0.025,
-      "beta_used": 1.21,
+      "intrinsic_value_base": 145.79,
+      "intrinsic_value_bear": 62.48,
+      "intrinsic_value_bull": 313.96,
+      "intrinsic_value_weighted": 158.60,
+      "upside_pct_base": -44.1,
+      "wacc_used": 0.09354,
+      "terminal_growth_rate": 0.03,
+      "beta_used": 1.1782,
+      "pv_stage1": 962900000000,
+      "pv_stage2": 558700000000,
+      "pv_terminal": 677000000000,
+      "equity_value_base": 2167200000000,
+      "validation_warnings": [],
       "scenario_table": [...],
       "sensitivity_matrix": {...},
-      "reverse_dcf_implied_cagr": 0.062
+      "reverse_dcf_implied_cagr": 0.002
     },
     "comps": {
       "ev_ebitda": 22.4,
@@ -390,12 +468,12 @@ The LLM receives fully computed numeric outputs as context. It does **not** perf
     "consensus_narrative": "..."
   },
   "macro_environment": {
-    "risk_free_rate_10y": 0.043,
+    "risk_free_rate_10y": 0.04133,
     "benchmark_hv30": 0.182,
     "vix_regime": "normal",
-    "base_mrp": 0.055,
+    "base_mrp": 0.045,
     "mrp_delta": 0.0,
-    "vix_adjusted_mrp": 0.055
+    "vix_adjusted_mrp": 0.045
   },
   "technicals": {
     "trend": "bullish",
@@ -453,14 +531,17 @@ The LLM receives fully computed numeric outputs as context. It does **not** perf
     ]
   },
   "quantitative_summary": "Apple trades at a premium to peers...",
+  "executive_summary": "Apple demonstrates strong capital returns with a Piotroski F-Score of 7 and a ROIC-WACC spread of +28pp...",
+  "investment_recommendation": "Hold — DCF intrinsic value of $110 sits ~58% below the current market price of $261, implying the market prices in a 35% revenue CAGR that is unlikely to materialise at scale.",
   "data_sources": {
     "price_data": "postgresql:raw_timeseries",
     "fundamentals": "postgresql:raw_fundamentals",
     "peer_group": "neo4j:COMPETES_WITH",
     "treasury_rates": "postgresql:raw_timeseries (FMP treasury endpoint)",
     "market_risk_premium": "postgresql:raw_fundamentals (FMP market risk premium endpoint)",
-    "llm_scope": "quantitative_summary narrative only",
-    "llm_model": "deepseek-reasoner"
+    "llm_scope": "quantitative_summary, executive_summary, investment_recommendation narratives only",
+    "llm_model_quantitative_summary": "deepseek-reasoner",
+    "llm_model_executive_block": "deepseek-chat"
   },
   "price_history": [...],
   "benchmark_history": [...]
@@ -631,8 +712,21 @@ The agent is restricted to the financial modelling use-case only. All data queri
 - **VIX-adjusted MRP.** WACC uses a live Market Risk Premium that is uplifted in high-volatility regimes (HV30 > 25%) and reduced in calm regimes (HV30 < 15%). This prevents WACC from being artificially low during market stress.
 - **MoE DCF consensus.** Three parallel LLM personas adjust TGR and WACC assumptions and produce a probability-weighted Bear/Base/Bull range. This gives the Supervisor a distribution of outcomes, not just a point estimate.
 - **`deepseek-chat` fallback for MoE narratives.** `deepseek-reasoner` uses chain-of-thought `<think>` tags that consume tokens before emitting the actual response. If the cleaned response is fewer than 20 characters, the agent retries with `deepseek-chat` (no reasoning overhead) for the persona narrative only.
+- **`deepseek-reasoner` empty `content` fix — `reasoning_content` fallback.** The DeepSeek API sometimes returns a response object where `message.content` is an empty string but `message.reasoning_content` contains the actual answer. `_generate_summary_deepseek()` in `agent.py` detects this case and falls back to `reasoning_content` before treating the response as a failure. Without this fix, `quantitative_summary` would be empty for any call where the model front-loads all output into the reasoning trace.
 - **WACC is live, not hardcoded.** `DCF_WACC` env var is a fallback only. At runtime, WACC is computed from live CAPM inputs: 10Y Treasury yield (from `treasury_rates`), VIX-adjusted MRP, rolling 60-day beta (from `market_eod_us`), and cost of debt from `raw_fundamentals`.
+- **DCF Fix 1 — Quarterly IS detection for tax rate.** EODHD's most-recent `income_statement` row is often the latest quarterly filing (e.g. `period_type='quarterly'`, Dec-2025). Deriving the effective tax rate from a quarterly IS overstates it (single-quarter tax provision / single-quarter pre-tax income). `DCFEngine.compute()` detects `_period_type in ("quarterly", "q")` and uses `bundle.income_annual` (the most recent full-year IS) for tax rate computation instead. For AAPL this corrects the rate from ~17.4% (quarterly) to ~15.6% (annual).
+- **DCF Fix 2 — Annual capex preference over quarterly capex.** EODHD's `capitalExpenditures` (plural) in the quarterly cashflow row maps to `capitalExpenditure` (singular) in the bundle dict. Because both keys can be populated, the previous `if not bundle.cashflow.get("capitalExpenditure")` overlay guard was never triggered, leaving quarterly capex ($2.4B for AAPL) in place instead of the annual figure ($12.7B). The fix introduces a `_cf_get()` helper inside `DCFEngine.compute()` that unconditionally prefers `bundle.cashflow_annual` fields when the primary cashflow row is quarterly, and falls back to the primary row plus an optional ×4 annualisation heuristic only when `cashflow_annual` is also unavailable.
+- **DCF Fix 3 — Annual IS YoY as base growth rate.** The growth rate was previously sourced from `QuarterlyRevenueGrowthYOY` (a single-quarter YoY metric from `key_metrics_ttm`), which reflects one quarter's anomalous performance and is not representative of trend-line revenue growth. The fix replaces this with a clean fiscal-year-over-fiscal-year comparison using `bundle.income_annual.revenue / bundle.income_prior.revenue − 1` (Priority 3 in the growth chain). For AAPL this gives 6.4% (FY2025 $416.2B / FY2024 $391.0B − 1); for MSFT it gives 14.9% (FY2025 $281.7B / FY2024 $245.1B − 1), correctly preserving MSFT's higher growth profile.
+- **WACC Fix 1 — treasury_rates_dedicated as primary rf source.** `bundle.treasury_rates` (from `raw_timeseries` lookup) is unreliable and often empty. `bundle.treasury_rates_dedicated` (from the dedicated `treasury_rates` PostgreSQL table) always has data. `_compute_wacc()` now reads `treasury_rates_dedicated` first. For AAPL this corrects rf from the 4.3% hardcoded fallback to the real US10Y = 4.133%.
+- **WACC Fix 2 — MRP default updated to Damodaran January 2026 ERP (4.5%).** The previous default of 5.5% is a textbook approximation from the 1990s, not a current market estimate. Damodaran's implied ERP for the US market as of January 2026 is 4.5%, reflecting elevated market valuations and low volatility. For AAPL this reduces re from ~11.1% to ~9.4%.
+- **WACC Fix 3 — Beta lookback uses all available daily rows.** The DB holds ~400 daily price rows (~18 months). The beta regression now passes `len(bundle.price_history)` as the lookback, ensuring every available observation is used rather than truncating at the legacy 104-week default (which had the same practical effect but is conceptually cleaner).
+- **WACC Fix 4 — Annual IS for rd derivation; 3.5% fallback.** Interest expense is now sourced from `bundle.income_annual` (avoids single-quarter noise). For companies where EODHD nets interest income against expense (e.g. AAPL), the EBIT−IBT gap is used as a last resort before the 3.5% investment-grade fallback (down from 4.0%).
+- **Sector-adjusted terminal growth rate.** The terminal growth rate `g` is no longer a flat global default. `_sector_terminal_growth()` maps the company's GICS sector to an analytically grounded TGR (range: 2.3% utilities → 3.5% software), grounded in Damodaran's long-run sector assumptions and a 2% real GDP + 2% inflation baseline. No ticker-specific values.
+- **ROIC-tier stable_roic in Stage 2.** The stable ROIC used for Stage 2 convergence is now determined by the company's *demonstrated* ROIC level, not a flat offset. Companies with ROIC > 30% earn a WACC+9% stable premium; 20–30% earns WACC+7%; 10–20% earns WACC+4%; below 10% earns WACC+2%. This correctly distinguishes AAPL (38.9% ROIC, exceptional moat) from MSFT (16.5% ROIC, moderate moat for a capex-intensive cloud business). No ticker-specific hardcoding.
+- **Reinvestment rate cap (capex-implied ceiling).** `_project_fcf_roic()` caps the ROIC-derived reinvestment rate at `capex_pct / nopat_margin`. For capital-light companies (AAPL: capex only 2.9% of revenue), the ROIC model could overstate reinvestment (g/ROIC = 6.4%/38.9% = 16.4%), producing too little FCF. The cap prevents this while correctly leaving capital-intensive companies (MSFT: capex 21.1% of revenue) unconstrained. R&D is intentionally *not* included in the cap because GAAP-expensed R&D is already subtracted from EBIT — adding it again would double-count it.
+- **DCF breakdown fields on DCFResult.** `pv_stage1`, `pv_stage2`, `pv_terminal`, and `equity_value_base` are now stored on the result object and logged at DEBUG level. This makes the PV decomposition fully traceable without re-running the model. Terminal Value as % of total EV is also logged (e.g. AAPL: TV = 30.8% of EV, well-behaved).
+- **Input validation warnings.** `_validate_dcf_inputs()` checks for anomalous inputs (very low revenue, extreme margins, high capex pct, extreme growth, high D/E) and stores human-readable warnings in `DCFResult.validation_warnings`. Warnings are non-fatal and also logged at WARNING level for production monitoring.
 
 ---
 
-*Last updated: 2026-03-10 | Author: hck717*
+*Last updated: 2026-03-11 | Author: hck717*

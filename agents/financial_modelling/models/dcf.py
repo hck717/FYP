@@ -100,7 +100,7 @@ _SECTOR_DEFAULT_GROWTH: Dict[str, float] = {
 }
 
 _SENSITIVITY_WACCS   = [0.08, 0.09, 0.10, 0.11]
-_SENSITIVITY_GROWTHS = [0.015, 0.020, 0.025, 0.030]
+_SENSITIVITY_GROWTHS = [0.020, 0.025, 0.030, 0.035]
 
 # Forecast horizon (years) — institutional standard
 _FORECAST_YEARS = 10
@@ -183,10 +183,14 @@ def _derive_base_growth(bundle: "FMDataBundle", sector: Optional[str] = None) ->
 
     Priority:
       1. Analyst estimates: implied growth = (estimatedRevenue / currentRevenue) − 1
-      2. Key metrics TTM: revenueGrowthTTM
-      3. Key metrics annual: revenueGrowth / revenue3YGrowth
-      4. Sector default (Damodaran consensus)
-      5. 8% generic fallback
+      2. Key metrics TTM: revenueGrowthTTM (FMP field — always annual/TTM)
+      3. Computed TTM YoY: RevenueTTM / prior-year-annual-revenue − 1
+         (Handles EODHD where revenueGrowthTTM is NULL but RevenueTTM + income_prior exist.
+          NOTE: QuarterlyRevenueGrowthYOY is intentionally NOT used here because it is a
+          single-quarter YoY figure, not a TTM growth rate, and overstates long-run growth.)
+      4. Annual revenue growth from key_metrics (FMP annual)
+      5. Sector default (Damodaran consensus)
+      6. 8% generic fallback
 
     The result is clamped to [−5%, 35%] to prevent outliers.
     """
@@ -208,7 +212,7 @@ def _derive_base_growth(bundle: "FMDataBundle", sector: Optional[str] = None) ->
                 logger.debug("_derive_base_growth: analyst implied %.1f%% for %s", implied * 100, bundle.ticker)
                 return max(-0.05, min(0.35, implied))
 
-    # ── 2. TTM revenue growth from key_metrics_ttm ───────────────────────────
+    # ── 2. TTM revenue growth from key_metrics_ttm (FMP field) ───────────────
     ttm_g = _safe_float(
         bundle.key_metrics_ttm.get("revenueGrowthTTM")
         or bundle.key_metrics_ttm.get("revenueGrowth")
@@ -217,10 +221,51 @@ def _derive_base_growth(bundle: "FMDataBundle", sector: Optional[str] = None) ->
         # Value may be stored as decimal (0.12) or percent (12.0)
         if abs(ttm_g) > 1:
             ttm_g /= 100.0
-        logger.debug("_derive_base_growth: TTM %.1f%% for %s", ttm_g * 100, bundle.ticker)
+        logger.debug("_derive_base_growth: TTM field %.1f%% for %s", ttm_g * 100, bundle.ticker)
         return max(-0.05, min(0.35, ttm_g))
 
-    # ── 3. Annual revenue growth from key_metrics ────────────────────────────
+    # ── 3. Computed annual YoY from income statement rows ────────────────────
+    # Preferred: income_annual (current full fiscal year) vs income_prior (prior
+    # full fiscal year). This gives a clean annual-vs-annual comparison and avoids
+    # the TTM-stacking artefact where a strong recent quarter inflates the YoY
+    # (e.g. RevenueTTM / prior_annual overstates growth if the latest quarter was
+    # unusually strong, as was AAPL Dec-2025).
+    ann_rev = _safe_float(
+        bundle.income_annual.get("revenue")
+        or bundle.income_annual.get("totalRevenue")
+        if bundle.income_annual else None
+    )
+    prior_rev = _safe_float(
+        bundle.income_prior.get("revenue")
+        or bundle.income_prior.get("totalRevenue")
+        if bundle.income_prior else None
+    )
+    if ann_rev and ann_rev > 0 and prior_rev and prior_rev > 0:
+        ann_yoy = ann_rev / prior_rev - 1.0
+        if -0.40 < ann_yoy < 1.0:
+            logger.debug(
+                "_derive_base_growth: annual IS YoY %.1f%% for %s (FY=%.1fB / prior=%.1fB)",
+                ann_yoy * 100, bundle.ticker, ann_rev / 1e9, prior_rev / 1e9,
+            )
+            return max(-0.05, min(0.35, ann_yoy))
+
+    # ── 3b. Fallback computed YoY: RevenueTTM / prior-year-annual − 1 ─────────
+    # Used when full-year IS rows are unavailable. Note: can overstate growth if
+    # a strong recent quarter is included in TTM; prefer Priority 3 above.
+    rev_ttm = _safe_float(
+        bundle.key_metrics_ttm.get("RevenueTTM")
+        or bundle.key_metrics_ttm.get("revenueTTM")
+    )
+    if rev_ttm and rev_ttm > 0 and prior_rev and prior_rev > 0:
+        ttm_yoy = rev_ttm / prior_rev - 1.0
+        if -0.40 < ttm_yoy < 1.0:
+            logger.debug(
+                "_derive_base_growth: TTM/prior YoY %.1f%% for %s (TTM=%.1fB / prior=%.1fB)",
+                ttm_yoy * 100, bundle.ticker, rev_ttm / 1e9, prior_rev / 1e9,
+            )
+            return max(-0.05, min(0.35, ttm_yoy))
+
+    # ── 4. Annual revenue growth from key_metrics ────────────────────────────
     ann_g = _safe_float(
         bundle.key_metrics.get("revenueGrowth")
         or bundle.key_metrics.get("revenue3YGrowth")
@@ -232,7 +277,7 @@ def _derive_base_growth(bundle: "FMDataBundle", sector: Optional[str] = None) ->
         logger.debug("_derive_base_growth: annual key_metrics %.1f%% for %s", ann_g * 100, bundle.ticker)
         return max(-0.05, min(0.35, ann_g))
 
-    # ── 4. Sector default ────────────────────────────────────────────────────
+    # ── 5. Sector default ────────────────────────────────────────────────────
     g = _sector_growth_fallback(sector)
     logger.debug("_derive_base_growth: sector fallback %.1f%% for %s (sector=%s)", g * 100, bundle.ticker, sector)
     return g
@@ -385,53 +430,89 @@ def _compute_wacc(
             if v and isinstance(v, str):
                 sector = v
                 break
-    # 1. Risk-free rate
-    rf: float = 0.043
-    if bundle.treasury_rates:
+    # 1. Risk-free rate — prefer dedicated treasury_rates table (US10Y), then raw_timeseries rows
+    # bundle.treasury_rates_dedicated is populated from the treasury_rates PG table (reliable).
+    # bundle.treasury_rates comes from raw_timeseries which may be empty for some tickers.
+    rf: float = 0.043  # fallback: approximate long-run US 10Y yield
+    _rf_found = False
+    if getattr(bundle, "treasury_rates_dedicated", None):
+        row = bundle.treasury_rates_dedicated[0]
+        v = _safe_float(row.get("rate"))
+        if v is not None and v > 0:
+            rf = v / 100 if v > 1 else v  # stored as percentage (e.g. 4.133) or decimal
+            _rf_found = True
+            logger.debug("WACC rf from treasury_rates_dedicated: %.3f%%", rf * 100)
+    if not _rf_found and bundle.treasury_rates:
         row = bundle.treasury_rates[0]
         for key in ("year10", "tenYear", "10Y", "ten_year", "y10"):
             v = _safe_float(row.get(key))
             if v is not None:
                 rf = v / 100 if v > 1 else v
+                _rf_found = True
+                logger.debug("WACC rf from treasury_rates timeseries: %.3f%%", rf * 100)
                 break
+    if not _rf_found:
+        logger.debug("WACC rf: using hardcoded fallback %.3f%%", rf * 100)
 
-    # 2. Market Risk Premium (VIX-adjusted if available)
-    mrp: float = 0.055
+    # 2. Market Risk Premium
+    # Default: Damodaran January 2026 implied ERP for the US market (4.5%).
+    # This is more conservative than the 5.5% often used in textbooks, and reflects
+    # the current low-volatility environment with elevated market valuations.
+    # Overridden by live VIX-adjusted MRP from macro_environment node if available.
+    mrp: float = 0.045
     if bundle.market_risk_premium:
         v = _safe_float(bundle.market_risk_premium.get("vix_adjusted_mrp"))
         if v is not None:
             mrp = v
+            logger.debug("WACC mrp from vix_adjusted_mrp: %.3f%%", mrp * 100)
         else:
             for key in ("marketRiskPremium", "equityRiskPremium", "market_risk_premium", "rp"):
                 v = _safe_float(bundle.market_risk_premium.get(key))
                 if v is not None:
                     mrp = v / 100 if v > 1 else v
+                    logger.debug("WACC mrp from market_risk_premium.%s: %.3f%%", key, mrp * 100)
                     break
 
-    # 3. Beta — 2-year weekly (104 data points); falls back to sector beta
+    # 3. Beta — use all available daily price history for the longest stable regression.
+    # The DB holds ~400 daily rows (~18 months). We pass the full row count as the
+    # lookback limit so _compute_beta uses every available observation rather than
+    # truncating at the 104-week default (which would use the same rows anyway since
+    # the data is daily, not weekly, but ensures we do not artificially limit the window).
     beta_raw = _compute_beta(
         bundle.price_history,
         bundle.benchmark_history,
-        lookback_weeks=config.beta_lookback_days,  # repurposed field: weeks for weekly data
+        lookback_weeks=len(bundle.price_history) if bundle.price_history else config.beta_lookback_days,
         sector=sector,
     )
     beta_used = beta_raw
     if beta_raw is None:
-        # Final fallback: market neutral
+        # Final fallback: sector beta
         beta_raw = _sector_beta_fallback(sector)
+    logger.debug("WACC beta: %.4f (sector=%s)", beta_raw, sector)
 
     # 4. Damodaran levered beta: β_L = β_U × (1 + (1−T) × D/E)
     inc = bundle.income
     bal = bundle.balance
-    # Prefer ratios_ttm effective tax rate, then derive from IS, else 21%
-    _eff_tax_w = _safe_float(inc.get("effectiveTaxRate"))
+    # Use annual IS tax rate when primary IS is quarterly (avoids single-quarter distortion)
+    _period_type_w = (inc.get("period_type") or inc.get("periodType") or "").lower()
+    _is_for_tax_w = (
+        bundle.income_annual
+        if _period_type_w in ("quarterly", "q") and bundle.income_annual
+        else inc
+    )
+    _eff_tax_w = _safe_float(_is_for_tax_w.get("effectiveTaxRate"))
     if _eff_tax_w is not None and 0.0 < _eff_tax_w < 1.0:
         t = _eff_tax_w
     elif _eff_tax_w is not None and _eff_tax_w >= 1.0:
         t = _eff_tax_w / 100.0
     else:
-        tax_expense = _safe_float(inc.get("incomeTaxExpense") or inc.get("income_tax_expense"), 0.0)
-        pre_tax = _safe_float(inc.get("incomeBeforeTax") or inc.get("pretaxIncome"), 0.0)
+        tax_expense = _safe_float(
+            _is_for_tax_w.get("incomeTaxExpense") or _is_for_tax_w.get("income_tax_expense")
+            or _is_for_tax_w.get("taxProvision"), 0.0
+        )
+        pre_tax = _safe_float(
+            _is_for_tax_w.get("incomeBeforeTax") or _is_for_tax_w.get("pretaxIncome"), 0.0
+        )
         t = (tax_expense / pre_tax) if pre_tax and pre_tax > 0 and tax_expense and tax_expense >= 0 else 0.21
 
     market_cap = _safe_float(
@@ -460,13 +541,41 @@ def _compute_wacc(
 
     # 5. Cost of equity (CAPM with levered beta)
     re = rf + beta_levered * mrp
+    logger.debug("WACC re=%.3f%% (rf=%.3f%% + beta=%.4f × mrp=%.3f%%)",
+                 re * 100, rf * 100, beta_levered, mrp * 100)
 
-    # 6. Cost of debt
-    _raw_interest = _safe_float(
+    # 6. Cost of debt — derive from actual interest expense ÷ total debt.
+    # Priority: annual IS (avoids single-quarter noise) → quarterly IS → EBIT-IBT gap → fallback.
+    # Fallback is 3.5%: approximate investment-grade corporate bond yield for large-cap tech.
+    # Note: some data providers (EODHD) do not separately report interest expense for companies
+    # that net interest income against expense (e.g. AAPL), in which case the gap method is used.
+    _interest_ann = _safe_float(
+        bundle.income_annual.get("interestExpense")
+        or bundle.income_annual.get("interest_expense"), 0.0
+    ) if bundle.income_annual else 0.0
+    _interest_qtr = _safe_float(
         inc.get("interestExpense") or inc.get("interest_expense"), 0.0
     )
-    interest_expense = abs(_raw_interest if _raw_interest is not None else 0.0)
-    rd = (interest_expense / total_debt) if total_debt and total_debt > 0 else 0.04
+    # Use annual IS figure if available; annualise quarterly figure (×4) as second choice
+    _interest_best = abs(_interest_ann or 0.0)
+    if _interest_best == 0.0 and _interest_qtr:
+        _period_type_cf = (inc.get("period_type") or "").lower()
+        _interest_best = abs(_interest_qtr) * (4 if _period_type_cf in ("quarterly", "q") else 1)
+    # Last resort: implied from EBIT − IBT gap in annual IS
+    if _interest_best == 0.0 and bundle.income_annual:
+        _ebit_ann = _safe_float(bundle.income_annual.get("ebit") or bundle.income_annual.get("operatingIncome"), 0.0)
+        _ibt_ann = _safe_float(bundle.income_annual.get("incomeBeforeTax") or bundle.income_annual.get("pretaxIncome"), 0.0)
+        if _ebit_ann and _ibt_ann and _ebit_ann > _ibt_ann:
+            _interest_best = _ebit_ann - _ibt_ann
+            logger.debug("WACC rd: interest derived from EBIT-IBT gap = $%.2fB", _interest_best / 1e9)
+    if total_debt and total_debt > 0 and _interest_best > 0:
+        rd = _interest_best / total_debt
+        # Sanity: rd should be between 1% and 15%; clamp outliers from bad data
+        rd = max(0.01, min(0.15, rd))
+    else:
+        rd = 0.035  # 3.5% fallback: investment-grade tech-sector cost of debt
+    logger.debug("WACC rd=%.3f%% (interest=\$%.2fB, debt=\$%.2fB)",
+                 rd * 100, _interest_best / 1e9, (total_debt or 0) / 1e9)
 
     # 7. Capital structure weights
     if market_cap is None or market_cap <= 0:
@@ -478,9 +587,12 @@ def _compute_wacc(
 
     e_weight = market_cap / total_cap
     d_weight = (total_debt or 0.0) / total_cap
+    logger.debug("WACC weights: e=%.1f%%, d=%.1f%%", e_weight * 100, d_weight * 100)
 
     wacc = e_weight * re + d_weight * rd * (1 - t)
-    wacc = max(0.05, min(0.25, wacc))
+    # Sanity bounds: WACC below the risk-free rate is nonsensical; above 25% suggests bad data.
+    wacc = max(rf + 0.005, min(0.25, wacc))
+    logger.debug("WACC final: %.3f%%", wacc * 100)
     return round(wacc, 5), beta_used
 
 
@@ -543,7 +655,15 @@ def _project_fcf_roic(
         reinv_rate = g_t / ROIC   (capital efficiency: how much we must reinvest per unit of growth)
         FCF_t      = NOPAT_t × (1 − reinv_rate)
 
-    Falls back to EBIT-margin / capex method if ROIC is unavailable or reinv_rate > 1.
+    Reinvestment rate is capped at the capex-implied rate (capex_pct / nopat_margin).
+    Rationale: the ROIC formula can over-estimate reinvestment for capital-light companies
+    (e.g. AAPL: g/ROIC = 6.4%/38.9% = 16.4%, but actual capex is only 2.9% of revenue,
+    implying a sustainable reinvestment rate of ~9.8%). The cap prevents the ROIC model
+    from being more punitive than the observed capex run-rate, while preserving the
+    full reinvestment burden for capital-intensive companies (e.g. MSFT: capex-implied
+    reinvestment is ~55%, well above the typical g/ROIC for a given year).
+
+    Falls back to EBIT-margin / capex method if ROIC is unavailable.
 
     Args:
         ebit:        Current EBIT (unused in projection — computed from margin × revenue)
@@ -551,9 +671,21 @@ def _project_fcf_roic(
         tax_rate:    Effective corporate tax rate
         growth_rates: Per-year revenue growth rates (fade model)
         roic_val:    ROIC as decimal; None → fallback method
-        capex_pct:   Capex as % of revenue (for fallback method)
+        capex_pct:   Capex as % of revenue (for fallback method and cap)
         ebit_margin: EBIT / Revenue for this scenario
     """
+    nopat_margin = ebit_margin * (1 - tax_rate)
+    # Capex-implied reinvestment rate: the fraction of NOPAT consumed by observed capex.
+    # This is the ceiling for ROIC-derived reinv — the model cannot assume more reinvestment
+    # than the company actually spends on capital (capex / NOPAT per unit of revenue).
+    capex_implied_reinv = (capex_pct / nopat_margin) if nopat_margin > 0 else 1.0
+    if capex_implied_reinv > 0:
+        logger.debug(
+            "_project_fcf_roic: capex_pct=%.2f%%, nopat_margin=%.2f%%, "
+            "capex_implied_reinv=%.2f%% (ROIC reinv ceiling)",
+            capex_pct * 100, nopat_margin * 100, capex_implied_reinv * 100,
+        )
+
     fcfs = []
     r = revenue
     for g in growth_rates:
@@ -563,8 +695,11 @@ def _project_fcf_roic(
 
         if roic_val is not None and roic_val > 0 and abs(g) > 0:
             reinv_rate = g / roic_val
-            # Cap reinvestment rate: cannot reinvest more than 100% of NOPAT
-            reinv_rate = max(-1.0, min(1.0, reinv_rate))
+            # Cap at capex-implied reinvestment: prevents ROIC model from over-penalising
+            # capital-light companies whose observed capex implies lower reinvestment.
+            reinv_rate = min(reinv_rate, capex_implied_reinv)
+            # Floor at 0 (no negative reinvestment in Stage 1); hard cap at 100% of NOPAT.
+            reinv_rate = max(0.0, min(1.0, reinv_rate))
             fcf = nopat_t * (1 - reinv_rate)
         else:
             # Fallback: traditional EBIT-margin minus capex
@@ -596,8 +731,15 @@ def _equity_value_from_pv(
     total_debt: float,
     cash: float,
 ) -> float:
-    """Enterprise Value → Equity Value."""
-    return pv_fcfs + tv_pv - total_debt + cash
+    """Enterprise Value → Equity Value.
+
+    Equity value is floored at 0: in a bear-case DCF where debt exceeds the
+    PV of cash flows the equity is worthless, but it cannot be negative (equity
+    holders have limited liability).  A small positive sentinel (0.01) is used
+    instead of 0 so that downstream per-share arithmetic stays defined.
+    """
+    raw = pv_fcfs + tv_pv - total_debt + cash
+    return max(raw, 0.01)
 
 
 def _shares_outstanding(bundle: FMDataBundle) -> Optional[float]:
@@ -712,9 +854,25 @@ def _three_stage_pv(
     stage2_growth_rates = _fade_growth_rates(g_s1_exit, terminal_growth, stage2_years)
 
     # ROIC convergence: in Stage 2, ROIC fades from current roic_val toward
-    # (wacc + 0.02) — a mature company earns a modest premium over cost of capital.
-    # This is the Damodaran "stable growth" ROIC assumption.
-    stable_roic = wacc + 0.05  # mature wide-moat ROIC ≈ WACC + 500bps (Damodaran: durable advantage)
+    # a stable terminal ROIC determined by the company's demonstrated return profile.
+    # Tiers are data-driven (actual ROIC level), not ticker-specific:
+    #   ROIC > 30%: exceptional moat → stable_roic = WACC + 9% (900bps)
+    #   ROIC 20–30%: strong moat   → stable_roic = WACC + 7% (700bps)
+    #   ROIC 10–20%: moderate moat → stable_roic = WACC + 4% (400bps)
+    #   ROIC < 10%:  thin moat     → stable_roic = WACC + 2% (200bps)
+    # Rationale: Damodaran notes that companies with sustained excess returns
+    # retain ROIC premiums above WACC in perpetuity proportional to moat strength.
+    if roic_val is not None and roic_val > 0.30:
+        stable_roic = wacc + 0.09   # exceptional: AAPL/MSFT-class ROIC
+    elif roic_val is not None and roic_val > 0.20:
+        stable_roic = wacc + 0.07   # strong moat
+    elif roic_val is not None and roic_val > 0.10:
+        stable_roic = wacc + 0.04   # moderate moat
+    else:
+        stable_roic = wacc + 0.02   # thin moat / commodity business
+    # Capex-implied reinvestment ceiling (same logic as Stage 1)
+    nopat_margin_s2 = ebit_margin * (1 - tax_rate)
+    capex_implied_reinv_s2 = (capex_pct / nopat_margin_s2) if nopat_margin_s2 > 0 else 1.0
     s2_fcfs: List[float] = []
     rev_t = rev_s1_end
     for idx, g in enumerate(stage2_growth_rates):
@@ -727,6 +885,8 @@ def _three_stage_pv(
             w = idx / max(stage2_years - 1, 1)  # 0 → 1
             blended_roic = roic_val * (1 - w) + stable_roic * w
             reinv_rate = g / blended_roic if abs(g) > 0 and blended_roic > 0 else 0.0
+            # Cap at capex-implied reinvestment (same reasoning as Stage 1)
+            reinv_rate = min(reinv_rate, capex_implied_reinv_s2)
             reinv_rate = max(-1.0, min(1.0, reinv_rate))
             fcf = nopat_t * (1 - reinv_rate)
         else:
@@ -813,7 +973,126 @@ def _reverse_dcf(
             lo = mid
             f_lo = f_mid
 
+            return round(mid, 5)
+        if f_lo * f_mid < 0:
+            hi = mid
+            f_hi = f_mid
+        else:
+            lo = mid
+            f_lo = f_mid
+
     return round((lo + hi) / 2, 5)
+
+
+def _sector_terminal_growth(sector: Optional[str], default: float) -> float:
+    """Return a sector-appropriate terminal growth rate.
+
+    Rationale:
+      - High-growth sectors (tech, semiconductors) have stronger long-run pricing power
+        and operate closer to the frontier of nominal GDP growth.
+      - Regulated/defensive sectors (utilities, consumer staples) grow closer to inflation.
+      - All values are grounded in Damodaran's long-run sector growth assumptions and
+        consistent with a 2% real GDP + 2% inflation baseline (US nominal GDP ~4%).
+      - The default (3.0%) is used for unknown or unclassified sectors.
+    No ticker-specific values: rates are derived purely from sector classification.
+    """
+    if sector is None:
+        return default
+    s = sector.lower()
+    if any(k in s for k in ("software", "saas")):
+        return 0.035    # 3.5%: software has strong pricing power + recurring revenue
+    if any(k in s for k in ("semiconductor", "semis")):
+        return 0.033    # 3.3%: cyclical but secular AI/data-center tailwinds
+    if any(k in s for k in ("information technology", "technology")):
+        return 0.032    # 3.2%: broad tech — hardware commoditises faster than software
+    if any(k in s for k in ("communication services", "media")):
+        return 0.030    # 3.0%: advertising + streaming; mature but digital-growth tailwind
+    if any(k in s for k in ("health care", "healthcare", "biotech", "pharma")):
+        return 0.030    # 3.0%: demographics-driven, pricing power but regulatory risk
+    if any(k in s for k in ("consumer discretionary", "retail")):
+        return 0.028    # 2.8%: cyclical; margins mean-revert over cycle
+    if any(k in s for k in ("consumer staples", "food", "beverage")):
+        return 0.027    # 2.7%: defensive, low-growth, inflation pass-through
+    if any(k in s for k in ("financials", "financial services", "insurance", "banking")):
+        return 0.027    # 2.7%: GDP-linked but rate-cycle sensitive
+    if any(k in s for k in ("industrials", "aerospace", "defense")):
+        return 0.027    # 2.7%: GDP-linked; capex-intensive with modest pricing power
+    if any(k in s for k in ("energy", "oil", "gas")):
+        return 0.025    # 2.5%: commodity-linked; long-run energy transition headwind
+    if any(k in s for k in ("materials", "mining", "chemicals")):
+        return 0.025    # 2.5%: commodity-linked
+    if any(k in s for k in ("real estate", "reit")):
+        return 0.025    # 2.5%: rent inflation-linked; capped by cap-rate dynamics
+    if any(k in s for k in ("utilities",)):
+        return 0.023    # 2.3%: regulated; growth tied to rate case outcomes
+    return default
+
+
+def _validate_dcf_inputs(
+    ticker: str,
+    revenue: float,
+    ebit_margin: Optional[float],
+    capex_pct: float,
+    wacc: float,
+    base_growth: float,
+    total_debt: float,
+    market_cap: Optional[float],
+) -> List[str]:
+    """Validate DCF inputs and return a list of human-readable warning strings.
+
+    These are non-fatal advisory warnings — the model still runs.  They are
+    surfaced in DCFResult.validation_warnings and logged at WARNING level so
+    analysts can quickly spot data quality issues without digging through logs.
+    """
+    warnings_out: List[str] = []
+
+    if revenue < 1e8:  # < $100M
+        warnings_out.append(
+            f"{ticker}: revenue unusually low (${revenue/1e6:.0f}M) — check data source"
+        )
+    if ebit_margin is not None:
+        if ebit_margin > 0.60:
+            warnings_out.append(
+                f"{ticker}: EBIT margin very high ({ebit_margin*100:.1f}%) — "
+                "verify TTM margin is not inflated by one-off gains"
+            )
+        elif ebit_margin < 0:
+            warnings_out.append(
+                f"{ticker}: negative EBIT margin ({ebit_margin*100:.1f}%) — "
+                "DCF FCF projection will be negative; interpret Bear/Base carefully"
+            )
+    if capex_pct > 0.30:
+        warnings_out.append(
+            f"{ticker}: capex/revenue very high ({capex_pct*100:.1f}%) — "
+            "confirm this is annual capex, not a multi-year figure"
+        )
+    if wacc < 0.05:
+        warnings_out.append(
+            f"{ticker}: WACC unusually low ({wacc*100:.2f}%) — "
+            "check beta and risk-free rate inputs"
+        )
+    if wacc > 0.18:
+        warnings_out.append(
+            f"{ticker}: WACC unusually high ({wacc*100:.2f}%) — "
+            "check beta; may indicate data quality issue"
+        )
+    if abs(base_growth) > 0.50:
+        warnings_out.append(
+            f"{ticker}: base revenue growth extreme ({base_growth*100:.1f}%) — "
+            "consider whether analyst estimates are reliable"
+        )
+    if market_cap and market_cap > 0 and total_debt > 0:
+        d_e = total_debt / market_cap
+        if d_e > 2.0:
+            warnings_out.append(
+                f"{ticker}: debt/equity ratio very high ({d_e:.2f}x) — "
+                "equity value is highly sensitive to debt assumptions"
+            )
+
+    for w in warnings_out:
+        logger.warning("DCF validation: %s", w)
+
+    return warnings_out
 
 
 # ---------------------------------------------------------------------------
@@ -856,19 +1135,83 @@ class DCFEngine:
         result.beta_used = round(beta_used, 4) if beta_used is not None else None
 
         # ── Base inputs ──────────────────────────────────────────────────────
-        revenue = _safe_float(bundle.income.get("revenue"))
+        # Prefer TTM revenue from key_metrics_ttm (RevenueTTM) over IS revenue
+        # because the IS row may be quarterly while RevenueTTM is always annual.
+        _rev_ttm = _safe_float(
+            bundle.key_metrics_ttm.get("RevenueTTM")
+            or bundle.key_metrics_ttm.get("revenueTTM")
+            or bundle.key_metrics_ttm.get("revenuePerShareTTM")  # fallback only if no total
+        )
+        _rev_is = _safe_float(bundle.income.get("revenue"))
+        _rev_is_total = _safe_float(bundle.income.get("totalRevenue"))
+        # totalRevenue is quarterly when period_type==quarterly; revenue may be TTM rolled-up
+        _period_type = (bundle.income.get("period_type") or bundle.income.get("periodType") or "").lower()
+        if _rev_ttm and _rev_ttm > 0:
+            # RevenueTTM from key_metrics_ttm is definitively annual
+            revenue = _rev_ttm
+        elif _rev_is and _rev_is > 0:
+            # Check if IS revenue looks like TTM (much larger than totalRevenue quarterly)
+            if _rev_is_total and _rev_is_total > 0 and _rev_is > _rev_is_total * 1.5:
+                # IS revenue is the annual/TTM rollup; totalRevenue is quarterly
+                revenue = _rev_is
+            elif _period_type == "quarterly" and _rev_is_total and _rev_is_total > 0:
+                # IS is quarterly; multiply quarterly total by ~4 as rough annual estimate
+                # (only fallback — prefer TTM sources above)
+                revenue = _rev_is_total * 4.0
+                logger.warning(
+                    "DCF: income statement is quarterly for %s; annualising totalRevenue×4 = %.1fB",
+                    bundle.ticker, revenue / 1e9,
+                )
+            else:
+                revenue = _rev_is
+        else:
+            revenue = None  # type: ignore[assignment]
+
         if revenue is None or revenue <= 0:
             logger.warning("DCF: no revenue for %s — cannot project FCF", bundle.ticker)
             return result
 
-        ocf = _safe_float(bundle.cashflow.get("operatingCashFlow"))
-        capex_raw = _safe_float(bundle.cashflow.get("capitalExpenditure"))
+        # When the primary cashflow row is quarterly, OCF and capex are single-quarter figures.
+        # Override with annual equivalents from bundle.cashflow_annual (set by tools.py annual overlay)
+        # or from bundle.cashflow_prior (prior-year annual) to ensure proper annual scaling.
+        _cf_period = (bundle.cashflow.get("period_type") or "").lower()
+        _cf_is_quarterly = _cf_period in ("quarterly", "q")
+        if _cf_is_quarterly and bundle.cashflow_annual:
+            _ann_cf = bundle.cashflow_annual
+        else:
+            _ann_cf = None
+
+        def _cf_get(key: str) -> Optional[float]:
+            """Return value from annual cashflow if primary is quarterly, else primary."""
+            if _ann_cf:
+                v = _safe_float(_ann_cf.get(key))
+                if v is not None:
+                    return v
+            return _safe_float(bundle.cashflow.get(key))
+
+        ocf = _cf_get("operatingCashFlow") or _cf_get("totalCashFromOperatingActivities")
+        capex_raw = _cf_get("capitalExpenditure") or _cf_get("capitalExpenditures")
+        if _cf_is_quarterly and _ann_cf is None:
+            # Annual cashflow_annual not available — try to detect and scale quarterly capex
+            # by checking if OCF looks like a single quarter (< 30% of TTM revenue)
+            if ocf is not None and revenue > 0 and ocf < revenue * 0.30:
+                logger.warning(
+                    "DCF: cashflow appears quarterly for %s (OCF=%.1fB vs revenue=%.1fB) "
+                    "— annualising OCF and capex ×4",
+                    bundle.ticker, (ocf or 0) / 1e9, revenue / 1e9,
+                )
+                if ocf is not None:
+                    ocf = ocf * 4.0
+                if capex_raw is not None:
+                    capex_raw = capex_raw * 4.0
         capex = abs(capex_raw) if capex_raw is not None else None
         capex_pct_from_rev = _safe_float(bundle.cashflow.get("capexToRevenue"))
         capex_pct = capex_pct_from_rev or (capex / revenue if capex is not None and revenue > 0 else 0.05)
 
         # Effective tax rate — prefer actual effective rate from ratios_ttm,
         # then derive from IS line items, fall back to statutory 21%.
+        # IMPORTANT: when the primary IS is quarterly, derive from annual IS instead
+        # to avoid overstating the quarterly effective tax rate.
         _eff_tax = _safe_float(bundle.income.get("effectiveTaxRate"))
         if _eff_tax is not None and 0.0 < _eff_tax < 1.0:
             tax_rate = _eff_tax
@@ -876,15 +1219,65 @@ class DCFEngine:
             # Stored as percentage (e.g. 16.5 → 0.165)
             tax_rate = _eff_tax / 100.0
         else:
-            tax_expense = _safe_float(bundle.income.get("incomeTaxExpense") or bundle.income.get("income_tax_expense"), 0.0)
-            pre_tax = _safe_float(bundle.income.get("incomeBeforeTax") or bundle.income.get("pretaxIncome"), 0.0)
-            tax_rate = (tax_expense / pre_tax) if pre_tax and pre_tax > 0 and tax_expense and tax_expense >= 0 else 0.21
+            # Prefer annual IS for tax rate when primary IS is quarterly
+            _is_for_tax = (
+                bundle.income_annual
+                if _period_type in ("quarterly", "q") and bundle.income_annual
+                else bundle.income
+            )
+            tax_expense = _safe_float(
+                _is_for_tax.get("incomeTaxExpense")
+                or _is_for_tax.get("income_tax_expense")
+                or _is_for_tax.get("taxProvision"),
+                0.0,
+            )
+            pre_tax = _safe_float(
+                _is_for_tax.get("incomeBeforeTax")
+                or _is_for_tax.get("pretaxIncome"),
+                0.0,
+            )
+            if pre_tax and pre_tax > 0 and tax_expense is not None and tax_expense >= 0:
+                tax_rate = tax_expense / pre_tax
+                if _period_type in ("quarterly", "q") and bundle.income_annual:
+                    logger.debug(
+                        "DCF: using annual IS tax rate for %s: %.1f%% (primary IS is quarterly)",
+                        bundle.ticker, tax_rate * 100,
+                    )
+            else:
+                tax_rate = 0.21
 
-        # Actual EBIT margin
-        ebit = _safe_float(bundle.income.get("ebit") or bundle.income.get("operatingIncome"))
+        # Actual EBIT margin — CRITICAL: prefer TTM operating margin from key_metrics_ttm.
+        # The income statement may be a single quarter; dividing quarterly EBIT by TTM revenue
+        # produces a severely understated margin.  OperatingMarginTTM is always TTM-correct.
         actual_ebit_margin: Optional[float] = None
-        if ebit is not None and revenue > 0:
-            actual_ebit_margin = ebit / revenue
+        _om_ttm = _safe_float(
+            bundle.key_metrics_ttm.get("OperatingMarginTTM")
+            or bundle.key_metrics_ttm.get("operatingMarginTTM")
+            or bundle.key_metrics_ttm.get("ebitMarginTTM")
+            or bundle.key_metrics_ttm.get("EBITMarginTTM")
+        )
+        if _om_ttm is not None and 0.0 < _om_ttm < 1.0:
+            actual_ebit_margin = _om_ttm
+            logger.debug("DCF: using TTM operating margin for %s: %.2f%%", bundle.ticker, _om_ttm * 100)
+        elif _om_ttm is not None and _om_ttm >= 1.0:
+            # Stored as percentage
+            actual_ebit_margin = _om_ttm / 100.0
+        else:
+            # Fallback: compute from IS only if the statement is annual/TTM
+            ebit = _safe_float(bundle.income.get("ebit") or bundle.income.get("operatingIncome"))
+            if ebit is not None and revenue > 0 and _period_type not in ("quarterly", "q"):
+                actual_ebit_margin = ebit / revenue
+                logger.debug(
+                    "DCF: computed EBIT margin from IS for %s: %.2f%% (period_type=%s)",
+                    bundle.ticker, actual_ebit_margin * 100, _period_type,
+                )
+            elif ebit is not None and revenue > 0:
+                logger.warning(
+                    "DCF: skipping IS-derived margin for %s — IS is quarterly (would understate margin)",
+                    bundle.ticker,
+                )
+        # Derive ebit for ROIC only (used below); scale by TTM margin if we used TTM margin
+        ebit = actual_ebit_margin * revenue if actual_ebit_margin is not None else None
 
         # Balance sheet inputs for net debt
         total_debt = _safe_float(
@@ -913,12 +1306,17 @@ class DCFEngine:
             if roic_precomp is not None and roic_precomp > 0:
                 roic_val = roic_precomp / 100 if roic_precomp > 1 else roic_precomp
 
+        # ── ROIC-WACC spread ─────────────────────────────────────────────────
+        # Positive spread = economic value creation; negative = value destruction
+        if roic_val is not None and wacc is not None:
+            result.roic_wacc_spread = round(roic_val - wacc, 5)
+        result.roic_used = round(roic_val, 5) if roic_val is not None else None
+
         # Shares outstanding
         shares = _shares_outstanding(bundle)
-        g = self.config.terminal_growth_rate
         years = _FORECAST_YEARS
 
-        # ── Derive sector (for base growth fallback) ─────────────────────────
+        # ── Derive sector (for TGR and base growth) ──────────────────────────
         sector_for_growth: Optional[str] = None
         for d in [bundle.scores, bundle.enterprise]:
             for key in ("sector", "Sector", "GicSector", "gicSector", "General_Sector", "general_sector"):
@@ -936,12 +1334,38 @@ class DCFEngine:
                     sector_for_growth = v
                     break
 
+        # ── Terminal growth rate (sector-adjusted) ────────────────────────────
+        # Use sector-appropriate TGR; config default is the fallback for unknown sectors.
+        g = _sector_terminal_growth(sector_for_growth, self.config.terminal_growth_rate)
+        logger.debug(
+            "DCF terminal growth for %s: %.2f%% (sector=%s, config_default=%.2f%%)",
+            bundle.ticker, g * 100, sector_for_growth, self.config.terminal_growth_rate * 100,
+        )
+
         # ── Data-driven base revenue growth ──────────────────────────────────
         # Derive from analyst consensus or TTM growth; fall back to sector default.
         base_growth = _derive_base_growth(bundle, sector_for_growth)
         logger.debug(
             "DCF scenarios for %s: base_growth=%.1f%% (sector=%s)",
             bundle.ticker, base_growth * 100, sector_for_growth,
+        )
+
+        # ── Input validation ──────────────────────────────────────────────────
+        _market_cap_for_val = _safe_float(
+            bundle.enterprise.get("marketCapitalization")
+            or bundle.enterprise.get("MarketCapitalization")
+            or bundle.key_metrics_ttm.get("marketCap")
+            or bundle.key_metrics_ttm.get("MarketCapitalizationMln", 0) * 1e6  # type: ignore[operator]
+        )
+        result.validation_warnings = _validate_dcf_inputs(
+            ticker=bundle.ticker,
+            revenue=revenue,
+            ebit_margin=actual_ebit_margin,
+            capex_pct=capex_pct,
+            wacc=wacc,
+            base_growth=base_growth,
+            total_debt=total_debt,
+            market_cap=_market_cap_for_val,
         )
 
         # ── Build scenario parameters ────────────────────────────────────────
@@ -1010,6 +1434,22 @@ class DCFEngine:
             else:
                 scenario_values[name] = None
                 sc["intrinsic_value"] = None
+
+            # Store Base scenario PV breakdown on DCFResult for transparency/debugging
+            if name == "Base":
+                result.pv_stage1 = round(pv_s1, 0)
+                result.pv_stage2 = round(pv_s2, 0)
+                result.pv_terminal = round(pv_tv, 0)
+                result.equity_value_base = round(equity_value, 0)
+                logger.debug(
+                    "DCF breakdown for %s | Stage1 PV: $%.1fB | Stage2 PV: $%.1fB | "
+                    "Terminal PV: $%.1fB | Equity: $%.1fB | Per share: $%.2f | "
+                    "TV%%: %.1f%%",
+                    bundle.ticker,
+                    pv_s1 / 1e9, pv_s2 / 1e9, pv_tv / 1e9, equity_value / 1e9,
+                    equity_value / shares if shares and shares > 0 else 0,
+                    pv_tv / (pv_s1 + pv_s2 + pv_tv) * 100 if (pv_s1 + pv_s2 + pv_tv) > 0 else 0,
+                )
 
         result.intrinsic_value_base = scenario_values.get("Base")
         result.intrinsic_value_bear = scenario_values.get("Bear")

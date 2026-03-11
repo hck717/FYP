@@ -64,7 +64,7 @@ class FinancialModellingConfig:
         default_factory=lambda: float(os.getenv("FM_LLM_TEMPERATURE", "0.1"))
     )
     llm_max_tokens: int = field(
-        default_factory=lambda: int(os.getenv("FM_LLM_MAX_TOKENS", "4096"))
+        default_factory=lambda: int(os.getenv("FM_LLM_MAX_TOKENS", "8192"))
     )
     # Determine Ollama URL based on environment
     ollama_base_url: str = field(
@@ -92,7 +92,7 @@ class FinancialModellingConfig:
     )
     terminal_growth_rate: float = field(
         default_factory=lambda: float(
-            os.getenv("FIN_MODEL_TERMINAL_GROWTH_RATE", os.getenv("DCF_TERMINAL_GROWTH_RATE", "0.025"))
+            os.getenv("FIN_MODEL_TERMINAL_GROWTH_RATE", os.getenv("DCF_TERMINAL_GROWTH_RATE", "0.030"))
         )
     )
     dcf_forecast_years: int = field(
