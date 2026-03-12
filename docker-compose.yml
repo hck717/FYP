@@ -240,6 +240,46 @@ services:
         condition: service_healthy
     restart: "no"
 
+  # Streamlit UI with ngrok tunnel
+  streamlit:
+    image: python:3.11-slim
+    container_name: fyp-streamlit
+    working_dir: /app
+    ports:
+      - "8501:8501"
+    environment:
+      - PYTHONUNBUFFERED=1
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=airflow
+      - POSTGRES_USER=airflow
+      - POSTGRES_PASSWORD=airflow
+      - NEO4J_URI=bolt://neo4j:7687
+      - NEO4J_USER=neo4j
+      - NEO4J_PASSWORD=SecureNeo4jPass2025!
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-sk-9fe1b0635ca341f3bccbe222132e3461}
+      - OLLAMA_BASE_URL=http://ollama:11434
+      - NGROK_AUTHTOKEN=${NGROK_AUTHTOKEN:-}
+    volumes:
+      - ./POC/streamlit:/app
+      - ./agents:/app/agents
+      - ./orchestration:/app/orchestration
+      - ./charts:/app/charts
+    command: >
+      sh -c "pip install -q pyngrok streamlit && 
+             ngrok http 8501 --log=stdout > /tmp/ngrok.log 2>&1 &
+             sleep 3 &&
+             cat /tmp/ngrok.log &&
+             streamlit run app.py --server.port 8501 --server.headless true --server.address 0.0.0.0"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
+    restart: unless-stopped
+
 volumes:
   # Named volume for Ollama model storage.
   # Use `docker volume inspect fyp_ollama-data` to locate the data on the host.

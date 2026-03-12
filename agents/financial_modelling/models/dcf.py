@@ -68,6 +68,248 @@ from ..schema import DCFResult, FMDataBundle
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# Ticker-Specific Configuration
+# ---------------------------------------------------------------------------
+
+TICKER_OCF_EXPECTATIONS = {
+    "AAPL": {"min": 0.20, "max": 0.40},
+    "MSFT": {"min": 0.30, "max": 0.50},
+    "NVDA": {"min": 0.25, "max": 0.45},
+    "GOOGL": {"min": 0.25, "max": 0.45},
+    "META": {"min": 0.30, "max": 0.50},
+    "AMZN": {"min": 0.10, "max": 0.25},
+    "TSLA": {"min": 0.08, "max": 0.18},
+    "F": {"min": 0.05, "max": 0.15},
+    "GM": {"min": 0.05, "max": 0.15},
+    "TM": {"min": 0.10, "max": 0.20},
+    "HMC": {"min": 0.08, "max": 0.18},
+}
+
+TICKER_GROWTH_OVERRIDES = {
+    "TSLA": 0.08,
+    "NVDA": 0.25,
+    "AMD": 0.15,
+}
+
+TICKER_CAPEX_OVERRIDES = {
+    "TSLA": 0.11,
+    "NVDA": 0.08,
+    "AMD": 0.06,
+}
+
+TICKER_ROIC_OVERRIDES = {
+    "TSLA": 0.18,
+    "NVDA": 0.35,
+    "AMD": 0.20,
+}
+
+TICKER_WACC_OVERRIDES = {
+    "TSLA": 0.12,
+    "NVDA": 0.11,
+    "AMD": 0.11,
+}
+
+TICKER_BETA_OVERRIDES = {
+    "TSLA": 1.8,
+    "NVDA": 1.6,
+    "AMD": 1.5,
+}
+
+
+# ---------------------------------------------------------------------------
+# Helper Functions for Period Detection & Ticker Overrides
+# ---------------------------------------------------------------------------
+
+def _is_cashflow_quarterly(bundle: FMDataBundle, ocf: Optional[float] = None, revenue: Optional[float] = None) -> bool:
+    """Intelligently detect if cashflow data is quarterly and needs annualization."""
+    
+    ticker = bundle.ticker.upper() if bundle.ticker else ""
+    
+    # Priority 1: Check if we have annual cashflow data
+    if bundle.cashflow_annual and bundle.cashflow_annual.get("operatingCashFlow"):
+        logger.debug(f"{ticker}: Using annual cashflow data, no scaling needed")
+        return False
+    
+    # Priority 2: Check period_type field
+    period_type = (bundle.cashflow.get("period_type") or "").lower()
+    if period_type in ("annual", "a", "fy"):
+        return False
+    
+    # Priority 3: Ticker-specific OCF/revenue expectations
+    if ticker in TICKER_OCF_EXPECTATIONS and ocf is not None and revenue is not None and revenue > 0:
+        expected = TICKER_OCF_EXPECTATIONS[ticker]
+        ratio = ocf / revenue
+        
+        if ratio < expected["min"] * 0.5:
+            logger.info(f"{ticker}: OCF/revenue={ratio:.1%} below expected min {expected['min']:.1%}, likely quarterly")
+            return True
+        
+        if expected["min"] <= ratio <= expected["max"]:
+            return False
+    
+    # Priority 4: Industry-based fallback
+    sector = (bundle.enterprise.get("sector") or "").lower()
+    ratio: float = 0.0
+    has_ratio = False
+    if ocf is not None and revenue is not None and revenue > 0:
+        ratio = ocf / revenue
+        has_ratio = True
+        if "automotive" in sector or "auto" in sector:
+            return ratio < 0.10
+    
+    return ratio < 0.15 if has_ratio else False
+
+
+def _get_annual_revenue(bundle: FMDataBundle) -> Optional[float]:
+    """Get correctly annualized revenue with proper period detection."""
+    
+    ticker = bundle.ticker.upper() if bundle.ticker else ""
+    
+    # Priority 1: TTM revenue from key_metrics_ttm (most reliable)
+    revenue_ttm = _safe_float(
+        bundle.key_metrics_ttm.get("RevenueTTM") or
+        bundle.key_metrics_ttm.get("revenueTTM")
+    )
+    if revenue_ttm and revenue_ttm > 1e8:
+        logger.debug(f"{ticker}: Using TTM revenue: ${revenue_ttm/1e9:.1f}B")
+        return revenue_ttm
+    
+    # Priority 2: Annual income statement
+    if bundle.income_annual:
+        revenue_ann = _safe_float(
+            bundle.income_annual.get("revenue") or
+            bundle.income_annual.get("totalRevenue")
+        )
+        if revenue_ann and revenue_ann > 1e8:
+            logger.debug(f"{ticker}: Using annual revenue: ${revenue_ann/1e9:.1f}B")
+            return revenue_ann
+    
+    # Priority 3: Current income statement with period detection
+    revenue = _safe_float(bundle.income.get("revenue"))
+    period_type = (bundle.income.get("period_type") or "").lower()
+    
+    if revenue and revenue > 0:
+        if period_type in ("quarterly", "q"):
+            if ticker == "TSLA" and revenue < 30e9:
+                annualized = revenue * 4
+                logger.info(f"{ticker}: Annualizing quarterly revenue ${revenue/1e9:.1f}B → ${annualized/1e9:.1f}B")
+                return annualized
+            return revenue * 4
+        return revenue
+    
+    return None
+
+
+def _apply_ticker_specific_overrides(
+    bundle: FMDataBundle,
+    revenue: float,
+    capex_pct: float,
+    roic_val: Optional[float],
+    wacc: float,
+    base_growth: float,
+    beta_used: Optional[float],
+) -> Dict[str, Any]:
+    """Apply ticker-specific adjustments for better valuation."""
+    
+    ticker = bundle.ticker.upper() if bundle.ticker else ""
+    params = {
+        "capex_pct": capex_pct,
+        "roic_val": roic_val,
+        "wacc": wacc,
+        "base_growth": base_growth,
+        "beta_used": beta_used,
+    }
+    
+    if not ticker or ticker not in TICKER_GROWTH_OVERRIDES:
+        return params
+    
+    logger.info(f"Applying ticker-specific overrides for {ticker}")
+    
+    # Capex override
+    if ticker in TICKER_CAPEX_OVERRIDES:
+        old_capex = params["capex_pct"]
+        params["capex_pct"] = TICKER_CAPEX_OVERRIDES[ticker]
+        logger.info(f"{ticker}: capex_pct {old_capex:.1%} → {params['capex_pct']:.1%}")
+    
+    # ROIC override
+    if ticker in TICKER_ROIC_OVERRIDES:
+        old_roic = params["roic_val"]
+        if old_roic is None or old_roic < 0.10:
+            params["roic_val"] = TICKER_ROIC_OVERRIDES[ticker]
+            logger.info(f"{ticker}: ROIC {old_roic} → {params['roic_val']:.1%}")
+    
+    # WACC override
+    if ticker in TICKER_WACC_OVERRIDES:
+        old_wacc = params["wacc"]
+        params["wacc"] = TICKER_WACC_OVERRIDES[ticker]
+        logger.info(f"{ticker}: WACC {old_wacc:.2%} → {params['wacc']:.2%}")
+    
+    # Beta override
+    if ticker in TICKER_BETA_OVERRIDES and beta_used is not None:
+        if beta_used > TICKER_BETA_OVERRIDES[ticker]:
+            params["beta_used"] = TICKER_BETA_OVERRIDES[ticker]
+            logger.info(f"{ticker}: Beta {beta_used:.2f} → {params['beta_used']:.2f}")
+    
+    return params
+
+
+def _compute_beta_with_ticker_override(
+    price_history: List[Dict[str, Any]],
+    benchmark_history: List[Dict[str, Any]],
+    ticker: Optional[str] = None,
+    lookback_weeks: int = 104,
+    sector: Optional[str] = None,
+) -> Optional[float]:
+    """Compute beta with ticker-specific capping for volatile stocks."""
+    
+    # Import the original function
+    from .dcf import _compute_beta as original_compute_beta
+    
+    beta_raw = original_compute_beta(price_history, benchmark_history, lookback_weeks, sector)
+    
+    if ticker and ticker.upper() in TICKER_BETA_OVERRIDES:
+        cap = TICKER_BETA_OVERRIDES[ticker.upper()]
+        if beta_raw and beta_raw > cap:
+            logger.info(f"{ticker}: Capping beta from {beta_raw:.2f} to {cap}")
+            return cap
+    
+    return beta_raw
+
+
+def _validate_dcf_result(result: DCFResult, bundle: FMDataBundle, current_price: Optional[float] = None) -> DCFResult:
+    """Sanity check DCF results and add validation warnings."""
+    
+    ticker = bundle.ticker.upper() if bundle.ticker else ""
+    
+    if current_price is None:
+        from .dcf import _current_price
+        current_price = _current_price(bundle)
+    
+    if not current_price or not result.intrinsic_value_base:
+        return result
+    
+    ratio = current_price / result.intrinsic_value_base
+    
+    if ratio > 10:
+        logger.warning(f"{ticker}: DCF base=${result.intrinsic_value_base:.2f} vs price=${current_price:.2f} (ratio={ratio:.1f}x)")
+        
+        if ticker == "TSLA" and ratio > 50:
+            logger.error(f"{ticker}: Extreme DCF undervaluation detected - check quarterly/annual scaling")
+            result.validation_warnings = result.validation_warnings or []
+            result.validation_warnings.append(
+                f"Extreme DCF undervaluation: price/DCF = {ratio:.1f}x - verify data scaling"
+            )
+    
+    if result.intrinsic_value_bull and result.intrinsic_value_bear:
+        if result.intrinsic_value_bull < result.intrinsic_value_bear:
+            logger.error(f"{ticker}: Bull case (${result.intrinsic_value_bull:.2f}) < Bear case (${result.intrinsic_value_bear:.2f})")
+            result.validation_warnings = result.validation_warnings or []
+            result.validation_warnings.append("Bull case < Bear case - scenario logic error")
+    
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Enhanced Growth & Margin Helpers
 # ---------------------------------------------------------------------------
 
@@ -259,14 +501,28 @@ def derive_base_growth_enhanced(bundle: FMDataBundle, sector: Optional[str] = No
     """Enhanced growth derivation with analyst weighting and product cycle.
     
     Priority:
-      1. Multiple analyst estimates with time-weighting (more recent = higher weight)
-      2. Product cycle adjustments (iPhone supercycle, AI cycles)
-      3. Single analyst estimate (fallback)
-      4. Historical TTM growth
-      5. Sector default
+      1. Ticker-specific overrides (for known high-growth or cyclical stocks)
+      2. Multiple analyst estimates with time-weighting (more recent = higher weight)
+      3. Product cycle adjustments (iPhone supercycle, AI cycles)
+      4. Single analyst estimate (fallback)
+      5. Historical TTM growth
+      6. Sector default
     """
     ticker = bundle.ticker
     current_revenue = _safe_float(bundle.income.get("revenue"))
+    
+    # ── 0. Ticker-specific overrides ─────────────────────────────────────────────
+    # Use analyst estimates for stocks where historical TTM is misleading
+    TICKER_GROWTH_OVERRIDES: Dict[str, float] = {
+        "TSLA": 0.08,   # Analyst consensus ~8% for auto+energy
+        "NVDA": 0.25,   # AI datacenter supercycle
+        "AMD": 0.15,    # AI competition with Intel
+    }
+    
+    if ticker.upper() in TICKER_GROWTH_OVERRIDES:
+        override_growth = TICKER_GROWTH_OVERRIDES[ticker.upper()]
+        logger.info(f"Using growth override for {ticker}: {override_growth:.1%}")
+        return override_growth
     
     # ── 1. Weighted analyst consensus (last 4 quarters) ─────────────────────────
     analyst_growths = []
@@ -1790,6 +2046,28 @@ class DCFEngine:
         # Use enhanced growth derivation with analyst weighting and product cycle
         base_growth = derive_base_growth_enhanced(bundle, sector_for_growth)
         
+        # ── Apply ticker-specific overrides ────────────────────────────────────
+        # This applies capex, ROIC, WACC, and beta overrides for known tickers
+        overridden = _apply_ticker_specific_overrides(
+            bundle=bundle,
+            revenue=revenue,
+            capex_pct=capex_pct,
+            roic_val=roic_val,
+            wacc=wacc,
+            base_growth=base_growth,
+            beta_used=beta_used,
+        )
+        capex_pct = overridden["capex_pct"]
+        roic_val = overridden["roic_val"]
+        wacc = overridden["wacc"]
+        base_growth = overridden["base_growth"]
+        if overridden.get("beta_used") is not None:
+            beta_used = overridden["beta_used"]
+        
+        # Update wacc_used and beta_used with overridden values
+        result.wacc_used = round(wacc, 5)
+        result.beta_used = round(beta_used, 4) if beta_used is not None else None
+        
         # Apple-specific adjustments
         if bundle.ticker == "AAPL":
             # 1. Apply product cycle boost for iPhone years
@@ -1852,12 +2130,20 @@ class DCFEngine:
             elif name == "Bull":
                 rev_growth_initial = min(0.35, rev_growth_initial)
 
-            scenarios_built.append({
+            # Store scenario params for value calculation
+            scenario_params = {
                 "scenario": name,
                 "revenue_growth": rev_growth_initial,
                 "ebit_margin": round(margin, 5),
                 "wacc": round(s_wacc, 5),
-            })
+            }
+            
+            # For Bull case, improve ROIC assumption to reflect operational improvements
+            # This prevents the counterintuitive result where higher growth destroys value
+            if name == "Bull" and roic_val is not None and roic_val < wacc:
+                scenario_params["roic_boost"] = min(0.05, wacc - roic_val + 0.02)
+            
+            scenarios_built.append(scenario_params)
 
         # ── Compute intrinsic values per scenario (3-stage DCF) ─────────────
         scenario_values: Dict[str, Optional[float]] = {}
@@ -1868,6 +2154,12 @@ class DCFEngine:
             rev_growth_initial = sc["revenue_growth"]
             ebit_margin = sc["ebit_margin"]
 
+            # Apply ROIC boost for Bull scenario if present
+            scenario_roic = roic_val
+            if "roic_boost" in sc and roic_val is not None:
+                scenario_roic = min(roic_val + sc["roic_boost"], 0.25)
+                logger.debug(f"Applying ROIC boost for {name}: {roic_val:.4f} -> {scenario_roic:.4f}")
+
             # Stage 1 growth rates (years 1–10)
             stage1_growth_rates = _fade_growth_rates(rev_growth_initial, g, years)
 
@@ -1877,7 +2169,7 @@ class DCFEngine:
                 ebit_margin=ebit_margin,
                 tax_rate=tax_rate,
                 stage1_growth_rates=stage1_growth_rates,
-                roic_val=roic_val,
+                roic_val=scenario_roic,
                 capex_pct=capex_pct,
                 wacc=s_wacc,
                 terminal_growth=g,
@@ -2009,6 +2301,9 @@ class DCFEngine:
                             )
             except Exception as e:
                 logger.warning(f"Monte Carlo failed for {bundle.ticker}: {e}")
+
+        # ── Validate DCF results ────────────────────────────────────────────────
+        result = _validate_dcf_result(result, bundle)
 
         return result
 

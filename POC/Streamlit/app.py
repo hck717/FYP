@@ -13,6 +13,7 @@ Architecture:
 
 from __future__ import annotations
 
+import os
 import queue
 import sys
 import threading
@@ -134,8 +135,21 @@ def _safe_get(d: Any, *keys: str, default: Any = None) -> Any:
 
 def _render_sidebar_availability() -> None:
     """Check and display backend health in the sidebar."""
+    # Check if running on cloud
+    is_cloud = os.getenv("STREAMLIT_CLOUD", "").lower() == "true" or "streamlit.cloud" in os.getenv("HOSTNAME", "")
+    
     st.sidebar.header("Backend Status")
-
+    
+    if is_cloud:
+        st.sidebar.warning("⚠️ Cloud Deployment")
+        st.sidebar.caption("""
+When hosting on Streamlit Cloud, backend services (PostgreSQL, Neo4j) 
+must be accessible from the cloud. Options:
+1. Deploy databases to the cloud
+2. Use a VPN/tunnel to expose local services
+3. Run Streamlit locally instead
+        """)
+    
     if st.sidebar.button("Refresh Status", key="refresh_avail"):
         st.session_state.pop("avail_report", None)
 
@@ -896,14 +910,17 @@ def _run_with_streaming(query: str) -> Optional[Dict[str, Any]]:
         subscribe_agent_progress,
         unsubscribe_agent_progress,
     )
+    import uuid
 
-    # ── Queues ────────────────────────────────────────────────────────────────
+    # ── Subscribe to progress queue BEFORE starting stream ───────────────────
+    # Generate session_id first so we can subscribe before parallel_agents runs
+    session_id = str(uuid.uuid4())[:12]
+    progress_queue = subscribe_agent_progress(session_id)
+    
+    # ── Queues ───────────────────────────────────────────────────────────────
     # output_queue: node-level events from the LangGraph stream thread
     output_queue: queue.Queue = queue.Queue()
-    # progress_queue: per-agent events from node_parallel_agents (set after
-    # we know the session_id from the first __session__ event)
-    progress_queue: Optional[queue.Queue] = None
-    session_id_holder: List[str] = []  # mutable container so the thread can write it
+    session_id_holder: List[str] = [session_id]  # store for cleanup
 
     _STREAM_DONE = object()   # sentinel to signal stream exhaustion
     _STREAM_ERROR = object()  # sentinel to signal stream exception
@@ -911,7 +928,8 @@ def _run_with_streaming(query: str) -> Optional[Dict[str, Any]]:
     def _stream_worker() -> None:
         """Background thread: run the LangGraph generator and push events."""
         try:
-            for node_name, node_output in orch_stream(query):
+            # Pass the pre-generated session_id to ensure consistency
+            for node_name, node_output in orch_stream(query, session_id=session_id):
                 output_queue.put((node_name, node_output))
         except Exception as exc:
             output_queue.put((_STREAM_ERROR, exc))
@@ -990,18 +1008,16 @@ def _run_with_streaming(query: str) -> Optional[Dict[str, Any]]:
                     if node_name is _STREAM_ERROR:
                         raise node_output  # type: ignore[misc]
 
-                    # ── Handle __session__ — subscribe to progress queue ──
+                    # ── Handle __session__ — already subscribed above ────────────────
                     if node_name == "__session__":
-                        sid = node_output.get("session_id", "")
-                        session_id_holder.append(sid)
-                        progress_queue = subscribe_agent_progress(sid)
+                        # Already subscribed to progress queue before stream started
                         continue
 
                     label, desc = NODE_LABELS.get(node_name, (node_name, ""))
 
                     if node_name == "parallel_agents":
                         pass_count += 1
-                        in_parallel_agents = False   # node just finished
+                        in_parallel_agents = True  # Start tracking while agents run
                         agent_area.empty()           # clear per-agent box
                         agent_statuses.clear()
                         line = f"**Pass {pass_count} — {label}:** {desc}"
@@ -1047,8 +1063,9 @@ def _run_with_streaming(query: str) -> Optional[Dict[str, Any]]:
                     if isinstance(node_output, dict):
                         final_state.update(node_output)
 
-                # ── Drain progress_queue (per-agent events) ───────────────
-                if progress_queue is not None and in_parallel_agents:
+                # ── Drain progress_queue (per-agent events) ─────────────────────────
+                # Always drain when we have events, not just during parallel_agents
+                if progress_queue is not None:
                     drained = False
                     while not drained:
                         try:
@@ -1059,6 +1076,7 @@ def _run_with_streaming(query: str) -> Optional[Dict[str, Any]]:
                         agent = event.get("agent", "")
                         if agent == "__done__":
                             drained = True
+                            in_parallel_agents = False  # Agents finished
                             break
                         status = event.get("status", "")
                         elapsed = event.get("elapsed_ms", 0)
@@ -1104,53 +1122,230 @@ def main() -> None:
         st.title("Agentic Investment Analyst")
         st.caption("Powered by LangGraph · DeepSeek · Neo4j · PostgreSQL")
         st.divider()
+        
+        # ── API Settings ───────────────────────────────────────────────────────
+        st.markdown("### API Settings")
+        
+        # DeepSeek API Key
+        deepseek_api_key = st.text_input(
+            "DeepSeek API Key",
+            type="password",
+            value=st.session_state.get("deepseek_api_key", ""),
+            help="Enter your DeepSeek API key. Get one at https://platform.deepseek.com",
+            key="deepseek_key_input"
+        )
+        
+        # Test API button
+        if st.button("Test API Connection", key="test_api_btn"):
+            if not deepseek_api_key:
+                st.error("Please enter your DeepSeek API key first.")
+            else:
+                with st.spinner("Testing connection..."):
+                    try:
+                        import requests
+                        response = requests.get(
+                            "https://api.deepseek.com/v1/models",
+                            headers={"Authorization": f"Bearer {deepseek_api_key}"},
+                            timeout=10
+                        )
+                        if response.status_code == 200:
+                            st.session_state["api_verified"] = True
+                            st.session_state["deepseek_api_key"] = deepseek_api_key
+                            os.environ["DEEPSEEK_API_KEY"] = deepseek_api_key
+                            st.success("✓ API key is valid!")
+                        else:
+                            st.session_state["api_verified"] = False
+                            st.error(f"✗ API error: {response.status_code}")
+                    except Exception as e:
+                        st.session_state["api_verified"] = False
+                        st.error(f"✗ Connection failed: {e}")
+        else:
+            # Check if already verified
+            if st.session_state.get("api_verified") and deepseek_api_key:
+                os.environ["DEEPSEEK_API_KEY"] = deepseek_api_key
+                st.success("✓ API verified")
+        
+        # Show API status
+        if not st.session_state.get("api_verified"):
+            st.warning("⚠️ API key required for analysis")
+        
+        st.divider()
         _render_sidebar_availability()
         st.divider()
         st.markdown("**Supported tickers**")
         st.markdown("AAPL · MSFT · GOOGL · TSLA · NVDA")
 
-    # ── Main area ─────────────────────────────────────────────────────────────
+    # ── Main area with tabs ─────────────────────────────────────────────────────
     st.title("Agentic Investment Analyst")
-    st.markdown(
-        "Ask any investment question about AAPL, MSFT, GOOGL, TSLA, or NVDA. "
-        "The orchestration pipeline will dispatch the appropriate agents in parallel "
-        "and synthesise a research note."
-    )
-
-    # Example query buttons
-    st.markdown("**Example queries:**")
-    cols = st.columns(len(EXAMPLE_QUERIES))
-    for col, q in zip(cols, EXAMPLE_QUERIES):
-        if col.button(q[:40] + "…", key=f"ex_{q[:20]}", width="stretch"):
-            st.session_state["query_input"] = q
-
-    # Query input
-    query = st.text_area(
-        "Your investment question",
-        value=st.session_state.get("query_input", ""),
-        height=80,
-        placeholder="e.g. What is Apple's competitive moat and valuation?",
-        key="query_text",
-    )
-    st.session_state["query_input"] = query
-
-    # Ticker override (optional — orchestration planner resolves automatically)
-    with st.expander("Advanced options"):
-        ticker_override = st.selectbox(
-            "Force ticker (optional — overrides planner resolution)",
-            options=["(auto)", *SUPPORTED_TICKERS],
-            index=0,
-            key="ticker_override",
+    
+    tab1, tab2 = st.tabs(["Analysis", "Database Health"])
+    
+    with tab1:
+        st.markdown(
+            "Ask any investment question about AAPL, MSFT, GOOGL, TSLA, or NVDA. "
+            "The orchestration pipeline will dispatch the appropriate agents in parallel "
+            "and synthesise a research note."
         )
-        if ticker_override != "(auto)":
-            # Inject the ticker into the query if not already present
-            if ticker_override not in query.upper():
-                query = f"[{ticker_override}] {query}"
+
+        # Example query buttons
+        st.markdown("**Example queries:**")
+        cols = st.columns(len(EXAMPLE_QUERIES))
+        for col, q in zip(cols, EXAMPLE_QUERIES):
+            if col.button(q[:40] + "…", key=f"ex_{q[:20]}", width="stretch"):
+                st.session_state["query_input"] = q
+
+        # Query input
+        query = st.text_area(
+            "Your investment question",
+            value=st.session_state.get("query_input", ""),
+            height=80,
+            placeholder="e.g. What is Apple's competitive moat and valuation?",
+            key="query_text",
+        )
+        st.session_state["query_input"] = query
+
+        # Ticker override (optional — orchestration planner resolves automatically)
+        with st.expander("Advanced options"):
+            ticker_override = st.selectbox(
+                "Force ticker (optional — overrides planner resolution)",
+                options=["(auto)", *SUPPORTED_TICKERS],
+                index=0,
+                key="ticker_override",
+            )
+            if ticker_override != "(auto)":
+                # Inject the ticker into the query if not already present
+                query = query or ""
+                if ticker_override not in query.upper():
+                    query = f"[{ticker_override}] {query}"
+
+    with tab2:
+        st.markdown("### Database Health Check")
+        st.markdown("Inspect PostgreSQL and Neo4j databases for data coverage and quality.")
+        
+        if st.button("Run Database Inspection", key="db_inspect"):
+            with st.spinner("Connecting to databases..."):
+                try:
+                    # Import and run the inspection
+                    import sys
+                    from pathlib import Path
+                    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "ingestion" / "etl"))
+                    from inspect_db import check_postgres, check_neo4j
+                    
+                    import io
+                    from contextlib import redirect_stdout, redirect_stderr
+                    
+                    # PostgreSQL results
+                    pg_output = io.StringIO()
+                    try:
+                        with redirect_stdout(pg_output), redirect_stderr(pg_output):
+                            pg_ok = check_postgres()
+                    except Exception as e:
+                        pg_ok = False
+                    
+                    # Neo4j results  
+                    neo4j_output = io.StringIO()
+                    try:
+                        with redirect_stdout(neo4j_output), redirect_stderr(neo4j_output):
+                            neo4j_ok = check_neo4j()
+                    except Exception as e:
+                        neo4j_ok = False
+                    
+                    # Display summary cards
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.metric("PostgreSQL", "✓ Connected" if pg_ok else "✗ Error", 
+                                 "OK" if pg_ok else "Check logs")
+                    with col2:
+                        st.metric("Neo4j", "✓ Connected" if neo4j_ok else "✗ Error",
+                                 "OK" if neo4j_ok else "Check logs")
+                    
+                    st.divider()
+                    
+                    # Show detailed results in expandable sections
+                    with st.expander("PostgreSQL Details", expanded=True):
+                        pg_result = pg_output.getvalue()
+                        if pg_result:
+                            # Parse and display key metrics
+                            lines = pg_result.split('\n')
+                            metrics = {}
+                            for line in lines:
+                                if ':' in line and ('rows' in line.lower() or 'coverage' in line.lower()):
+                                    metrics[line.strip()] = True
+                            
+                            # Show as metrics
+                            metric_cols = st.columns(3)
+                            idx = 0
+                            for line in lines:
+                                if "raw_timeseries" in line and "rows" in line:
+                                    try:
+                                        count = int([x for x in line.split() if x.isdigit()][0])
+                                        metric_cols[idx % 3].metric("Price Data", f"{count:,}")
+                                        idx += 1
+                                    except:
+                                        pass
+                                if "financial_statements" in line and "rows" in line:
+                                    try:
+                                        count = int([x for x in line.split() if x.isdigit()][0])
+                                        metric_cols[idx % 3].metric("Financials", f"{count:,}")
+                                        idx += 1
+                                    except:
+                                        pass
+                                if "news_articles" in line and "rows" in line:
+                                    try:
+                                        count = int([x for x in line.split() if x.isdigit()][0])
+                                        metric_cols[idx % 3].metric("News", f"{count:,}")
+                                        idx += 1
+                                    except:
+                                        pass
+                            
+                            st.text("Raw Output:")
+                            st.code(pg_result[:3000] if len(pg_result) > 3000 else pg_result, language="text")
+                    
+                    with st.expander("Neo4j Details", expanded=True):
+                        neo4j_result = neo4j_output.getvalue()
+                        
+                        # Parse key metrics
+                        lines = neo4j_result.split('\n')
+                        idx = 0
+                        metric_cols = st.columns(3)
+                        for line in lines:
+                            if "Company nodes" in line:
+                                try:
+                                    count = int([x for x in line.split() if x.isdigit()][0])
+                                    metric_cols[idx % 3].metric("Companies", str(count))
+                                    idx += 1
+                                except:
+                                    pass
+                            if "Chunk nodes" in line:
+                                try:
+                                    count = int([x for x in line.split() if x.isdigit()][0])
+                                    metric_cols[idx % 3].metric("Chunks", f"{count:,}")
+                                    idx += 1
+                                except:
+                                    pass
+                            if "embedding dimension" in line:
+                                if "768" in line:
+                                    metric_cols[idx % 3].metric("Embedding", "768-dim ✓")
+                                idx += 1
+                            
+                            st.text("Raw Output:")
+                            st.code(neo4j_result[:3000] if len(neo4j_result) > 3000 else neo4j_result, language="text")
+                        
+                except Exception as e:
+                    st.error(f"Failed to inspect databases: {e}")
+                    st.info("Make sure PostgreSQL and Neo4j are running.")
 
     run_btn = st.button("Run Analysis", type="primary", width="stretch")
 
     # ── Run ───────────────────────────────────────────────────────────────────
     if run_btn:
+        # Check API key is verified
+        if not st.session_state.get("api_verified"):
+            st.error("Please enter and verify your DeepSeek API key in the sidebar first!")
+            st.info("1. Enter your DeepSeek API key in the sidebar\n2. Click 'Test API Connection'\n3. Wait for '✓ API key is valid!' message")
+            st.stop()
+        
+        query = query or ""
         if not query.strip():
             st.warning("Please enter a question.")
             return
@@ -1218,12 +1413,13 @@ def main() -> None:
                 from orchestration.graph import get_graph as _get_orch_graph
                 _compiled = _get_orch_graph()
                 mermaid_str = _compiled.get_graph().draw_mermaid()
-                st.markdown(
-                    f"```mermaid\n{mermaid_str}\n```",
-                    help="Mermaid diagram of the orchestration pipeline. "
-                         "Copy and paste into https://mermaid.live to render.",
-                )
-                st.caption("Copy the Mermaid source above into https://mermaid.live to render interactively.")
+                # Try using st.mermaid if available (Streamlit 1.28+)
+                try:
+                    st.mermaid(mermaid_str)
+                except (AttributeError, Exception):
+                    # Fallback: show as code with link to render
+                    st.code(mermaid_str, language="mermaid")
+                    st.markdown("[📊 Render this Mermaid diagram online](https://mermaid.live)")
             except Exception as _graph_err:
                 st.caption(f"Pipeline graph unavailable: {_graph_err}")
 

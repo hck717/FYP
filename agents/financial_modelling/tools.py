@@ -1882,11 +1882,11 @@ class FMDataFetcher:
     # Static peer map: Neo4j has no COMPETES_WITH/BELONGS_TO edges in this deployment.
     # This map covers all 5 supported tickers with their 4 closest peers.
     _STATIC_PEERS: Dict[str, List[str]] = {
-        "AAPL":  ["MSFT", "GOOGL", "NVDA", "TSLA"],
-        "MSFT":  ["AAPL", "GOOGL", "NVDA", "TSLA"],
-        "GOOGL": ["AAPL", "MSFT", "NVDA", "TSLA"],
-        "TSLA":  ["AAPL", "MSFT", "NVDA", "GOOGL"],
-        "NVDA":  ["AAPL", "MSFT", "GOOGL", "TSLA"],
+        "AAPL":  ["MSFT", "GOOGL", "NVDA", "META"],
+        "MSFT":  ["AAPL", "GOOGL", "NVDA", "META"],
+        "GOOGL": ["AAPL", "MSFT", "NVDA", "AMZN"],
+        "NVDA":  ["AMD", "INTC", "AAPL", "MSFT"],
+        "TSLA":  ["F", "GM", "TM", "HMC"],
     }
 
     def _resolve_peers(self, ticker: str) -> List[str]:
