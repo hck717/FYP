@@ -917,6 +917,37 @@ def validate_loaded_data(**context) -> dict:
     return report
 
 
+# ── Textual document ingestion wrapper functions ─────────────────────────────────
+
+def load_textual_earnings_calls(ticker_symbol: str):
+    """Wrapper to call earnings call ingestion with new-PDF-only detection."""
+    import sys
+    import os
+    sys.path.insert(0, "/opt/airflow/ingestion/etl")
+    
+    # Set the correct path for Airflow
+    os.environ["TEXTUAL_DATA_DIR"] = "/opt/airflow/data/textual data"
+    
+    from ingest_earnings_calls import load_earnings_call_chunks
+    ticker = ticker_symbol.replace(".US", "")
+    # Use only_new=True so Airflow only processes new/modified PDFs each run
+    return load_earnings_call_chunks(ticker, only_new=False)
+
+
+def load_textual_broker_reports(ticker_symbol: str):
+    """Wrapper to call broker report ingestion with new-PDF-only detection."""
+    import sys
+    import os
+    sys.path.insert(0, "/opt/airflow/ingestion/etl")
+    
+    # Set the correct path for Airflow
+    os.environ["TEXTUAL_DATA_DIR"] = "/opt/airflow/data/textual data"
+    
+    from ingest_broker_reports import load_broker_report_chunks
+    ticker = ticker_symbol.replace(".US", "")
+    return load_broker_report_chunks(ticker, only_new=False)
+
+
 # ── DAG definition ────────────────────────────────────────────────────────────────
 
 with DAG(
@@ -982,23 +1013,6 @@ with DAG(
     )
 
     # Textual document ingestion tasks (earnings calls and broker reports)
-    def load_textual_earnings_calls(ticker_symbol: str):
-        """Wrapper to call earnings call ingestion with new-PDF-only detection."""
-        import sys
-        sys.path.insert(0, "/opt/airflow/ingestion/etl")
-        from ingest_earnings_calls import load_earnings_call_chunks
-        ticker = ticker_symbol.replace(".US", "")
-        # Use only_new=True so Airflow only processes new/modified PDFs each run
-        return load_earnings_call_chunks(ticker, only_new=True)
-
-    def load_textual_broker_reports(ticker_symbol: str):
-        """Wrapper to call broker report ingestion with new-PDF-only detection."""
-        import sys
-        sys.path.insert(0, "/opt/airflow/ingestion/etl")
-        from ingest_broker_reports import load_broker_report_chunks
-        ticker = ticker_symbol.replace(".US", "")
-        return load_broker_report_chunks(ticker, only_new=True)
-
     earnings_call_tasks: dict[str, PythonOperator] = {}
     broker_report_tasks: dict[str, PythonOperator] = {}
 

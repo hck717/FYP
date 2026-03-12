@@ -12,5 +12,5 @@ RUN apt-get update \
 USER airflow
 
 # Copy requirements and install
-COPY requirements.txt /requirements.txt
+COPY docker/requirements.txt /requirements.txt
 RUN pip install --no-cache-dir -r /requirements.txt

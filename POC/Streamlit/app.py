@@ -933,6 +933,7 @@ def _run_with_streaming(query: str) -> Optional[Dict[str, Any]]:
     agent_statuses: Dict[str, str] = {}
     agent_elapsed:  Dict[str, int]  = {}
     agent_excerpts: Dict[str, str]  = {}
+    agent_thinking_traces: Dict[str, List[Dict[str, Any]]] = {}
 
     def _render_agent_progress() -> None:
         """Re-render the per-agent progress box."""
@@ -958,6 +959,18 @@ def _run_with_streaming(query: str) -> Optional[Dict[str, Any]]:
             if excerpt and status == "done":
                 line += f"\n  *{excerpt}*"
             lines.append(line)
+            # Show thinking trace in real-time for done agents
+            thinking_trace = agent_thinking_traces.get(agent)
+            if thinking_trace and status == "done":
+                trace_lines = []
+                for step in thinking_trace[-3:]:  # Show last 3 steps
+                    ts = step.get("ts", "")
+                    name = step.get("name", "")
+                    detail = step.get("detail", "")
+                    trace_lines.append(f"  `{ts}` {name}: {detail[:50]}...")
+                if trace_lines:
+                    lines.append("  **Thinking:**")
+                    lines.extend(trace_lines)
         agent_area.markdown("\n".join(lines))
 
     try:
@@ -1057,6 +1070,10 @@ def _run_with_streaming(query: str) -> Optional[Dict[str, Any]]:
                             excerpt = event.get("excerpt")
                             if excerpt:
                                 agent_excerpts[agent] = excerpt
+                            # Store thinking trace for real-time display
+                            thinking_trace = event.get("thinking_trace")
+                            if thinking_trace:
+                                agent_thinking_traces[agent] = thinking_trace
                         elif status == "error":
                             agent_statuses[agent] = "error"
                             agent_elapsed[agent]  = elapsed

@@ -270,11 +270,88 @@ CREATE TABLE IF NOT EXISTS sentiment_trends (
 - **Location**: `/data/textual data/{TICKER}/earning_call/`
 - **Format**: PDF files
 - **Ingestion**: `ingest_earnings_calls.py` extracts text → splits into chunks → embeds with Ollama → stores in Neo4j
+- **Exact Paths**:
+  - `/Users/brianho/FYP/data/textual data/AAPL/earning_call/`
+  - `/Users/brianho/FYP/data/textual data/MSFT/earning_call/`
+  - `/Users/brianho/FYP/data/textual data/GOOGL/earning_call/`
+  - `/Users/brianho/FYP/data/textual data/TSLA/earning_call/`
+  - `/Users/brianho/FYP/data/textual data/NVDA/earning_call/`
 
 ### Broker Reports
-- **Location**: `/data/textual data/{TICKER}/broker/`
+- **Location**: `/Users/brianho/FYP/data/textual data/{TICKER}/broker/`
 - **Format**: PDF files
 - **Ingestion**: `ingest_broker_reports.py` extracts text → splits into chunks → embeds with Ollama → stores in Neo4j
+- **Exact Paths**:
+  - `/Users/brianho/FYP/data/textual data/AAPL/broker/`
+  - `/Users/brianho/FYP/data/textual data/MSFT/broker/`
+  - `/Users/brianho/FYP/data/textual data/GOOGL/broker/`
+  - `/Users/brianho/FYP/data/textual data/TSLA/broker/`
+  - `/Users/brianho/FYP/data/textual data/NVDA/broker/`
+
+### Metadata Files
+- **Location**: `/Users/brianho/FYP/data/textual data/{TICKER}/metadata.json`
+- **Contains**: Ticker info, sector, industry, company description
+
+---
+
+## Complete Data Location Reference
+
+### Local Data Directory Structure
+```
+/Users/brianho/FYP/data/
+├── textual data/
+│   ├── AAPL/
+│   │   ├── broker/
+│   │   ├── earning_call/
+│   │   └── metadata.json
+│   ├── MSFT/
+│   │   ├── broker/
+│   │   ├── earning_call/
+│   │   └── metadata.json
+│   ├── GOOGL/
+│   │   ├── broker/
+│   │   ├── earning_call/
+│   │   └── metadata.json
+│   ├── TSLA/
+│   │   ├── broker/
+│   │   ├── earning_call/
+│   │   └── metadata.json
+│   └── NVDA/
+│       ├── broker/
+│       ├── earning_call/
+│       └── metadata.json
+├── postgres_data/          # PostgreSQL data directory
+├── neo4j_data/            # Neo4j graph database
+├── neo4j_logs/            # Neo4j log files
+└── logs/                  # Application logs
+```
+
+### PostgreSQL Database Tables (via Docker)
+- **Host**: `localhost:5432` (external) or `postgres:5432` (Docker internal)
+- **Database**: `airflow`
+- **User**: `airflow`
+- **Key Tables**:
+  - `raw_timeseries` - OHLCV price data
+  - `financial_statements` - Income statement, balance sheet, cash flow
+  - `valuation_metrics` - PE, EV/EBITDA, market cap
+  - `sentiment_trends` - Daily sentiment aggregations
+  - `news_articles` - News with embeddings
+  - `text_chunks` - Company profile chunks with embeddings
+  - `earnings_surprises` - EPS actuals vs estimates
+  - `insider_transactions` - SEC Form 4 transactions
+  - `institutional_holders` - 13F holdings
+
+### Neo4j Database (via Docker)
+- **Host**: `localhost:7474` (HTTP) / `localhost:7687` (Bolt)
+- **User**: `neo4j`
+- **Password**: `SecureNeo4jPass2025!`
+- **Key Nodes**:
+  - `:Company` - 85+ properties per ticker
+  - `:Chunk` - Text embeddings from earnings calls, broker reports
+
+### Agent Data Cache (written by DAG)
+- **Location**: `/Users/brianho/FYP/ingestion/etl/agent_data/{TICKER}/`
+- **Contains**: Raw JSON/CSV files from EODHD API
 
 ---
 

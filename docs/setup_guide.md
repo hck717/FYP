@@ -191,20 +191,7 @@ RUN pip install --no-cache-dir -r /requirements.txt
 ```
 
 ### D. Requirements (`docker/requirements.txt`)
-Add the core libraries mentioned in your architecture:
-
-```text
-apache-airflow-providers-postgres
-langchain
-langgraph
-qdrant-client
-openai
-pandas
-numpy
-yfinance
-plotly
-requests
-```
+The full requirements are in `docker/requirements.txt`. This file contains all Python dependencies needed for the Docker deployment and supersedes the root `requirements.txt`.
 
 ---
 

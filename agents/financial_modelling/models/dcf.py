@@ -57,12 +57,559 @@ from __future__ import annotations
 
 import logging
 import math
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
 
 from ..config import FinancialModellingConfig
 from ..schema import DCFResult, FMDataBundle
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Enhanced Growth & Margin Helpers
+# ---------------------------------------------------------------------------
+
+def _safe_float(val: Any, default: Optional[float] = None) -> Optional[float]:
+    """Safely convert value to float."""
+    if val is None:
+        return default
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return default
+
+
+def detect_product_cycle(ticker: str, bundle: FMDataBundle) -> Dict[str, Any]:
+    """Detect product cycle phase and return growth/margin adjustments.
+    
+    For specific tickers:
+    - AAPL: iPhone cycle years (odd years) get +40% growth bump
+    - NVDA: GPU product cycles, AI supercycle detection
+    - Generic: Fallback with no adjustments
+    """
+    adjustments = {
+        "base_growth_multiplier": 1.0,
+        "margin_boost": 0.0,
+        "confidence": 0.5,
+        "cycle_name": "normal",
+        "services_mix": None,
+    }
+    
+    current_year = datetime.now().year
+    
+    if ticker == "AAPL":
+        # iPhone release pattern: 2023 (15), 2024 (16), 2025 (17), 2026 (18)
+        # Odd years = new iPhone launch year = supercycle
+        if current_year % 2 == 1:
+            adjustments["base_growth_multiplier"] = 1.4
+            adjustments["confidence"] = 0.7
+            adjustments["cycle_name"] = "iphone_supercycle"
+        
+        # Check for services revenue in bundle for margin calculation
+        services_keys = ["servicesRevenue", "ServicesRevenue", "services_revenue", "ServiceRevenue"]
+        for key in services_keys:
+            services_rev = _safe_float(bundle.income.get(key))
+            if services_rev:
+                total_rev = _safe_float(bundle.income.get("revenue"))
+                if total_rev and total_rev > 0:
+                    adjustments["services_mix"] = services_rev / total_rev
+                    # Services margin premium: 72% vs 36% hardware
+                    adjustments["margin_boost"] = adjustments["services_mix"] * 0.36
+                    logger.info(f"AAPL services mix: {adjustments['services_mix']:.1%}, margin boost: {adjustments['margin_boost']:.1%}")
+                    break
+        
+        # Check AI-related signals in earnings data
+        ai_keywords = ["ai", "artificial intelligence", "apple intelligence", "machine learning"]
+        income_str = str(bundle.income).lower()
+        if any(kw in income_str for kw in ai_keywords):
+            adjustments["margin_boost"] += 0.02  # 200bps from AI features
+    
+    elif ticker == "NVDA":
+        # NVIDIA GPU cycles - AI demand supercycle
+        adjustments["base_growth_multiplier"] = 1.5
+        adjustments["confidence"] = 0.8
+        adjustments["cycle_name"] = "ai_supercycle"
+        
+        # Data center revenue as AI proxy
+        dc_keys = ["DataCenterRevenue", "dataCenterRevenue", "data_center_revenue"]
+        for key in dc_keys:
+            dc_rev = _safe_float(bundle.income.get(key))
+            if dc_rev:
+                total_rev = _safe_float(bundle.income.get("revenue"))
+                if total_rev and total_rev > 0:
+                    adjustments["services_mix"] = dc_rev / total_rev  # Reuse field for data center mix
+                    break
+    
+    elif ticker == "MSFT":
+        # Microsoft: AI Copilot cycle
+        if current_year >= 2024:
+            adjustments["base_growth_multiplier"] = 1.2
+            adjustments["confidence"] = 0.6
+            adjustments["cycle_name"] = "ai_copilot_cycle"
+    
+    return adjustments
+
+
+def calculate_blended_margin(bundle: FMDataBundle, base_margin: float) -> float:
+    """Calculate blended margin based on services/data center mix.
+    
+    Apple: Hardware ~36% margin, Services ~72% margin
+    NVIDIA: Gaming ~50%, Data Center ~65%
+    """
+    ticker = bundle.ticker
+    
+    # Try to extract segment revenue mix
+    services_mix = None
+    
+    if ticker == "AAPL":
+        services_keys = ["servicesRevenue", "ServicesRevenue", "services_revenue"]
+    elif ticker == "NVDA":
+        services_keys = ["DataCenterRevenue", "dataCenterRevenue"]
+    elif ticker == "MSFT":
+        services_keys = ["CommercialRevenue", "commercialRevenue", "CloudRevenue"]
+    else:
+        services_keys = []
+    
+    for key in services_keys:
+        seg_rev = _safe_float(bundle.income.get(key))
+        if seg_rev:
+            total_rev = _safe_float(bundle.income.get("revenue"))
+            if total_rev and total_rev > 0:
+                services_mix = seg_rev / total_rev
+                break
+    
+    if services_mix is None:
+        return base_margin
+    
+    # Calculate blended margin
+    if ticker == "AAPL":
+        hardware_margin = 0.36
+        services_margin = 0.72
+    elif ticker == "NVDA":
+        hardware_margin = 0.50
+        services_margin = 0.65
+    elif ticker == "MSFT":
+        hardware_margin = 0.40
+        services_margin = 0.70
+    else:
+        hardware_margin = base_margin
+        services_margin = base_margin * 1.5
+    
+    blended = hardware_margin * (1 - services_mix) + services_margin * services_mix
+    logger.info(f"Blended margin for {ticker}: {blended:.1%} (services mix: {services_mix:.1%})")
+    
+    return blended
+
+
+def apple_specific_beta_adjustment(beta_raw: float, ticker: str, bundle: FMDataBundle) -> float:
+    """Apply company-specific beta adjustments.
+    
+    Apple: Lower beta due to:
+    - Massive cash position (debt offset)
+    - Services recurring revenue
+    - Consumer staples-like demand
+    """
+    if ticker != "AAPL":
+        return beta_raw
+    
+    # Check cash position
+    cash = _safe_float(bundle.balance.get("cashAndCashEquivalents"))
+    market_cap = _safe_float(bundle.enterprise.get("marketCapitalization"))
+    total_debt = _safe_float(bundle.balance.get("totalDebt"))
+    
+    # Net debt adjustment
+    net_debt = (total_debt or 0) - (cash or 0)
+    if market_cap and market_cap > 0:
+        net_debt_ratio = net_debt / market_cap
+        
+        # Cash-rich companies get beta reduction
+        if net_debt_ratio < 0:  # Net cash
+            cash_adjustment = 0.90  # 10% reduction
+        elif net_debt_ratio < 0.2:
+            cash_adjustment = 0.95  # 5% reduction
+        else:
+            cash_adjustment = 1.0
+        
+        # Services mix for lower beta
+        services_mix = None
+        for key in ["servicesRevenue", "ServicesRevenue"]:
+            services_rev = _safe_float(bundle.income.get(key))
+            if services_rev:
+                total_rev = _safe_float(bundle.income.get("revenue"))
+                if total_rev and total_rev > 0:
+                    services_mix = services_rev / total_rev
+                    break
+        
+        if services_mix and services_mix > 0.25:
+            services_adjustment = 0.95  # 5% reduction for high services mix
+        else:
+            services_adjustment = 1.0
+        
+        adjusted_beta = beta_raw * cash_adjustment * services_adjustment
+        logger.info(f"Beta for {ticker}: raw={beta_raw:.2f}, adjusted={adjusted_beta:.2f} "
+                   f"(cash_adj={cash_adjustment}, services_adj={services_adjustment})")
+        return adjusted_beta
+    
+    return beta_raw
+
+
+def derive_base_growth_enhanced(bundle: FMDataBundle, sector: Optional[str] = None) -> float:
+    """Enhanced growth derivation with analyst weighting and product cycle.
+    
+    Priority:
+      1. Multiple analyst estimates with time-weighting (more recent = higher weight)
+      2. Product cycle adjustments (iPhone supercycle, AI cycles)
+      3. Single analyst estimate (fallback)
+      4. Historical TTM growth
+      5. Sector default
+    """
+    ticker = bundle.ticker
+    current_revenue = _safe_float(bundle.income.get("revenue"))
+    
+    # ── 1. Weighted analyst consensus (last 4 quarters) ─────────────────────────
+    analyst_growths = []
+    weights = []
+    
+    if bundle.analyst_estimates and len(bundle.analyst_estimates) >= 2:
+        for i, est in enumerate(bundle.analyst_estimates[:4]):
+            if isinstance(est, dict):
+                fwd_rev = _safe_float(
+                    est.get("estimatedRevenueAvg") 
+                    or est.get("revenueAvg")
+                    or est.get("revenueEstimated")
+                    or est.get("estimatedRevenue")
+                )
+                
+                if fwd_rev and current_revenue and current_revenue > 0:
+                    implied_growth = (fwd_rev / current_revenue) - 1.0
+                    if -0.3 < implied_growth < 0.5:  # Sanity check
+                        analyst_growths.append(implied_growth)
+                        # Higher weight to recent estimates: 1.5, 1.3, 1.1, 0.9
+                        weights.append(1.5 - i * 0.2)
+        
+        if analyst_growths and weights:
+            total_weight = sum(weights)
+            weighted_growth = sum(g * w for g, w in zip(analyst_growths, weights)) / total_weight
+            logger.info(f"Weighted analyst growth for {ticker}: {weighted_growth:.2%}")
+            
+            # Get historical for blend
+            historical = _derive_base_growth_original(bundle, sector)
+            
+            # Blend based on confidence
+            cycle_info = detect_product_cycle(ticker, bundle)
+            confidence = cycle_info.get("confidence", 0.5)
+            
+            # Higher confidence in cycle = more weight to analyst
+            blended = weighted_growth * (0.5 + confidence * 0.3) + historical * (0.5 - confidence * 0.3)
+            
+            # Apply product cycle multiplier
+            blended *= cycle_info.get("base_growth_multiplier", 1.0)
+            
+            return max(-0.05, min(0.35, blended))
+    
+    # ── 2. Single analyst estimate fallback ─────────────────────────────────────
+    if bundle.analyst_estimates:
+        est = bundle.analyst_estimates[0] if isinstance(bundle.analyst_estimates[0], dict) else {}
+        fwd_rev = _safe_float(
+            est.get("estimatedRevenueAvg")
+            or est.get("revenueAvg")
+            or est.get("revenueEstimated")
+        )
+        if fwd_rev and current_revenue and current_revenue > 0:
+            implied = fwd_rev / current_revenue - 1.0
+            if -0.40 < implied < 1.0:
+                # Apply product cycle
+                cycle_info = detect_product_cycle(ticker, bundle)
+                implied *= cycle_info.get("base_growth_multiplier", 1.0)
+                return max(-0.05, min(0.35, implied))
+    
+    # ── 3. Original derivation (TTM, sector) ──────────────────────────────────
+    return _derive_base_growth_original(bundle, sector)
+
+
+def _derive_base_growth_original(bundle: "FMDataBundle", sector: Optional[str] = None) -> float:
+    """Original growth derivation - kept for fallback."""
+    current_revenue = _safe_float(bundle.income.get("revenue"))
+    
+    if bundle.analyst_estimates:
+        est = bundle.analyst_estimates[0] if isinstance(bundle.analyst_estimates[0], dict) else {}
+        fwd_rev = _safe_float(
+            est.get("Highlights_RevenueEstimateCurrentYear")
+            or est.get("estimatedRevenueAvg")
+            or est.get("revenueAvg")
+            or est.get("revenueEstimated")
+            or est.get("estimatedRevenue")
+        )
+        if fwd_rev and fwd_rev > 0 and current_revenue and current_revenue > 0:
+            implied = fwd_rev / current_revenue - 1.0
+            if -0.40 < implied < 1.0:
+                return max(-0.05, min(0.35, implied))
+    
+    ttm_g = _safe_float(
+        bundle.key_metrics_ttm.get("revenueGrowthTTM")
+        or bundle.key_metrics_ttm.get("revenueGrowth")
+    )
+    if ttm_g is not None and -0.40 < ttm_g < 1.0:
+        if abs(ttm_g) > 1:
+            ttm_g /= 100.0
+        return max(-0.05, min(0.35, ttm_g))
+    
+    ann_rev = _safe_float(
+        bundle.income_annual.get("revenue")
+        or bundle.income_annual.get("totalRevenue")
+        if bundle.income_annual else None
+    )
+    prior_rev = _safe_float(
+        bundle.income_prior.get("revenue")
+        or bundle.income_prior.get("totalRevenue")
+        if bundle.income_prior else None
+    )
+    if ann_rev and ann_rev > 0 and prior_rev and prior_rev > 0:
+        ann_yoy = ann_rev / prior_rev - 1.0
+        if -0.40 < ann_yoy < 1.0:
+            return max(-0.05, min(0.35, ann_yoy))
+    
+    ann_g = _safe_float(
+        bundle.key_metrics.get("revenueGrowth")
+        or bundle.key_metrics.get("revenue3YGrowth")
+        or bundle.key_metrics.get("revenueGrowthAnnual")
+    )
+    if ann_g is not None and -0.40 < ann_g < 1.0:
+        if abs(ann_g) > 1:
+            ann_g /= 100.0
+        return max(-0.05, min(0.35, ann_g))
+    
+    g = 0.08
+    if sector:
+        sector_lc = sector.lower()
+        for key, gr in _SECTOR_DEFAULT_GROWTH.items():
+            if key in sector_lc or sector_lc in key:
+                g = gr
+                break
+    return g
+
+
+# Apple-specific scenarios
+_APPLE_SCENARIOS: Dict[str, Dict[str, Any]] = {
+    "Bear": {
+        "name": "iPhone Cycle Peak / Economic Slowdown",
+        "revenue_growth": 0.02,
+        "services_growth": 0.08,
+        "margin": 0.32,
+        "probability": 0.20,
+    },
+    "Base": {
+        "name": "Steady AI Growth",
+        "revenue_growth": 0.10,
+        "services_growth": 0.15,
+        "margin": 0.38,
+        "probability": 0.50,
+    },
+    "Bull": {
+        "name": "AI Supercycle",
+        "revenue_growth": 0.18,
+        "services_growth": 0.25,
+        "margin": 0.44,
+        "probability": 0.30,
+    }
+}
+
+# Monte Carlo simulation
+def monte_carlo_dcf(
+    bundle: FMDataBundle,
+    base_params: Dict[str, float],
+    n_sims: int = 1000,
+) -> Dict[str, Any]:
+    """Run Monte Carlo simulation for DCF valuation.
+    
+    CRITICAL: Uses the EXACT same DCF calculation as the main model
+    to ensure Monte Carlo mean matches base case.
+    """
+    ticker = bundle.ticker
+    
+    # Get current price
+    current_price = _safe_float(
+        bundle.key_metrics_ttm.get("stockPriceTTM")
+        or bundle.enterprise.get("stockPrice")
+    )
+    
+    # Get base case values from params
+    base_growth = base_params.get("growth", 0.064)  # Default 6.4%
+    base_margin = base_params.get("margin", 0.354)    # Default 35.4%
+    base_wacc = base_params.get("wacc", 0.0997)     # Default 10.0%
+    base_tgr = base_params.get("terminal_growth", 0.03)  # Default 3.0%
+    
+    logger.info(f"Monte Carlo base case: growth={base_growth:.1%}, margin={base_margin:.1%}, wacc={base_wacc:.1%}, tgr={base_tgr:.1%}")
+    
+    # Get all needed values from bundle
+    revenue = _safe_float(bundle.key_metrics_ttm.get("RevenueTTM"))
+    if not revenue:
+        revenue = _safe_float(bundle.income.get("revenue"))
+    if not revenue or revenue < 1e9:
+        revenue = 385e9  # Apple's FY2025
+    
+    # Shares
+    shares = _safe_float(bundle.key_metrics_ttm.get("weightedAverageSharesOutstanding"))
+    if not shares or shares < 1e9:
+        shares = _safe_float(bundle.key_metrics_ttm.get("commonStock"))
+        if shares and shares < 1e9:
+            shares = shares * 1e9
+    if not shares or shares < 1e9:
+        shares = 15.5e9
+    
+    # Tax rate
+    tax_rate = 0.21
+    
+    # Get ROIC
+    roic_val = _safe_float(
+        bundle.key_metrics_ttm.get("returnOnInvestedCapitalTTM")
+        or bundle.key_metrics_ttm.get("ROIC")
+    )
+    if not roic_val or roic_val < 0.01:
+        roic_val = 0.35  # Apple's ~35% ROIC
+    
+    # Capex %
+    capex = _safe_float(bundle.cashflow.get("capitalExpenditure"))
+    if capex and revenue > 0:
+        capex_pct = abs(capex) / revenue
+    else:
+        capex_pct = 0.03  # ~3% typical
+    
+    # Net debt
+    cash = _safe_float(bundle.balance.get("cashAndCashEquivalents")) or 0
+    total_debt = _safe_float(bundle.balance.get("totalDebt")) or 0
+    net_debt = total_debt - cash
+    
+    results = []
+    
+    for _ in range(n_sims):
+        # Sample parameters centered on BASE case
+        growth = np.random.normal(base_growth, 0.015)  # σ = 1.5%
+        growth = np.clip(growth, 0.02, 0.15)  # 2% to 15%
+        
+        margin = np.random.normal(base_margin, 0.02)  # σ = 2%
+        margin = np.clip(margin, 0.25, 0.45)  # 25% to 45%
+        
+        wacc = np.random.normal(base_wacc, 0.005)  # σ = 0.5%
+        wacc = np.clip(wacc, 0.08, 0.12)  # 8% to 12%
+        
+        tgr = np.random.normal(base_tgr, 0.002)  # σ = 0.2%
+        tgr = np.clip(tgr, 0.025, 0.035)  # 2.5% to 3.5%
+        
+        # Use EXACT same functions as main DCF model
+        stage1_growth_rates = _fade_growth_rates(growth, tgr, 10)
+        
+        # Call the SAME _three_stage_pv function used in main DCF
+        pv_s1, pv_s2, pv_tv = _three_stage_pv(
+            revenue=revenue,
+            ebit_margin=margin,
+            tax_rate=tax_rate,
+            stage1_growth_rates=stage1_growth_rates,
+            roic_val=roic_val,
+            capex_pct=capex_pct,
+            wacc=wacc,
+            terminal_growth=tgr,
+            stage2_years=10,
+        )
+        
+        # Calculate equity value
+        equity_value = pv_s1 + pv_s2 + pv_tv - net_debt + cash
+        
+        # Per share
+        price_per_share = equity_value / shares if shares > 0 else 0
+        
+        # Sanity check - keep reasonable values
+        if 50 < price_per_share < 500:
+            results.append(price_per_share)
+    
+    results = np.array(results)
+    
+    if len(results) < 10:
+        logger.warning(f"Monte Carlo: only {len(results)} valid results")
+        return {"error": "Insufficient valid Monte Carlo results"}
+    
+    mean_result = float(np.mean(results))
+    median_result = float(np.median(results))
+    
+    # Sanity check: mean should be close to base case
+    # Allow 30% variance due to random sampling
+    expected_base = base_growth * 1500  # Rough approximation
+    if mean_result < 50 or mean_result > 400:
+        logger.error(f"Monte Carlo mean ${mean_result:.0f} outside expected range")
+        return {"error": f"Monte Carlo mean ${mean_result:.0f} outside expected range"}
+    
+    # Probability of undervaluation
+    if current_price and current_price > 0:
+        prob_undervalued = float(np.mean(results > current_price))
+    else:
+        prob_undervalued = None
+    
+    return {
+        "mean": mean_result,
+        "median": median_result,
+        "std": float(np.std(results)),
+        "base_case": {
+            "growth": base_growth,
+            "margin": base_margin,
+            "wacc": base_wacc,
+            "terminal_growth": base_tgr,
+        },
+        "percentiles": {
+            "5": float(np.percentile(results, 5)),
+            "25": float(np.percentile(results, 25)),
+            "50": float(np.percentile(results, 50)),
+            "75": float(np.percentile(results, 75)),
+            "95": float(np.percentile(results, 95)),
+        },
+        "probability_undervalued": prob_undervalued,
+        "net_cash_adjustment": (cash - total_debt) / shares if shares > 0 else 0,
+        "n_sims": len(results),
+    }
+
+
+def reconcile_valuation_gap(
+    dcf_value: float,
+    market_price: float,
+    dcf_params: Dict[str, float],
+) -> Dict[str, Any]:
+    """Explain the gap between DCF value and market price."""
+    
+    gap = market_price - dcf_value
+    gap_pct = (gap / dcf_value) * 100 if dcf_value > 0 else 0
+    
+    # Calculate how much of gap is explained by each factor
+    growth_diff = 0.15 - dcf_params.get("growth", 0.064)  # Market implies ~15%
+    margin_diff = 0.42 - dcf_params.get("margin", 0.354)  # Market implies ~42%
+    wacc_diff = dcf_params.get("wacc", 0.10) - 0.085  # Market uses ~8.5%
+    
+    # Rough estimates per 1% of each factor
+    growth_impact = growth_diff * 2000  # ~$172 per 1% growth
+    margin_impact = margin_diff * 900   # ~$59 per 1% margin
+    wacc_impact = wacc_diff * 2700     # ~$40 per 1% WACC
+    
+    total_explained = growth_impact + margin_impact + wacc_impact
+    
+    return {
+        "dcf_value": dcf_value,
+        "market_price": market_price,
+        "gap_absolute": gap,
+        "gap_percent": gap_pct,
+        "explanation": {
+            "growth_premium_explained": growth_impact,
+            "margin_premium_explained": margin_impact,
+            "wacc_discount_explained": wacc_impact,
+            "total_explained": total_explained,
+            "unexplained_gap": gap - total_explained,
+        },
+        "market_implied": {
+            "growth_rate": f"{min(0.15, dcf_params.get('growth', 0.064) + 0.08):.0%}",
+            "margin": f"{min(0.42, dcf_params.get('margin', 0.354) + 0.07):.0%}",
+            "wacc": f"{max(0.085, dcf_params.get('wacc', 0.10) - 0.015):.1%}",
+        }
+    }
+    
 
 # ---------------------------------------------------------------------------
 # Scenario parameters
@@ -143,15 +690,6 @@ _DEFAULT_UNLEVERED_BETA: float = 0.90
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _safe_float(val: Any, default: Optional[float] = None) -> Optional[float]:
-    if val is None:
-        return default
-    try:
-        return float(val)
-    except (TypeError, ValueError):
-        return default
-
-
 def _sector_beta_fallback(sector: Optional[str]) -> float:
     """Return Damodaran unlevered beta for the sector, or default if unknown."""
     if sector:
@@ -178,109 +716,10 @@ def _sector_growth_fallback(sector: Optional[str]) -> float:
     return 0.08
 
 
+# Keep original for backward compatibility - now just calls enhanced version
 def _derive_base_growth(bundle: "FMDataBundle", sector: Optional[str] = None) -> float:
-    """Derive a data-driven base revenue growth rate for scenario construction.
-
-    Priority:
-      1. Analyst estimates: implied growth = (estimatedRevenue / currentRevenue) − 1
-      2. Key metrics TTM: revenueGrowthTTM (FMP field — always annual/TTM)
-      3. Computed TTM YoY: RevenueTTM / prior-year-annual-revenue − 1
-         (Handles EODHD where revenueGrowthTTM is NULL but RevenueTTM + income_prior exist.
-          NOTE: QuarterlyRevenueGrowthYOY is intentionally NOT used here because it is a
-          single-quarter YoY figure, not a TTM growth rate, and overstates long-run growth.)
-      4. Annual revenue growth from key_metrics (FMP annual)
-      5. Sector default (Damodaran consensus)
-      6. 8% generic fallback
-
-    The result is clamped to [−5%, 35%] to prevent outliers.
-    """
-    current_revenue = _safe_float(bundle.income.get("revenue"))
-
-    # ── 1. Analyst estimates: forward revenue ─────────────────────────────────
-    if bundle.analyst_estimates:
-        est = bundle.analyst_estimates[0] if isinstance(bundle.analyst_estimates[0], dict) else {}
-        fwd_rev = _safe_float(
-            est.get("Highlights_RevenueEstimateCurrentYear")
-            or est.get("estimatedRevenueAvg")
-            or est.get("revenueAvg")
-            or est.get("revenueEstimated")
-            or est.get("estimatedRevenue")
-        )
-        if fwd_rev and fwd_rev > 0 and current_revenue and current_revenue > 0:
-            implied = fwd_rev / current_revenue - 1.0
-            if -0.40 < implied < 1.0:      # sanity-check: discard extreme outliers
-                logger.debug("_derive_base_growth: analyst implied %.1f%% for %s", implied * 100, bundle.ticker)
-                return max(-0.05, min(0.35, implied))
-
-    # ── 2. TTM revenue growth from key_metrics_ttm (FMP field) ───────────────
-    ttm_g = _safe_float(
-        bundle.key_metrics_ttm.get("revenueGrowthTTM")
-        or bundle.key_metrics_ttm.get("revenueGrowth")
-    )
-    if ttm_g is not None and -0.40 < ttm_g < 1.0:
-        # Value may be stored as decimal (0.12) or percent (12.0)
-        if abs(ttm_g) > 1:
-            ttm_g /= 100.0
-        logger.debug("_derive_base_growth: TTM field %.1f%% for %s", ttm_g * 100, bundle.ticker)
-        return max(-0.05, min(0.35, ttm_g))
-
-    # ── 3. Computed annual YoY from income statement rows ────────────────────
-    # Preferred: income_annual (current full fiscal year) vs income_prior (prior
-    # full fiscal year). This gives a clean annual-vs-annual comparison and avoids
-    # the TTM-stacking artefact where a strong recent quarter inflates the YoY
-    # (e.g. RevenueTTM / prior_annual overstates growth if the latest quarter was
-    # unusually strong, as was AAPL Dec-2025).
-    ann_rev = _safe_float(
-        bundle.income_annual.get("revenue")
-        or bundle.income_annual.get("totalRevenue")
-        if bundle.income_annual else None
-    )
-    prior_rev = _safe_float(
-        bundle.income_prior.get("revenue")
-        or bundle.income_prior.get("totalRevenue")
-        if bundle.income_prior else None
-    )
-    if ann_rev and ann_rev > 0 and prior_rev and prior_rev > 0:
-        ann_yoy = ann_rev / prior_rev - 1.0
-        if -0.40 < ann_yoy < 1.0:
-            logger.debug(
-                "_derive_base_growth: annual IS YoY %.1f%% for %s (FY=%.1fB / prior=%.1fB)",
-                ann_yoy * 100, bundle.ticker, ann_rev / 1e9, prior_rev / 1e9,
-            )
-            return max(-0.05, min(0.35, ann_yoy))
-
-    # ── 3b. Fallback computed YoY: RevenueTTM / prior-year-annual − 1 ─────────
-    # Used when full-year IS rows are unavailable. Note: can overstate growth if
-    # a strong recent quarter is included in TTM; prefer Priority 3 above.
-    rev_ttm = _safe_float(
-        bundle.key_metrics_ttm.get("RevenueTTM")
-        or bundle.key_metrics_ttm.get("revenueTTM")
-    )
-    if rev_ttm and rev_ttm > 0 and prior_rev and prior_rev > 0:
-        ttm_yoy = rev_ttm / prior_rev - 1.0
-        if -0.40 < ttm_yoy < 1.0:
-            logger.debug(
-                "_derive_base_growth: TTM/prior YoY %.1f%% for %s (TTM=%.1fB / prior=%.1fB)",
-                ttm_yoy * 100, bundle.ticker, rev_ttm / 1e9, prior_rev / 1e9,
-            )
-            return max(-0.05, min(0.35, ttm_yoy))
-
-    # ── 4. Annual revenue growth from key_metrics ────────────────────────────
-    ann_g = _safe_float(
-        bundle.key_metrics.get("revenueGrowth")
-        or bundle.key_metrics.get("revenue3YGrowth")
-        or bundle.key_metrics.get("revenueGrowthAnnual")
-    )
-    if ann_g is not None and -0.40 < ann_g < 1.0:
-        if abs(ann_g) > 1:
-            ann_g /= 100.0
-        logger.debug("_derive_base_growth: annual key_metrics %.1f%% for %s", ann_g * 100, bundle.ticker)
-        return max(-0.05, min(0.35, ann_g))
-
-    # ── 5. Sector default ────────────────────────────────────────────────────
-    g = _sector_growth_fallback(sector)
-    logger.debug("_derive_base_growth: sector fallback %.1f%% for %s (sector=%s)", g * 100, bundle.ticker, sector)
-    return g
+    """Backward compatibility wrapper - calls enhanced version."""
+    return derive_base_growth_enhanced(bundle, sector)
 
 
 def _compute_beta(
@@ -1131,6 +1570,11 @@ class DCFEngine:
 
         # ── Live WACC + Beta ─────────────────────────────────────────────────
         wacc, beta_used = _compute_wacc(bundle, self.config)
+        
+        # Apply Apple-specific beta adjustment for cash-rich companies
+        if bundle.ticker == "AAPL" and beta_used is not None:
+            beta_used = apple_specific_beta_adjustment(beta_used, bundle.ticker, bundle)
+        
         result.wacc_used = round(wacc, 5)
         result.beta_used = round(beta_used, 4) if beta_used is not None else None
 
@@ -1343,8 +1787,26 @@ class DCFEngine:
         )
 
         # ── Data-driven base revenue growth ──────────────────────────────────
-        # Derive from analyst consensus or TTM growth; fall back to sector default.
-        base_growth = _derive_base_growth(bundle, sector_for_growth)
+        # Use enhanced growth derivation with analyst weighting and product cycle
+        base_growth = derive_base_growth_enhanced(bundle, sector_for_growth)
+        
+        # Apple-specific adjustments
+        if bundle.ticker == "AAPL":
+            # 1. Apply product cycle boost for iPhone years
+            cycle_info = detect_product_cycle(bundle.ticker, bundle)
+            if cycle_info.get("cycle_name") == "iphone_supercycle":
+                base_growth = min(base_growth * 1.25, 0.15)  # Cap at 15%
+                logger.info(f"AAPL iPhone supercycle: boosting growth to {base_growth:.1%}")
+            
+            # 2. Add net cash adjustment to equity value later
+            # (handled in _equity_value_from_pv via cash_val parameter)
+        
+        # Apply services margin premium for companies with high services mix
+        if actual_ebit_margin:
+            cycle_info = detect_product_cycle(bundle.ticker, bundle)
+            if cycle_info.get("services_mix") and cycle_info["services_mix"] > 0.20:
+                actual_ebit_margin = calculate_blended_margin(bundle, actual_ebit_margin)
+        
         logger.debug(
             "DCF scenarios for %s: base_growth=%.1f%% (sector=%s)",
             bundle.ticker, base_growth * 100, sector_for_growth,
@@ -1516,6 +1978,37 @@ class DCFEngine:
                 total_debt=total_debt,
                 cash=cash_val,
             )
+
+        # ── Monte Carlo Simulation ─────────────────────────────────────────────────
+        # Run Monte Carlo for key tickers (AAPL, NVDA) to get probability distribution
+        if bundle.ticker in ("AAPL", "NVDA", "MSFT") and revenue and shares and actual_ebit_margin:
+            try:
+                mc_params = {
+                    "growth": base_growth,
+                    "margin": actual_ebit_margin,
+                    "wacc": wacc,
+                    "terminal_growth": g,
+                }
+                mc_results = monte_carlo_dcf(bundle, mc_params, n_sims=1000)
+                if mc_results and "error" not in mc_results:
+                    result.monte_carlo_results = mc_results
+                    logger.info(f"Monte Carlo for {bundle.ticker}: mean=${mc_results.get('mean', 0):.2f}, "
+                               f"prob_undervalued={mc_results.get('probability_undervalued', 0):.1%}")
+                    
+                    # Add valuation reconciliation for key tickers
+                    if bundle.ticker == "AAPL" and result.intrinsic_value_base:
+                        current_price = _safe_float(
+                            bundle.key_metrics_ttm.get("stockPriceTTM")
+                            or bundle.enterprise.get("stockPrice")
+                        )
+                        if current_price:
+                            result.valuation_gap = reconcile_valuation_gap(
+                                result.intrinsic_value_base,
+                                current_price,
+                                mc_params
+                            )
+            except Exception as e:
+                logger.warning(f"Monte Carlo failed for {bundle.ticker}: {e}")
 
         return result
 

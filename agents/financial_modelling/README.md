@@ -729,4 +729,65 @@ The agent is restricted to the financial modelling use-case only. All data queri
 
 ---
 
+## Enhanced DCF Features (March 2026)
+
+### Product Cycle Detection
+
+The DCF engine now detects product cycles for specific tickers and adjusts growth assumptions:
+
+| Ticker | Cycle | Growth Multiplier | Confidence |
+|--------|-------|-----------------|------------|
+| AAPL | iPhone supercycle (odd years) | 1.4x | 70% |
+| NVDA | AI supercycle | 1.5x | 80% |
+| MSFT | AI Copilot cycle | 1.2x | 60% |
+
+For AAPL in iPhone cycle years (2025, 2027, etc.), the growth rate is boosted by 40%.
+
+### Services Margin Premium
+
+For companies with high services revenue (AAPL, MSFT), the DCF calculates a blended margin:
+
+- **AAPL**: Hardware ~36%, Services ~72% → Blended margin based on mix
+- **MSFT**: Commercial ~40%, Cloud ~70% → Blended margin based on mix
+
+The blended margin is applied when services mix exceeds 20%.
+
+### Apple-Specific Beta Adjustment
+
+Apple's beta is adjusted for:
+- **Cash-rich**: Net cash position reduces beta by 5-10%
+- **Services mix**: High services (>25%) reduces beta by 5%
+
+Expected: Raw beta 1.18 → Adjusted ~1.05 for AAPL.
+
+### Monte Carlo Simulation
+
+The DCF runs a Monte Carlo simulation (1000 iterations) for key tickers (AAPL, NVDA, MSFT):
+
+- Revenue growth: Normal distribution with sector-specific parameters
+- EBIT margin: Normal distribution bounded 15-50%
+- WACC: Normal distribution bounded 6-15%
+- Terminal growth: Normal distribution bounded 1.5-3.5%
+
+**Sanity checks:**
+- Results outside $20-$1000 per share are discarded
+- Mean values exceeding 10x current price are flagged as errors
+
+Output includes:
+- Mean, median, standard deviation
+- 5th, 25th, 75th, 95th percentiles
+- Probability of undervaluation
+
+### Enhanced Growth Derivation
+
+Growth rates are now derived using multiple weighted sources:
+
+1. **Multiple analyst estimates** with time-weighting (recent = higher weight)
+2. **Product cycle adjustments** (iPhone supercycle boost)
+3. **Services acceleration** for high-services companies
+
+This produces more realistic growth rates that blend historical data with forward-looking analyst consensus.
+
+---
+
 *Last updated: 2026-03-11 | Author: hck717*

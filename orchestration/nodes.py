@@ -704,7 +704,11 @@ def node_parallel_agents(state: OrchestrationState) -> OrchestrationState:
                     })
                     logger.info("[parallel_agents] %s done (%d result(s)).", name, len(result_list))
                     _excerpt = _extract_agent_excerpt(name, result_list)
-                    _push({"agent": name, "status": "done", "tickers": tickers, "elapsed_ms": elapsed_ms, "error": None, "excerpt": _excerpt})
+                    # Extract thinking trace from agent results for real-time display
+                    _thinking_trace = None
+                    if result_list and isinstance(result_list[0], dict):
+                        _thinking_trace = result_list[0].get("thinking_trace") or []
+                    _push({"agent": name, "status": "done", "tickers": tickers, "elapsed_ms": elapsed_ms, "error": None, "excerpt": _excerpt, "thinking_trace": _thinking_trace})
                     if name == "business_analyst":
                         ba_outputs = result_list
                         # A2: detect CRAG fallback

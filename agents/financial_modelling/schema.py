@@ -47,6 +47,10 @@ class DCFResult:
     equity_value_base: Optional[float] = None  # Total equity value = pv_s1+pv_s2+tv − debt + cash
     # Input validation warnings (non-fatal; logged and surfaced in output)
     validation_warnings: List[str] = field(default_factory=list)
+    # Monte Carlo simulation results
+    monte_carlo_results: Optional[Dict[str, Any]] = None
+    # Valuation gap explanation
+    valuation_gap: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -71,6 +75,8 @@ class DCFResult:
             "pv_terminal": self.pv_terminal,
             "equity_value_base": self.equity_value_base,
             "validation_warnings": self.validation_warnings,
+            "monte_carlo_results": self.monte_carlo_results,
+            "valuation_gap": self.valuation_gap,
         }
 
 
@@ -335,6 +341,26 @@ class FactorScores:
         }
 
 
+@dataclass
+class DataQualityMetrics:
+    """Data quality assessment for valuation results."""
+
+    completeness_score: float = 0.0  # 0-100%
+    source_reliability: str = "medium"  # "high"/"medium"/"low"
+    missing_fields: List[str] = field(default_factory=list)
+    warnings: List[str] = field(default_factory=list)
+    data_freshness_days: Optional[int] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "completeness_score": self.completeness_score,
+            "source_reliability": self.source_reliability,
+            "missing_fields": self.missing_fields,
+            "warnings": self.warnings,
+            "data_freshness_days": self.data_freshness_days,
+        }
+
+
 # ---------------------------------------------------------------------------
 # Data bundle passed between pipeline nodes
 # ---------------------------------------------------------------------------
@@ -438,5 +464,6 @@ __all__ = [
     "EarningsRecord",
     "DividendRecord",
     "FactorScores",
+    "DataQualityMetrics",
     "FMDataBundle",
 ]

@@ -72,6 +72,7 @@ from .models.valuation import CompsEngine
 from .prompts import build_system_prompt
 from .schema import (
     DCFResult,
+    DataQualityMetrics,
     DividendRecord,
     EarningsRecord,
     FactorScores,
@@ -131,6 +132,7 @@ class AgentState(TypedDict, total=False):
     earnings: Optional[EarningsRecord]
     dividends: Optional[DividendRecord]
     factor_scores: Optional[FactorScores]
+    data_quality: Optional[DataQualityMetrics]
     current_price: Optional[float]
     three_statement: Optional[Any]   # ThreeStatementModel
 
@@ -952,11 +954,13 @@ def _node_assess_analyst_estimates(state: AgentState) -> AgentState:
             **state,
             "dividends": DividendRecord(),
             "factor_scores": FactorScores(),
+            "data_quality": DataQualityMetrics(),
             "current_price": None,
         }
 
     dividends = _compute_dividends(bundle)
     scores = _compute_factor_scores(bundle)
+    data_quality = _compute_data_quality(bundle)
     current_price = _get_current_price(bundle)
 
     logger.debug(
@@ -973,6 +977,7 @@ def _node_assess_analyst_estimates(state: AgentState) -> AgentState:
         **state,
         "dividends": dividends,
         "factor_scores": scores,
+        "data_quality": data_quality,
         "current_price": current_price,
     }
 
@@ -1455,6 +1460,63 @@ def _compute_factor_scores(bundle: FMDataBundle) -> FactorScores:
     return result
 
 
+def _compute_data_quality(bundle: FMDataBundle) -> DataQualityMetrics:
+    """Compute data quality metrics for the bundle."""
+    quality = DataQualityMetrics()
+    required_fields = [
+        "income", "balance", "cashflow",
+        "key_metrics_ttm", "enterprise", "scores",
+    ]
+    missing = []
+    present_count = 0
+
+    for field in required_fields:
+        data = getattr(bundle, field, None)
+        if data:
+            present_count += 1
+        else:
+            missing.append(field)
+
+    # Calculate completeness score (0-100%)
+    quality.completeness_score = round((present_count / len(required_fields)) * 100, 1)
+
+    # Determine source reliability based on data sources
+    if bundle.income and bundle.balance and bundle.enterprise:
+        quality.source_reliability = "high"
+    elif bundle.income or bundle.key_metrics_ttm:
+        quality.source_reliability = "medium"
+    else:
+        quality.source_reliability = "low"
+
+    quality.missing_fields = missing
+
+    # Add warnings for data issues
+    if not bundle.income:
+        quality.warnings.append("Missing income statement data")
+    if not bundle.balance:
+        quality.warnings.append("Missing balance sheet data")
+    if not bundle.cashflow:
+        quality.warnings.append("Missing cash flow data")
+    if not bundle.enterprise:
+        quality.warnings.append("Missing enterprise value data")
+
+    # Check data freshness via price history
+    if bundle.price_history:
+        try:
+            latest_date = bundle.price_history[0].get("date")
+            if latest_date:
+                from datetime import datetime
+                latest = datetime.strptime(str(latest_date)[:10], "%Y-%m-%d")
+                days_old = (datetime.now() - latest).days
+                quality.data_freshness_days = days_old
+                if days_old > 30:
+                    quality.warnings.append(f"Price data is {days_old} days old")
+        except Exception:
+            pass
+
+    return quality
+
+
 def _get_current_price(bundle: FMDataBundle) -> Optional[float]:
     """Extract current (latest) price from various available sources."""
     # Try TTM metrics first
@@ -1734,6 +1796,7 @@ def _node_format_json_output(
     earnings: EarningsRecord = state.get("earnings") or EarningsRecord()
     dividends: DividendRecord = state.get("dividends") or DividendRecord()
     factor_scores: FactorScores = state.get("factor_scores") or FactorScores()
+    data_quality: DataQualityMetrics = state.get("data_quality") or DataQualityMetrics()
     current_price: Optional[float] = state.get("current_price")
     fetch_error = state.get("fetch_error")
     three_stmt = state.get("three_statement")
@@ -1768,6 +1831,7 @@ def _node_format_json_output(
         "earnings": earnings.to_dict(),
         "dividends": dividends.to_dict(),
         "factor_scores": factor_scores.to_dict(),
+        "data_quality": data_quality.to_dict(),
     }
 
     quantitative_summary = _generate_summary(config, factor_table)
