@@ -23,17 +23,13 @@ python3.11 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 
-# 3. Start Ollama and pull required models (Ollama must be running before Docker starts)
-ollama serve &                 # skip if Ollama is already running as a system service
-ollama pull llama3.2:latest    # planner + quant narrative
-ollama pull deepseek-r1:8b     # business analyst + summarizer + financial modelling
-ollama pull nomic-embed-text   # embedding model for vector search
+
 
 # 4. Start all Docker services (PostgreSQL, Neo4j, Airflow x3)
 docker compose up --build -d
 sleep 60                        # wait for all containers to initialise and Airflow to migrate DB
 
-# 5. Verify all backends are healthy
+# 5. Verify all backends are healthy after the DAG tasks is finished 
 docker exec fyp-airflow-webserver python /opt/airflow/ingestion/etl/inspect_db.py
 # Expected: All checks passed
 
