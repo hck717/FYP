@@ -45,7 +45,7 @@ import logging
 import sys
 import uuid
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 # Ensure the repo root is on sys.path so agent imports work regardless of cwd
 _REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -107,7 +107,7 @@ def build_graph() -> Any:
 
     Topology:
       planner → parallel_agents → react_check → (parallel_agents | summarizer)
-              → memory_update → END
+              → translator → memory_update → END
 
     All enabled agents (BA, QF, FM, WS) run concurrently inside
     ``node_parallel_agents`` via a ThreadPoolExecutor.  After each pass,
@@ -117,17 +117,21 @@ def build_graph() -> Any:
     the graph loops back to ``node_parallel_agents`` to retry only the gap agents.
     Otherwise it advances to the summarizer.
 
-    After the summarizer, ``node_memory_update`` persists any failure patterns
+    After the summarizer, ``node_translator`` translates the final summary to the
+    requested language (if any). Then ``node_memory_update`` persists any failure patterns
     to the ``agent_episodic_memory`` PostgreSQL table for future pre-emption.
 
     Returns a compiled StateGraph ready to call with .invoke() or .stream().
     """
+    from .nodes import node_translator
+
     graph = StateGraph(OrchestrationState)
 
     graph.add_node("planner",          node_planner)
     graph.add_node("parallel_agents",  node_parallel_agents)
     graph.add_node("react_check",      node_react_check)
     graph.add_node("summarizer",       node_summarizer)
+    graph.add_node("translator",       node_translator)
     graph.add_node("memory_update",    node_memory_update)
 
     graph.set_entry_point("planner")
@@ -143,7 +147,8 @@ def build_graph() -> Any:
         },
     )
 
-    graph.add_edge("summarizer",       "memory_update")
+    graph.add_edge("summarizer",       "translator")
+    graph.add_edge("translator",       "memory_update")
     graph.add_edge("memory_update",    END)
 
     return graph.compile()
@@ -180,12 +185,14 @@ def _get_graph() -> Any:
 def run(
     user_query: str,
     session_id: str = "",
+    output_language: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Run the full orchestration pipeline for a user query.
 
     Args:
         user_query: Natural language question from the user.
         session_id: Optional identifier for the session (for logging).
+        output_language: Optional language code for translation (e.g., "cantonese", "mandarin").
 
     Returns:
         The final state dict, always containing:
@@ -205,8 +212,9 @@ def run(
         "react_steps": [],
         "react_iteration": 0,
         "agent_errors": {},
+        "output_language": output_language,
     }
-    logger.info("[orchestration.run] user_query=%r session=%s", user_query, session_id)
+    logger.info("[orchestration.run] user_query=%r session=%s output_language=%s", user_query, session_id, output_language)
     final_state = graph.invoke(initial_state)
     return dict(final_state)
 
@@ -214,6 +222,7 @@ def run(
 def stream(
     user_query: str,
     session_id: str = "",
+    output_language: Optional[str] = None,
 ):
     """Stream state updates from the orchestration graph.
 
@@ -229,8 +238,8 @@ def stream(
     after receiving this first event).
 
     In the parallel graph the nodes are:
-      planner → parallel_agents → react_check → summarizer → memory_update.
-    For complexity-1 queries the UI sees exactly five node events.  For
+      planner → parallel_agents → react_check → summarizer → translator → memory_update.
+    For complexity-1 queries the UI sees exactly six node events.  For
     complexity-2/3 queries, parallel_agents + react_check may repeat.
     """
     if not session_id:
@@ -242,6 +251,7 @@ def stream(
         "react_steps": [],
         "react_iteration": 0,
         "agent_errors": {},
+        "output_language": output_language,
     }
     # Yield session_id first so caller can subscribe to the progress queue
     yield "__session__", {"session_id": session_id}

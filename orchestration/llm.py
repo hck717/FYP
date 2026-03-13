@@ -31,6 +31,7 @@ _SUMMARIZER_MODEL = os.getenv(
     "ORCHESTRATION_SUMMARIZER_MODEL",
     "deepseek-chat",
 )
+_TRANSLATION_MODEL = os.getenv("ORCHESTRATION_TRANSLATION_MODEL", _SUMMARIZER_MODEL)
 _REQUEST_TIMEOUT_ENV = os.getenv("ORCHESTRATION_LLM_TIMEOUT", "").strip()
 _REQUEST_TIMEOUT: Optional[int] = int(_REQUEST_TIMEOUT_ENV) if _REQUEST_TIMEOUT_ENV else 60
 _SUMMARIZER_TIMEOUT_ENV = os.getenv("ORCHESTRATION_SUMMARIZER_TIMEOUT", "").strip()
@@ -1902,6 +1903,139 @@ def _build_fm_context(fm_output: Dict[str, Any]) -> List[str]:
     return parts
 
 
+def _build_data_tables(
+    quant_outputs: List[Dict[str, Any]],
+    fm_outputs: List[Dict[str, Any]],
+    tickers: List[str],
+) -> str:
+    """Build data tables for the fundamental report.
+    
+    Creates tables for:
+    - Quarterly Revenue (in millions)
+    - Annual Revenue (Fiscal Year)
+    - Quarterly Operating Earnings (Non-GAAP, per share)
+    - Annual Operating Earnings (Non-GAAP, per share)
+    - Annual Valuation (Fiscal Year P/E Ratio)
+    """
+    if not quant_outputs and not fm_outputs:
+        return ""
+    
+    tables: List[str] = []
+    
+    for i, ticker in enumerate(tickers):
+        quant = quant_outputs[i] if i < len(quant_outputs) else {}
+        fm = fm_outputs[i] if i < len(fm_outputs) else {}
+        
+        if not quant and not fm:
+            continue
+        
+        ticker_header = f"### {ticker} Financial Data"
+        tables.append(ticker_header)
+        
+        # Quarterly Revenue table
+        qt = quant.get("quarterly_trends") or []
+        if qt:
+            qt_sorted = sorted(qt, key=lambda r: str(r.get("period", "")))
+            q_rev_rows = []
+            for row in qt_sorted[-4:]:
+                period = str(row.get("period", ""))
+                revenue = row.get("revenue")
+                if revenue is not None:
+                    try:
+                        rev_val = float(revenue)
+                        q_rev_rows.append(f"| {period} | ${rev_val:,.0f} |")
+                    except (TypeError, ValueError):
+                        q_rev_rows.append(f"| {period} | N/A |")
+            
+            if q_rev_rows:
+                tables.append("")
+                tables.append("**Quarterly Revenue (in millions)**")
+                tables.append("| Quarter | Revenue |")
+                tables.append("|---------|---------|")
+                tables.extend(q_rev_rows)
+        
+        # Annual Revenue table (from key_metrics or annual data)
+        key_metrics = quant.get("key_metrics") or {}
+        annual_rev = key_metrics.get("revenue")
+        if annual_rev is not None:
+            try:
+                rev_val = float(annual_rev)
+                tables.append("")
+                tables.append("**Annual Revenue (Fiscal Year)**")
+                tables.append("| Fiscal Year | Revenue (M) |")
+                tables.append("|-------------|-------------|")
+                tables.append(f"| {key_metrics.get('fiscal_year', 'Latest')} | ${rev_val:,.0f} |")
+            except (TypeError, ValueError):
+                pass
+        
+        # Quarterly Operating Earnings (Non-GAAP, per share) - from quarterly_trends
+        if qt:
+            qt_sorted = sorted(qt, key=lambda r: str(r.get("period", "")))
+            q_eps_rows = []
+            for row in qt_sorted[-4:]:
+                period = str(row.get("period", ""))
+                eps = row.get("eps_diluted") or row.get("operating_earnings_per_share")
+                if eps is not None:
+                    try:
+                        eps_val = float(eps)
+                        q_eps_rows.append(f"| {period} | ${eps_val:.2f} |")
+                    except (TypeError, ValueError):
+                        q_eps_rows.append(f"| {period} | N/A |")
+            
+            if q_eps_rows:
+                tables.append("")
+                tables.append("**Quarterly Operating Earnings (Non-GAAP, per share)**")
+                tables.append("| Quarter | EPS |")
+                tables.append("|--------|-----|")
+                tables.extend(q_eps_rows)
+        
+        # Annual Operating Earnings (Non-GAAP, per share)
+        annual_eps = key_metrics.get("operating_earnings_per_share") or key_metrics.get("eps_diluted")
+        if annual_eps is not None:
+            try:
+                eps_val = float(annual_eps)
+                tables.append("")
+                tables.append("**Annual Operating Earnings (Non-GAAP, per share)**")
+                tables.append("| Fiscal Year | EPS |")
+                tables.append("|-------------|-----|")
+                tables.append(f"| {key_metrics.get('fiscal_year', 'Latest')} | ${eps_val:.2f} |")
+            except (TypeError, ValueError):
+                pass
+        
+        # Annual Valuation (Fiscal Year P/E Ratio)
+        vf = quant.get("value_factors") or {}
+        pe_trailing = vf.get("pe_trailing")
+        if pe_trailing is not None:
+            try:
+                pe_val = float(pe_trailing)
+                tables.append("")
+                tables.append("**Annual Valuation (Fiscal Year P/E Ratio)**")
+                tables.append("| Fiscal Year | P/E (TTM) |")
+                tables.append("|-------------|-----------|")
+                tables.append(f"| {key_metrics.get('fiscal_year', 'Latest')} | {pe_val:.1f}x |")
+            except (TypeError, ValueError):
+                pass
+        
+        # Also get P/E from FM agent if available
+        comps = fm.get("comps") or {}
+        if not pe_trailing:
+            pe_fm = comps.get("pe_trailing")
+            if pe_fm is not None:
+                try:
+                    pe_val = float(pe_fm)
+                    tables.append("")
+                    tables.append("**Annual Valuation (Fiscal Year P/E Ratio)**")
+                    tables.append("| Fiscal Year | P/E (TTM) |")
+                    tables.append("|-------------|-----------|")
+                    tables.append(f"| {key_metrics.get('fiscal_year', 'Latest')} | {pe_val:.1f}x |")
+                except (TypeError, ValueError):
+                    pass
+        
+        tables.append("")
+    
+    return "\n".join(tables)
+
+
 def summarise_results(
     user_query: str,
     tickers: List[str],
@@ -2356,4 +2490,35 @@ def summarise_results(
     return cleaned
 
 
-__all__ = ["plan_query", "summarise_results"]
+# ── Translation Helper ───────────────────────────────────────────────────────────
+
+def translate_text(text: str, target_language: str) -> str:
+    """Translate text to the target language using DeepSeek."""
+
+    system_prompt = (
+        "You are a senior translator for financial research. Translate the provided report into "
+        f"{target_language} while preserving formatting, headers, numeric citations, and analytical tone."
+        " Do not add any commentary or change the numeric citations."
+    )
+
+    prompt = """Translate the following financial research report:
+
+""" + text + "\n\nTranslation:"""
+
+    try:
+        translated = _deepseek_generate(
+            _TRANSLATION_MODEL,
+            prompt,
+            max_tokens=4096,
+            temperature=0.1,
+            system_prompt=system_prompt,
+        )
+        translated = _strip_think(translated)
+        translated = _strip_fences(translated)
+        return translated.strip() or text
+    except Exception as exc:
+        logger.warning("Translation via DeepSeek failed: %s", exc)
+        return text
+
+
+__all__ = ["plan_query", "summarise_results", "translate_text"]

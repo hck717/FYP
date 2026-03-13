@@ -167,9 +167,37 @@ def node_planner(state: OrchestrationState) -> OrchestrationState:
     Populates:
       - plan, ticker, tickers, run_business_analyst, run_quant_fundamental, run_web_search
       - episodic_hints: pre-emptive hints from agent_episodic_memory for known failure patterns
+      - output_language: detected language requirement from user query
     """
     user_query = state.get("user_query", "")
     logger.info("[planner] Analysing query: %r", user_query)
+
+    # Detect language requirement from user query
+    output_language: Optional[str] = None
+    query_lower = user_query.lower()
+    language_keywords = {
+        "cantonese": ["cantonese", "in cantonese", "write in cantonese", "cantonese language"],
+        "spanish": ["spanish", "in spanish", "espanol", "write in spanish", "spanish language"],
+        "mandarin": ["mandarin", "in mandarin", "putonghua", "write in mandarin", "mandarin language"],
+        "french": ["french", "in french", "francais", "write in french", "french language"],
+        "german": ["german", "in german", "deutsch", "write in german", "german language"],
+        "japanese": ["japanese", "in japanese", "nihongo", "write in japanese", "japanese language"],
+        "korean": ["korean", "in korean", "hangul", "write in korean", "korean language"],
+        "portuguese": ["portuguese", "in portuguese", "portugues", "write in portuguese"],
+        "italian": ["italian", "in italian", "italiano", "write in italian"],
+        "dutch": ["dutch", "in dutch", "nederlands", "write in dutch"],
+        "russian": ["russian", "in russian", "russkiy", "write in russian"],
+        "arabic": ["arabic", "in arabic", "arabi", "write in arabic"],
+        "hindi": ["hindi", "in hindi", "write in hindi"],
+        "thai": ["thai", "in thai", "write in thai"],
+        "vietnamese": ["vietnamese", "in vietnamese", "tieng viet", "write in vietnamese"],
+        "indonesian": ["indonesian", "in indonesian", "bahasa", "write in indonesian"],
+    }
+    for lang, keywords in language_keywords.items():
+        if any(kw in query_lower for kw in keywords):
+            output_language = lang
+            logger.info("[planner] Detected language requirement: %s", output_language)
+            break
 
     plan = plan_query(user_query)
 
@@ -272,6 +300,8 @@ def node_planner(state: OrchestrationState) -> OrchestrationState:
         "data_availability": data_availability,
         "episodic_hints": episodic_hints,
         "planner_trace": planner_trace,
+        # Prefer language detected from query text; fall back to UI-supplied value in state
+        "output_language": output_language or state.get("output_language"),
         "react_steps": [],
         "react_iteration": 0,
         "react_max_iterations": react_max,
@@ -934,6 +964,7 @@ def node_summarizer(state: OrchestrationState) -> OrchestrationState:
     user_query    = state.get("user_query", "")
     tickers       = state.get("tickers") or []
     ticker        = state.get("ticker")
+    output_language = state.get("output_language")
 
     # Prefer the multi-output lists; fall back to legacy single-output aliases.
     # Cast to List[Dict[str, Any]] by filtering out any None values.
@@ -996,6 +1027,9 @@ def node_summarizer(state: OrchestrationState) -> OrchestrationState:
     if summarizer_trace:
         logger.info("[summarizer] Thinking trace captured (%d chars).", len(summarizer_trace))
 
+    # NOTE: Translation is now handled by the translator agent (node_translator)
+    # This keeps all agents working in English, with translation done at the end
+
     output: Dict[str, Any] = {
         "user_query": user_query,
         "ticker": ticker,
@@ -1016,6 +1050,7 @@ def node_summarizer(state: OrchestrationState) -> OrchestrationState:
         "final_summary": final_summary,
         "planner_trace": state.get("planner_trace", ""),
         "summarizer_trace": summarizer_trace,
+        "output_language": output_language,
     }
 
     return {**state, "final_summary": final_summary, "summarizer_trace": summarizer_trace, "output": output}
@@ -1095,6 +1130,39 @@ def node_memory_update(state: OrchestrationState) -> OrchestrationState:
     return state
 
 
+# ── Node 9: Translator Agent ─────────────────────────────────────────────────
+
+def node_translator(state: OrchestrationState) -> OrchestrationState:
+    """Translate the final summary to the target language using DeepSeek chat.
+    
+    This is a simple translation agent that uses deepseek-chat for translation.
+    It runs after the summarizer and before memory_update.
+    """
+    final_summary = state.get("final_summary", "")
+    output_language = state.get("output_language")
+    
+    if not output_language or not final_summary:
+        logger.info("[translator] No translation requested or no summary to translate")
+        return state
+    
+    logger.info("[translator] Translating final summary to %s", output_language)
+    
+    try:
+        from .llm import translate_text
+        translated_summary = translate_text(final_summary, output_language)
+        
+        logger.info("[translator] Translation to %s complete", output_language)
+        
+        return {
+            **state,
+            "final_summary": translated_summary,
+        }
+    except Exception as exc:
+        logger.warning("[translator] Translation failed: %s", exc)
+        # Return original summary if translation fails
+        return state
+
+
 __all__ = [
     "node_planner",
     "node_business_analyst",
@@ -1104,5 +1172,6 @@ __all__ = [
     "node_parallel_agents",
     "node_react_check",
     "node_summarizer",
+    "node_translator",
     "node_memory_update",
 ]

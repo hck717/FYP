@@ -25,6 +25,7 @@ class OrchestrationState(TypedDict, total=False):
     # ── Input ────────────────────────────────────────────────────────────────
     user_query: str                         # original chat message from the user
     session_id: str                         # optional session identifier
+    output_language: Optional[str]         # detected language requirement (e.g. "cantonese", "spanish")
 
     # ── Planner output ───────────────────────────────────────────────────────
     plan: Optional[Dict[str, Any]]          # structured plan from DeepSeek planner

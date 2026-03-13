@@ -99,6 +99,19 @@ st.markdown(
     .status-err  { color: #ef4444; font-weight: 600; }
     .metric-label { font-size: 0.75rem; color: #9ca3af; text-transform: uppercase; letter-spacing: 0.05em; }
     .metric-value { font-size: 1.1rem; font-weight: 600; }
+    
+    /* Fix for text rendering issues */
+    .stMarkdown {
+        font-feature-settings: "liga" 1, "kern" 1;
+        -webkit-font-smoothing: antialiased;
+        -moz-osx-font-smoothing: grayscale;
+    }
+    
+    /* Better font for code/technical content */
+    code {
+        font-family: 'JetBrains Mono', 'Fira Code', 'SF Mono', Monaco, monospace;
+        font-size: 0.85em;
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -106,6 +119,152 @@ st.markdown(
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _clean_text_for_display(text: str) -> str:
+    """Clean text to fix rendering issues with invisible Unicode characters."""
+    if not text:
+        return text
+    import re
+
+    # Remove zero-width characters and other invisible / control Unicode
+    text = re.sub(r'[\u200b-\u200d\ufeff]', '', text)
+
+    # Normalise line endings
+    text = text.replace('\r\n', '\n').replace('\r', '\n')
+
+    return text
+
+
+def _render_data_tables(state: Dict[str, Any]) -> None:
+    """Render financial data tables from quant and fm outputs."""
+    import pandas as pd
+    
+    tickers: List[str] = state.get("tickers") or []
+    if not tickers and state.get("ticker"):
+        tickers = [state["ticker"]]
+    if not tickers:
+        return
+
+    qf_outputs: List[Dict] = state.get("quant_fundamental_outputs") or []
+    if not qf_outputs and state.get("quant_fundamental_output"):
+        qf_outputs = [state["quant_fundamental_output"]]
+    
+    fm_outputs: List[Dict] = state.get("financial_modelling_outputs") or []
+    if not fm_outputs and state.get("financial_modelling_output"):
+        fm_outputs = [state["financial_modelling_output"]]
+
+    has_data = False
+
+    for idx, ticker in enumerate(tickers):
+        qf = qf_outputs[idx] if idx < len(qf_outputs) else {}
+        fm = fm_outputs[idx] if idx < len(fm_outputs) else {}
+
+        if not qf and not fm:
+            continue
+
+        qt = qf.get("quarterly_trends") or []
+        key_metrics = qf.get("key_metrics") or {}
+        vf = qf.get("value_factors") or {}
+
+        if not qt and not key_metrics and not vf:
+            continue
+
+        has_data = True
+        with st.expander(f"📊 Financial Data Tables — {ticker}", expanded=True):
+            # Quarterly Revenue
+            if qt:
+                qt_sorted = sorted(qt, key=lambda r: str(r.get("period", "")))
+                rev_rows = []
+                for row in qt_sorted[-4:]:
+                    period = str(row.get("period", ""))
+                    revenue = row.get("revenue")
+                    if revenue is not None:
+                        try:
+                            rev_val = float(revenue) / 1_000_000
+                            rev_rows.append({"Quarter": period, "Revenue ($M)": f"${rev_val:,.1f}M"})
+                        except (TypeError, ValueError):
+                            rev_rows.append({"Quarter": period, "Revenue ($M)": "N/A"})
+
+                if rev_rows:
+                    st.markdown("**Quarterly Revenue**")
+                    df_rev = pd.DataFrame(rev_rows)
+                    st.table(df_rev)
+
+            # Annual Revenue — aggregate from quarterly_trends grouped by year
+            if qt:
+                from collections import defaultdict
+                annual_rev_map: dict = defaultdict(float)
+                for row in qt_sorted:
+                    year = str(row.get("period", ""))[:4]
+                    revenue = row.get("revenue")
+                    if year.isdigit() and revenue is not None:
+                        try:
+                            annual_rev_map[year] += float(revenue)
+                        except (TypeError, ValueError):
+                            pass
+                if annual_rev_map:
+                    annual_rev_rows = [
+                        {"Fiscal Year": yr, "Revenue ($M)": f"${total / 1_000_000:,.1f}M"}
+                        for yr, total in sorted(annual_rev_map.items())
+                    ]
+                    st.markdown("**Annual Revenue (Sum of Quarterly)**")
+                    st.table(pd.DataFrame(annual_rev_rows))
+
+            # Quarterly Operating Earnings (EPS)
+            if qt:
+                qt_sorted = sorted(qt, key=lambda r: str(r.get("period", "")))
+                eps_rows = []
+                for row in qt_sorted[-4:]:
+                    period = str(row.get("period", ""))
+                    eps = row.get("eps_diluted") or row.get("operating_earnings_per_share")
+                    if eps is not None:
+                        try:
+                            eps_val = float(eps)
+                            eps_rows.append({"Quarter": period, "EPS ($)": f"${eps_val:.2f}"})
+                        except (TypeError, ValueError):
+                            eps_rows.append({"Quarter": period, "EPS ($)": "N/A"})
+
+                if eps_rows:
+                    st.markdown("**Quarterly EPS (Diluted)**")
+                    df_eps = pd.DataFrame(eps_rows)
+                    st.table(df_eps)
+
+            # Annual EPS — sum diluted EPS per year from quarterly_trends
+            if qt:
+                annual_eps_map: dict = defaultdict(float)
+                annual_eps_count: dict = defaultdict(int)
+                for row in qt_sorted:
+                    year = str(row.get("period", ""))[:4]
+                    eps = row.get("eps_diluted") or row.get("operating_earnings_per_share")
+                    if year.isdigit() and eps is not None:
+                        try:
+                            annual_eps_map[year] += float(eps)
+                            annual_eps_count[year] += 1
+                        except (TypeError, ValueError):
+                            pass
+                if annual_eps_map:
+                    annual_eps_rows = [
+                        {"Fiscal Year": yr, "EPS ($, Annual)": f"${annual_eps_map[yr]:.2f}"}
+                        for yr in sorted(annual_eps_map.keys())
+                    ]
+                    st.markdown("**Annual EPS (Sum of Quarterly Diluted EPS)**")
+                    st.table(pd.DataFrame(annual_eps_rows))
+
+            # Annual Valuation (P/E)
+            pe_trailing = vf.get("pe_trailing")
+            if pe_trailing is not None:
+                try:
+                    pe_val = float(pe_trailing)
+                    fiscal_year = key_metrics.get("fiscal_year", "TTM")
+                    st.markdown("**Valuation (Trailing P/E)**")
+                    df_pe = pd.DataFrame([{"Period": fiscal_year, "P/E (TTM)": f"{pe_val:.1f}x"}])
+                    st.table(df_pe)
+                except (TypeError, ValueError):
+                    pass
+
+    if not has_data:
+        st.caption("No financial data tables available.")
+
 
 def _fmt(val: Any, decimals: int = 2, suffix: str = "") -> str:
     """Format a numeric value for display; returns '—' for None/missing."""
@@ -888,7 +1047,7 @@ _AGENT_DISPLAY = {
 }
 
 
-def _run_with_streaming(query: str) -> Optional[Dict[str, Any]]:
+def _run_with_streaming(query: str, output_language: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """Stream orchestration events into the UI; return final state on completion.
 
     Architecture
@@ -929,7 +1088,7 @@ def _run_with_streaming(query: str) -> Optional[Dict[str, Any]]:
         """Background thread: run the LangGraph generator and push events."""
         try:
             # Pass the pre-generated session_id to ensure consistency
-            for node_name, node_output in orch_stream(query, session_id=session_id):
+            for node_name, node_output in orch_stream(query, session_id=session_id, output_language=output_language):
                 output_queue.put((node_name, node_output))
         except Exception as exc:
             output_queue.put((_STREAM_ERROR, exc))
@@ -1217,6 +1376,14 @@ def main() -> None:
                 query = query or ""
                 if ticker_override not in query.upper():
                     query = f"[{ticker_override}] {query}"
+            
+            # Language selection for output
+            output_language = st.selectbox(
+                "Output language (translation)",
+                options=["English", "Cantonese", "Mandarin", "Spanish", "French", "German", "Japanese", "Korean", "Portuguese", "Italian", "Dutch", "Russian", "Arabic", "Hindi", "Thai", "Vietnamese", "Indonesian"],
+                index=0,
+                key="output_language",
+            )
 
     with tab2:
         st.markdown("### Database Health Check")
@@ -1356,7 +1523,11 @@ def main() -> None:
 
         st.markdown("---")
         st.subheader("Live Progress")
-        final_state = _run_with_streaming(query.strip())
+        # Get output language from the widget's session state
+        output_lang = st.session_state.get("output_language", "English")
+        # Convert to the format expected by orchestration (None for English)
+        output_lang_param = output_lang if output_lang != "English" else None
+        final_state = _run_with_streaming(query.strip(), output_lang_param)
 
         if final_state:
             st.session_state["last_state"] = final_state
@@ -1383,11 +1554,32 @@ def main() -> None:
         # Rendered BEFORE the research note so charts appear at the top.
         _render_visualisations(state)
 
+        # Financial Data Tables
+        _render_data_tables(state)
+
         # Final research note
         final_summary = state.get("final_summary") or ""
         if final_summary:
             st.subheader("Research Note")
-            st.markdown(final_summary)
+            
+            # Clean and display the text
+            final_summary_clean = _clean_text_for_display(final_summary)
+            
+            # Check if text has proper formatting
+            has_proper_spaces = " " in final_summary_clean[:100] and "\n" in final_summary_clean[:500]
+            
+            # Show toggle for raw vs formatted view
+            col1, col2 = st.columns([1, 5])
+            with col1:
+                show_raw = st.checkbox("Raw text", value=not has_proper_spaces, key="show_raw_text")
+            with col2:
+                pass
+            
+            if show_raw:
+                st.text(final_summary_clean)
+            else:
+                st.markdown(final_summary_clean)
+            
             st.download_button(
                 label="Download Research Note (.md)",
                 data=final_summary,

@@ -89,12 +89,19 @@ class Citation:
 
 # ── Extraction helpers ─────────────────────────────────────────────────────────
 
-def _chunk_id_to_label(chunk_id: str, ticker: Optional[str] = None) -> Tuple[str, str, str]:
+def _chunk_id_to_label(
+    chunk_id: str,
+    ticker: Optional[str] = None,
+    source_name: Optional[str] = None,
+) -> Tuple[str, str, str]:
     """Parse a chunk_id string into (db, label, detail).
 
     Formats handled:
       neo4j::AAPL::risk_factors::0          →  Neo4j,  "Risk Factors (filing)",  AAPL
       neo4j::AAPL::mda::2                   →  Neo4j,  "MDA",                    AAPL
+      AAPL::broker_report::abc123def456789  →  Neo4j,  source_name or "Broker Report",  AAPL
+      AAPL::earnings_call::abc123def456789  →  Neo4j,  source_name or "Earnings Call",  AAPL
+      AAPL::risk_factors::0                 →  Neo4j,  "Risk Factors (filing)",  AAPL
     """
     if not chunk_id:
         return "unknown", chunk_id, ""
@@ -103,27 +110,75 @@ def _chunk_id_to_label(chunk_id: str, ticker: Optional[str] = None) -> Tuple[str
     if len(parts) < 2:
         return "unknown", chunk_id, ""
 
-    backend = parts[0].lower()  # "neo4j"
+    backend = parts[0].lower()  # "neo4j" or ticker symbol
 
     if backend == "neo4j":
         # neo4j::TICKER::section::n
-        tk      = parts[1] if len(parts) > 1 else (ticker or "")
-        section = parts[2] if len(parts) > 2 else "filing"
+        tk        = parts[1] if len(parts) > 1 else (ticker or "")
+        section   = parts[2] if len(parts) > 2 else "filing"
         sec_label = _SECTION_LABELS.get(section, section.replace("_", " ").title())
-        label   = f"{tk} — {sec_label}"
-        detail  = "Neo4j knowledge graph"
+        label     = f"{tk} — {sec_label}"
+        detail    = "Neo4j knowledge graph"
         return "neo4j", label, detail
 
-    return backend, chunk_id, ""
+    # Ticker-prefixed format: TICKER::section::hash  (broker_report, earnings_call, etc.)
+    # parts[0] is the ticker, parts[1] is the section, parts[2] is the hash
+    tk      = parts[0].upper()
+    section = parts[1] if len(parts) > 1 else "document"
+    if section == "broker_report":
+        # Use source_name (e.g. "Wells Fargo_GOOGL_2025.pdf") if available,
+        # otherwise fall back to a generic label
+        if source_name:
+            # Strip common extensions and clean up underscores/dashes
+            display = re.sub(r'\.(pdf|txt|docx?)$', '', source_name, flags=re.IGNORECASE)
+            display = display.replace('_', ' ').strip()
+            label   = f"{tk} — Broker Report: {display}"
+        else:
+            label = f"{tk} — Broker Research Report"
+        return "neo4j", label, "Neo4j knowledge graph · broker_report"
+
+    if section == "earnings_call":
+        if source_name:
+            display = re.sub(r'\.(pdf|txt|docx?)$', '', source_name, flags=re.IGNORECASE)
+            display = display.replace('_', ' ').strip()
+            label   = f"{tk} — Earnings Call: {display}"
+        else:
+            label = f"{tk} — Earnings Call Transcript"
+        return "neo4j", label, "Neo4j knowledge graph · earnings_call"
+
+    # Other ticker-prefixed sections (annual_report, 10-K, press_release, etc.)
+    sec_label = _SECTION_LABELS.get(section, section.replace("_", " ").title())
+    label     = f"{tk} — {sec_label}"
+    return "neo4j", label, "Neo4j knowledge graph"
 
 
-def _extract_inline_chunk_ids(text: str) -> List[str]:
-    """Find all [neo4j::...] inline citation tokens in a string."""
-    return re.findall(r'\[(neo4j::[^\]]+)\]', text or "")
+def _extract_inline_chunk_ids(text: str) -> List[Tuple[str, str]]:
+    """Find all inline citation tokens in a string.
+
+    Handles two formats:
+      Old:  [neo4j::TICKER::section::n]          → ("", "neo4j::TICKER::section::n")
+      New:  [source_name | TICKER::section::hash] → ("source_name", "TICKER::section::hash")
+      Bare: [TICKER::section::hash]               → ("", "TICKER::section::hash")
+
+    Returns a list of (source_name, chunk_id) tuples.
+    """
+    results: List[Tuple[str, str]] = []
+    # Match any bracket containing "::" — covers all three formats above
+    for raw in re.findall(r'\[([^\]]+::[^\]]+)\]', text or ""):
+        raw = raw.strip().rstrip("].,;")
+        if " | " in raw:
+            sname, cid = raw.split(" | ", 1)
+            results.append((sname.strip(), cid.strip().rstrip("].,;")))
+        else:
+            results.append(("", raw))
+    return results
 
 
-def _walk_and_collect_chunk_ids(obj: Any, found: List[str]) -> None:
-    """Recursively collect all inline chunk_id tokens from nested dicts/lists/strings."""
+def _walk_and_collect_chunk_ids(obj: Any, found: List[Tuple[str, str]]) -> None:
+    """Recursively collect all inline chunk_id tokens from nested dicts/lists/strings.
+
+    Each element of *found* is a (source_name, chunk_id) tuple.
+    """
     if isinstance(obj, str):
         found.extend(_extract_inline_chunk_ids(obj))
     elif isinstance(obj, dict):
@@ -182,26 +237,30 @@ def build_citation_block(
     # ── 1. Business Analyst citations ─────────────────────────────────────────
     if ba_output:
         # 1a. Inline chunk_id tokens embedded in prose fields
-        inline_ids: List[str] = []
-        _walk_and_collect_chunk_ids(ba_output, inline_ids)
+        # Each entry is a (source_name, chunk_id) tuple
+        inline_pairs: List[Tuple[str, str]] = []
+        _walk_and_collect_chunk_ids(ba_output, inline_pairs)
 
         # 1b. Explicit sources arrays (competitive_moat.sources, key_risks[].source)
+        # These are bare chunk_id strings (no source_name), so we wrap them as ("", cid)
         moat = ba_output.get("competitive_moat") or {}
         for cid in (moat.get("sources") or []):
             if isinstance(cid, str) and cid:
-                inline_ids.append(cid)
+                inline_pairs.append(("", cid))
 
         for risk in (ba_output.get("key_risks") or []):
             if isinstance(risk, dict) and risk.get("source"):
-                inline_ids.append(risk["source"])
+                inline_pairs.append(("", risk["source"]))
 
-        # Deduplicate while preserving order
+        # Deduplicate while preserving order; key is chunk_id
         seen_cids: set = set()
-        for cid in inline_ids:
+        for sname, cid in inline_pairs:
             cid_clean = cid.strip().rstrip("].,;")
             if cid_clean and cid_clean not in seen_cids:
                 seen_cids.add(cid_clean)
-                db, label, detail = _chunk_id_to_label(cid_clean, ticker)
+                db, label, detail = _chunk_id_to_label(
+                    cid_clean, ticker, source_name=sname or None
+                )
                 _add("business_analyst", db, label, detail, chunk_id=cid_clean)
 
         # 1c. Sentiment — always sourced from PostgreSQL
@@ -455,7 +514,12 @@ def build_citation_block(
 
 
 def inject_inline_numbers(text: str, chunk_id_map: Dict[str, Citation]) -> str:
-    """Replace [neo4j::...] inline tokens with numeric refs [N].
+    """Replace inline citation tokens with numeric refs [N].
+
+    Handles:
+      Old:  [neo4j::TICKER::section::n]          → [N]
+      New:  [source_name | TICKER::section::hash] → [N]
+      Bare: [TICKER::section::hash]               → [N]
 
     If a token is not in the map (e.g. it was filtered as ungrounded), it is
     removed to keep the prose clean.
@@ -463,17 +527,26 @@ def inject_inline_numbers(text: str, chunk_id_map: Dict[str, Citation]) -> str:
     if not chunk_id_map or not text:
         return text
 
-    def _replace(m: re.Match) -> str:
-        raw = m.group(1).rstrip("].,;")
-        if raw in chunk_id_map:
-            return chunk_id_map[raw].ref()
-        # Try prefix match
-        for cid, cit in chunk_id_map.items():
-            if cid and (raw.startswith(cid) or cid.startswith(raw)):
+    def _resolve(cid: str) -> str:
+        """Look up cid in chunk_id_map; try prefix match if exact match fails."""
+        if cid in chunk_id_map:
+            return chunk_id_map[cid].ref()
+        for key, cit in chunk_id_map.items():
+            if key and (cid.startswith(key) or key.startswith(cid)):
                 return cit.ref()
         return ""  # strip unresolved token
 
-    return re.sub(r'\[(neo4j::[^\]]+)\]', _replace, text)
+    def _replace(m: re.Match) -> str:
+        raw = m.group(1).strip().rstrip("].,;")
+        # New format: "source_name | chunk_id"
+        if " | " in raw:
+            cid = raw.split(" | ", 1)[1].strip().rstrip("].,;")
+        else:
+            cid = raw
+        return _resolve(cid)
+
+    # Match any bracket containing "::" — covers all inline citation formats
+    return re.sub(r'\[([^\]]+::[^\]]+)\]', _replace, text)
 
 
 __all__ = ["Citation", "build_citation_block", "inject_inline_numbers"]
