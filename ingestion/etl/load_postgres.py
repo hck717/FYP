@@ -424,6 +424,59 @@ def ensure_tables() -> None:
         UNIQUE (agent_name, memory_key)
     );
 
+    -- RLAIF feedback (AI-generated scores for reports)
+    CREATE TABLE IF NOT EXISTS rl_feedback (
+        id                  SERIAL PRIMARY KEY,
+        run_id             VARCHAR(50) NOT NULL,
+        user_query         TEXT NOT NULL,
+        timestamp          TIMESTAMP DEFAULT NOW(),
+        factual_accuracy   FLOAT,
+        citation_completeness FLOAT,
+        analysis_depth     FLOAT,
+        structure_compliance FLOAT,
+        language_quality   FLOAT,
+        overall_score      FLOAT,
+        strengths          JSONB DEFAULT '[]',
+        weaknesses         JSONB DEFAULT '[]',
+        specific_feedback  TEXT,
+        agent_blamed       VARCHAR(50),
+        report_excerpt     TEXT,
+        ticker             VARCHAR(20)
+    );
+    CREATE INDEX IF NOT EXISTS idx_rl_feedback_run_id ON rl_feedback (run_id);
+    CREATE INDEX IF NOT EXISTS idx_rl_feedback_timestamp ON rl_feedback (timestamp);
+    CREATE INDEX IF NOT EXISTS idx_rl_feedback_agent_blamed ON rl_feedback (agent_blamed);
+
+    -- User feedback (explicit ratings from UI)
+    CREATE TABLE IF NOT EXISTS user_feedback (
+        id                  SERIAL PRIMARY KEY,
+        run_id             VARCHAR(50) NOT NULL,
+        session_id         VARCHAR(50),
+        timestamp          TIMESTAMP DEFAULT NOW(),
+        helpful            BOOLEAN NOT NULL,
+        comment            TEXT,
+        issue_tags         JSONB DEFAULT '[]',
+        report_version     VARCHAR(20)
+    );
+    CREATE INDEX IF NOT EXISTS idx_user_feedback_run_id ON user_feedback (run_id);
+    CREATE INDEX IF NOT EXISTS idx_user_feedback_timestamp ON user_feedback (timestamp);
+
+    -- Prompt versions (tracking prompt changes for A/B testing)
+    CREATE TABLE IF NOT EXISTS prompt_versions (
+        id                  SERIAL PRIMARY KEY,
+        agent_name         VARCHAR(50) NOT NULL,
+        version            VARCHAR(20) NOT NULL,
+        prompt_text        TEXT NOT NULL,
+        deployed_at        TIMESTAMP DEFAULT NOW(),
+        deployed_to        FLOAT DEFAULT 1.0,
+        avg_score_before   FLOAT,
+        avg_score_after    FLOAT,
+        improvement_pct    FLOAT,
+        weaknesses_addressed JSONB DEFAULT '[]'
+    );
+    CREATE INDEX IF NOT EXISTS idx_prompt_versions_agent ON prompt_versions (agent_name);
+    CREATE INDEX IF NOT EXISTS idx_prompt_versions_version ON prompt_versions (version);
+
     CREATE TABLE IF NOT EXISTS critic_run_log (
         id           SERIAL PRIMARY KEY,
         run_id       TEXT,

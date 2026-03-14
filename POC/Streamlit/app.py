@@ -1036,6 +1036,71 @@ def _render_plan_info(plan: Optional[Dict[str, Any]], state: Dict[str, Any]) -> 
     )
 
 
+# ── Feedback Widget ───────────────────────────────────────────────────────────
+
+def _render_feedback_widget(run_id: str, state: Dict[str, Any]) -> None:
+    """Render the explicit user feedback widget."""
+    from orchestration import feedback
+    
+    feedback_key = f"feedback_submitted_{run_id}"
+    
+    if feedback_key not in st.session_state:
+        st.session_state[feedback_key] = False
+    
+    with st.expander("Was this analysis helpful?", expanded=True):
+        col1, col2 = st.columns([1, 4])
+        
+        with col1:
+            helpful = st.radio(
+                "Your feedback",
+                options=["Yes", "No"],
+                horizontal=True,
+                key=f"helpful_radio_{run_id}",
+            )
+        
+        with col2:
+            issue_options = [
+                "Wrong numbers",
+                "Missing citations",
+                "Analysis too shallow",
+                "Missing sections",
+                "Too long/verbose",
+                "Other",
+            ]
+            selected_issues = st.multiselect(
+                "What could be better? (select all that apply)",
+                options=issue_options,
+                key=f"issues_{run_id}",
+            )
+        
+        comment = st.text_area(
+            "Additional comments (optional)",
+            placeholder="Tell us more about your experience...",
+            key=f"comment_{run_id}",
+        )
+        
+        if st.button("Submit Feedback", key=f"submit_{run_id}"):
+            is_helpful = helpful == "Yes"
+            
+            success = feedback.store_user_feedback(
+                run_id=run_id,
+                session_id=st.session_state.get("session_id"),
+                helpful=is_helpful,
+                comment=comment if comment else None,
+                issue_tags=selected_issues if selected_issues else None,
+                report_version=None,
+            )
+            
+            if success:
+                st.session_state[feedback_key] = True
+                st.success("Thank you for your feedback!")
+            else:
+                st.error("Failed to submit feedback. Please try again.")
+        
+        if st.session_state[feedback_key]:
+            st.info("You have already submitted feedback for this report.")
+
+
 # ── Streaming runner ──────────────────────────────────────────────────────────
 
 # Human-readable agent display names for the live progress panel
@@ -1586,6 +1651,32 @@ def main() -> None:
                 file_name=f"research_{state.get('ticker', 'query')}.md",
                 mime="text/markdown",
             )
+
+        # RLAIF Quality Score Display
+        rl_scores = state.get("rl_feedback_scores")
+        run_id = state.get("rl_feedback_run_id")
+        if rl_scores and run_id:
+            with st.expander("AI Quality Score (RLAIF)", expanded=False):
+                overall = rl_scores.get("overall_score", 0)
+                col1, col2, col3, col4, col5 = st.columns(5)
+                col1.metric("Overall", f"{overall:.1f}/10")
+                col2.metric("Factual", f"{rl_scores.get('factual_accuracy', 0):.1f}")
+                col3.metric("Citations", f"{rl_scores.get('citation_completeness', 0):.1f}")
+                col4.metric("Analysis", f"{rl_scores.get('analysis_depth', 0):.1f}")
+                col5.metric("Structure", f"{rl_scores.get('structure_compliance', 0):.1f}")
+                
+                if overall < 7.0:
+                    st.warning(f"⚠️ This report scored below the quality threshold (7.0). Agent blamed: {rl_scores.get('agent_blamed', 'unknown')}")
+                
+                weaknesses = rl_scores.get("weaknesses", [])
+                if weaknesses:
+                    st.markdown("**Areas for improvement:**")
+                    for w in weaknesses[:3]:
+                        st.markdown(f"- {w}")
+
+        # Explicit User Feedback Widget
+        if run_id:
+            _render_feedback_widget(run_id, state)
 
         # Per-agent result cards
         st.subheader("Agent Details")

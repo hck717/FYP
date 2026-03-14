@@ -32,6 +32,7 @@ from typing import Any, Dict, List, Optional, cast
 
 from .llm import plan_query, summarise_results
 from .state import OrchestrationState
+from . import feedback
 
 logger = logging.getLogger(__name__)
 
@@ -1056,6 +1057,69 @@ def node_summarizer(state: OrchestrationState) -> OrchestrationState:
     return {**state, "final_summary": final_summary, "summarizer_trace": summarizer_trace, "output": output}
 
 
+# ── Node 7b: RLAIF Scorer ───────────────────────────────────────────────────
+
+def node_rlaif_scorer(state: OrchestrationState) -> OrchestrationState:
+    """Score the generated report using RLAIF (Reinforcement Learning from AI Feedback).
+    
+    After the summarizer generates a report, this node calls DeepSeek as a judge
+    to score the report on multiple dimensions and stores the feedback for
+    short-term learning.
+    
+    Scores are stored in the rl_feedback table for analysis.
+    """
+    import uuid
+    
+    final_summary = state.get("final_summary", "")
+    user_query = state.get("user_query", "")
+    ticker = state.get("ticker")
+    run_id = state.get("rl_feedback_run_id") or str(uuid.uuid4())[:12]
+    
+    # Collect agent outputs for reference
+    agent_outputs = {
+        "business_analyst_output": state.get("business_analyst_output"),
+        "quant_fundamental_output": state.get("quant_fundamental_output"),
+        "financial_modelling_output": state.get("financial_modelling_output"),
+        "web_search_output": state.get("web_search_output"),
+    }
+    
+    logger.info("[rlaif_scorer] Scoring report for run_id=%s", run_id)
+    
+    try:
+        scores = feedback.score_report_with_rlaif(
+            run_id=run_id,
+            user_query=user_query,
+            final_summary=final_summary,
+            agent_outputs=agent_outputs,
+            ticker=ticker,
+        )
+        
+        logger.info(
+            "[rlaif_scorer] Scores: overall=%.2f, factual=%.2f, citation=%.2f, "
+            "analysis=%.2f, structure=%.2f, language=%.2f",
+            scores.get("overall_score", 0),
+            scores.get("factual_accuracy", 0),
+            scores.get("citation_completeness", 0),
+            scores.get("analysis_depth", 0),
+            scores.get("structure_compliance", 0),
+            scores.get("language_quality", 0),
+        )
+        
+        return {
+            **state,
+            "rl_feedback_scores": scores,
+            "rl_feedback_run_id": run_id,
+        }
+        
+    except Exception as exc:
+        logger.warning("[rlaif_scorer] Failed to score report: %s", exc)
+        return {
+            **state,
+            "rl_feedback_scores": None,
+            "rl_feedback_run_id": run_id,
+        }
+
+
 # ── Node 8: Episodic Memory Update ───────────────────────────────────────────
 
 def node_memory_update(state: OrchestrationState) -> OrchestrationState:
@@ -1172,6 +1236,7 @@ __all__ = [
     "node_parallel_agents",
     "node_react_check",
     "node_summarizer",
+    "node_rlaif_scorer",
     "node_translator",
     "node_memory_update",
 ]

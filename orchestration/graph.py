@@ -59,6 +59,7 @@ from .nodes import (
     node_parallel_agents,
     node_planner,
     node_react_check,
+    node_rlaif_scorer,
     node_summarizer,
     subscribe_agent_progress,
     unsubscribe_agent_progress,
@@ -123,7 +124,7 @@ def build_graph() -> Any:
 
     Returns a compiled StateGraph ready to call with .invoke() or .stream().
     """
-    from .nodes import node_translator
+    from .nodes import node_translator, node_rlaif_scorer
 
     graph = StateGraph(OrchestrationState)
 
@@ -131,6 +132,7 @@ def build_graph() -> Any:
     graph.add_node("parallel_agents",  node_parallel_agents)
     graph.add_node("react_check",      node_react_check)
     graph.add_node("summarizer",       node_summarizer)
+    graph.add_node("rlaif_scorer",     node_rlaif_scorer)
     graph.add_node("translator",       node_translator)
     graph.add_node("memory_update",    node_memory_update)
 
@@ -147,7 +149,8 @@ def build_graph() -> Any:
         },
     )
 
-    graph.add_edge("summarizer",       "translator")
+    graph.add_edge("summarizer",       "rlaif_scorer")
+    graph.add_edge("rlaif_scorer",    "translator")
     graph.add_edge("translator",       "memory_update")
     graph.add_edge("memory_update",    END)
 

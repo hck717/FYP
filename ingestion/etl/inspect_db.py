@@ -276,7 +276,70 @@ def check_postgres() -> bool:
         # ── text_chunks (pgvector) ────────────────────────────────────────────
         check_pgvector(cur)
 
+        # ── Feedback tables (RLAIF + User Feedback) ─────────────────────────
+        check_feedback_tables(cur)
+
     conn.close()
+    return all_pass
+
+
+def check_feedback_tables(cur) -> bool:
+    """Check RLAIF and User Feedback tables."""
+    print("\n--- Feedback Tables ---")
+    all_pass = True
+
+    feedback_tables = [
+        ("rl_feedback", "RLAIF scores from AI judge"),
+        ("user_feedback", "Explicit user ratings from UI"),
+        ("prompt_versions", "Prompt version tracking for A/B testing"),
+    ]
+
+    for table, description in feedback_tables:
+        try:
+            # Check if table exists
+            cur.execute(
+                "SELECT EXISTS (SELECT 1 FROM information_schema.tables "
+                "WHERE table_name = %s)",
+                (table,)
+            )
+            exists = cur.fetchone()[0]
+
+            if not exists:
+                print(_warn(f"{table}: table does not exist (will be created on first use)"))
+                continue
+
+            # Get row count
+            cur.execute(f"SELECT COUNT(*) FROM {table}")
+            count = cur.fetchone()[0]
+
+            if count > 0:
+                print(_ok(f"{table}: {count} rows ({description})"))
+                _print_sample_rows(cur, table)
+            else:
+                print(_warn(f"{table}: 0 rows (no feedback recorded yet)"))
+
+            # Check specific columns exist
+            expected_cols = {
+                "rl_feedback": ["run_id", "user_query", "overall_score", "agent_blamed", "factual_accuracy"],
+                "user_feedback": ["run_id", "helpful", "comment", "issue_tags"],
+                "prompt_versions": ["agent_name", "version", "prompt_text", "deployed_at"],
+            }
+
+            if table in expected_cols:
+                for col in expected_cols[table]:
+                    cur.execute(
+                        "SELECT EXISTS (SELECT 1 FROM information_schema.columns "
+                        "WHERE table_name = %s AND column_name = %s)",
+                        (table, col)
+                    )
+                    col_exists = cur.fetchone()[0]
+                    if not col_exists:
+                        print(_fail(f"{table}: missing column {col}"))
+                        all_pass = False
+
+        except Exception as exc:
+            print(_warn(f"{table}: {exc}"))
+
     return all_pass
 
 

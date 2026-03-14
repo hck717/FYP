@@ -80,5 +80,9 @@ class OrchestrationState(TypedDict, total=False):
     final_summary: Optional[str]            # narrative from DeepSeek summarizer
     output: Optional[Dict[str, Any]]        # full structured response to UI
 
+    # ── RLAIF Feedback ────────────────────────────────────────────────────────
+    rl_feedback_scores: Optional[Dict[str, Any]]  # RLAIF scores from AI judge
+    rl_feedback_run_id: Optional[str]      # Unique run ID for this analysis
+
 
 __all__ = ["OrchestrationState"]
