@@ -53,9 +53,10 @@ IMPORTANT - CITATION FORMAT:
 3. NO HALLUCINATION: Do not state facts, figures, or events that are not explicitly
    present in the retrieved chunks. If the chunk is ambiguous, say so in data_quality_note.
 
-4. THIN CONTEXT: If fewer than 2 chunks were retrieved OR no chunk has a relevance score
-   above 0.4, you MUST set qualitative_summary to "INSUFFICIENT_DATA: <reason>" and
-   leave qualitative_analysis fields as null. Do not fabricate analysis from thin air.
+4. THIN CONTEXT: If the provided chunks do not contain enough specific, factual evidence
+   to definitively answer the user's question, you MUST set `qualitative_summary` to exactly
+   `INSUFFICIENT_DATA: <reason>` and set all other fields to null. Do not attempt to guess,
+   infer, or hallucinate. This is a hard requirement with no exceptions.
 
 5. UNKNOWN TICKER: If the context contains no retrieved chunks for the queried ticker,
    set qualitative_summary to "INSUFFICIENT_DATA: No documents found in knowledge base
@@ -196,51 +197,7 @@ Hard constraints:
 """.strip()
 
 
-QUERY_CLASSIFICATION_PROMPT = """
-You are a query router for an equity research AI system.
-Classify the following analyst query into EXACTLY ONE of three categories:
-
-SIMPLE   — A direct, single-hop qualitative question answerable from one or two document
-           passages. Examples: company description, sector, what a product does, moat summary.
-           Expected latency: fast path (<3 s).
-
-NUMERICAL — A query that requires extracting a specific metric, time-series figure,
-            or ratio from filings or earnings calls, or comparing a few numeric data points.
-            Examples: revenue growth rate, EPS guidance figure, capex trend.
-
-COMPLEX  — A multi-hop, relational, or synthesising question requiring evidence from
-           several documents, graph traversal, or contrastive analysis across time periods.
-           Examples: competitive dynamics vs. named rivals, margin trajectory drivers,
-           strategic positioning with risk/opportunity trade-offs.
-
-Rules:
-- Reply with ONLY the single word: SIMPLE, NUMERICAL, or COMPLEX.
-- No explanation, no punctuation, no markdown.
-
-Query: "{{query}}"
-Classification:
-""".strip()
-
-
-REWRITE_PROMPT = """
-You are rewriting a qualitative equity research query to improve dense retrieval
-over financial news articles stored in a vector database.
-
-Rules:
-- Preserve the ticker symbol.
-- Make the query more specific using financial terminology: competitive moat, segment revenue,
-  margin profile, capital allocation, risk factor, guidance, regulatory exposure.
-- Decompose compound questions into the single most retrieval-relevant sub-question.
-- Return only the rewritten query. No explanation, no preamble.
-
-Original query: "{{query}}"
-Rewritten query:
-""".strip()
-
-
 __all__ = [
     "SYSTEM_PROMPT",
     "JSON_SCHEMA_PROMPT",
-    "QUERY_CLASSIFICATION_PROMPT",
-    "REWRITE_PROMPT",
 ]

@@ -13,8 +13,6 @@ import logging
 import statistics
 from typing import Any, Dict, List, Optional
 
-import numpy as np
-
 from ..config import FinancialModellingConfig
 from ..schema import CompsResult, FMDataBundle
 
@@ -31,46 +29,6 @@ def _safe_float(val: Any, default: Optional[float] = None) -> Optional[float]:
 
 
 def _median(values: List[float]) -> Optional[float]:
-    clean = [v for v in values if v is not None and not (v != v)]  # drop NaN
-    if not clean:
-        return None
-    return statistics.median(clean)
-
-
-def winsorize_peer_multiples(multiples: List[float], limits: tuple = (0.05, 0.05)) -> List[float]:
-    """Cap extreme peer multiples at 5th/95th percentile to reduce outlier impact.
-    
-    Args:
-        multiples: List of peer multiples (e.g., EV/EBITDA values)
-        limits: Tuple of (lower_percentile, upper_percentile) - defaults to 5th/95th
-    
-    Returns:
-        List of winsorized multiples
-    """
-    if not multiples:
-        return []
-    
-    clean = [m for m in multiples if m is not None and m > 0 and (m == m)]  # positive and not NaN
-    if len(clean) < 5:
-        logger.debug("Not enough peers (%d) for winsorization, returning original", len(clean))
-        return multiples
-    
-    try:
-        lower = np.percentile(clean, limits[0] * 100)
-        upper = np.percentile(clean, (1 - limits[1]) * 100)
-        
-        winsorized = [max(lower, min(m, upper)) for m in clean]
-        
-        # Log if any values were adjusted
-        adjusted_count = sum(1 for m in clean if m < lower or m > upper)
-        if adjusted_count > 0:
-            logger.info("Winsorized %d peer multiples: range [%.2f, %.2f] -> [%.2f, %.2f]",
-                       adjusted_count, min(clean), max(clean), lower, upper)
-        
-        return winsorized
-    except Exception as e:
-        logger.warning("Winsorization failed: %s, returning original", e)
-        return multiples
     clean = [v for v in values if v is not None and not (v != v)]  # drop NaN
     if not clean:
         return None
@@ -122,18 +80,14 @@ class CompsEngine:
             if pe_t is not None and pe_t > 0:
                 peer_pe_trailing.append(pe_t)
 
-        # ── Apply outlier detection (winsorization) to peer multiples ─────────────
-        peer_ev_ebitdas_winsorized = winsorize_peer_multiples(peer_ev_ebitdas)
-        peer_pe_trailing_winsorized = winsorize_peer_multiples(peer_pe_trailing)
-
         # ── vs_sector_avg: use EV/EBITDA if available, else P/E trailing ────
         target_multiple = result.ev_ebitda
-        peer_median_evebitda = _median(peer_ev_ebitdas_winsorized)
+        peer_median_evebitda = _median(peer_ev_ebitdas)
         peer_median = peer_median_evebitda
 
         if target_multiple is None or peer_median is None:
             target_multiple = result.pe_trailing
-            peer_median = _median(peer_pe_trailing_winsorized)
+            peer_median = _median(peer_pe_trailing)
 
         if target_multiple is not None and peer_median is not None and peer_median > 0:
             pct = (target_multiple - peer_median) / peer_median * 100
@@ -172,36 +126,6 @@ class CompsEngine:
 
     # ── Individual multiple helpers ──────────────────────────────────────────
 
-    # Industry thresholds for EV/EBITDA validation
-    # Note: High-growth companies (TSLA, NVDA) legitimately have very high multiples
-    EV_EBITDA_THRESHOLDS = {
-        "technology": 50,
-        "software": 45,
-        "semiconductors": 50,  # NVDA often trades at 60-100x
-        "consumer_discretionary": 35,  # Includes EV makers like TSLA
-        "automobiles": 80,  # TSLA legitimately high due to growth narrative
-        "electric vehicles": 80,
-        "consumer_electronics": 40,
-        "communication_services": 35,
-        "healthcare": 30,
-        "biotechnology": 40,
-        "financials": 20,
-        "utilities": 18,
-        "consumer_staples": 22,
-        "energy": 15,
-        "industrials": 25,
-        "materials": 18,
-        "real_estate": 25,
-        "telecommunications": 15,
-    }
-    
-    # Ticker-specific overrides for companies with legitimately high multiples
-    TICKER_EV_EBITDA_OVERRIDES = {
-        "TSLA": 150,  # Tesla - growth narrative justifies high multiple
-        "NVDA": 120,  # NVIDIA - AI narrative
-        "AMD": 60,   # Advanced Micro Devices
-    }
-
     def _ev_ebitda(
         self,
         km_ttm: Dict[str, Any],
@@ -213,36 +137,11 @@ class CompsEngine:
         # Try precomputed TTM key first (FMP field names)
         v = _safe_float(km_ttm.get("evToEBITDATTM") or km_ttm.get("enterpriseValueMultipleTTM"))
         if v is not None and v > 0:
-            # Check ticker-specific override BEFORE generic 50x threshold
-            if ticker.upper() in self.TICKER_EV_EBITDA_OVERRIDES:
-                threshold = self.TICKER_EV_EBITDA_OVERRIDES[ticker.upper()]
-                if v <= threshold:
-                    return round(v, 2) if v else None
-                # Still validate if above ticker threshold
-                logger.warning(f"EV/EBITDA {v}x exceeds ticker threshold {threshold}x, validating...")
-            elif v > 50:
-                logger.warning(f"EV/EBITDA {v}x unusually high (>50), validating...")
-            else:
-                return round(v, 2) if v else None
-            
-            v = self._validate_ev_ebitda(v, km_ttm, enterprise, income, ticker)
-            return round(v, 2) if v else None
+            return round(v, 2)
         # EODHD field names (enterprise_values payload stored in bundle.enterprise)
         v = _safe_float(enterprise.get("EnterpriseValueEbitda") or km_ttm.get("EnterpriseValueEbitda"))
         if v is not None and v > 0:
-            # Check ticker-specific override BEFORE generic 50x threshold
-            if ticker.upper() in self.TICKER_EV_EBITDA_OVERRIDES:
-                threshold = self.TICKER_EV_EBITDA_OVERRIDES[ticker.upper()]
-                if v <= threshold:
-                    return round(v, 2) if v else None
-                logger.warning(f"EV/EBITDA {v}x exceeds ticker threshold {threshold}x, validating...")
-            elif v > 50:
-                logger.warning(f"EV/EBITDA {v}x unusually high (>50), validating...")
-            else:
-                return round(v, 2) if v else None
-            
-            v = self._validate_ev_ebitda(v, km_ttm, enterprise, income, ticker)
-            return round(v, 2) if v else None
+            return round(v, 2)
         # Compute from components
         ev = _safe_float(
             enterprise.get("enterpriseValue")
@@ -256,119 +155,7 @@ class CompsEngine:
             or km_ttm.get("EBITDA")   # EODHD key_metrics_ttm
         )
         if ev and ebitda and ebitda > 0:
-            ev_ebitda = round(ev / ebitda, 2)
-            # Check ticker-specific override BEFORE generic 50x threshold
-            if ticker.upper() in self.TICKER_EV_EBITDA_OVERRIDES:
-                threshold = self.TICKER_EV_EBITDA_OVERRIDES[ticker.upper()]
-                if ev_ebitda <= threshold:
-                    return ev_ebitda
-                logger.warning(f"Computed EV/EBITDA {ev_ebitda}x exceeds ticker threshold {threshold}x, validating...")
-                validated = self._validate_ev_ebitda(ev_ebitda, km_ttm, enterprise, income, ticker)
-                return round(validated, 2) if validated else None
-            elif ev_ebitda > 50:
-                logger.warning(f"Computed EV/EBITDA {ev_ebitda}x unusually high (>50), validating...")
-                validated = self._validate_ev_ebitda(ev_ebitda, km_ttm, enterprise, income, ticker)
-                return round(validated, 2) if validated else None
-            return ev_ebitda
-        return None
-
-    def _validate_ev_ebitda(
-        self,
-        current_value: float,
-        km_ttm: Dict[str, Any],
-        enterprise: Dict[str, Any],
-        income: Dict[str, Any],
-        ticker: str = "",
-    ) -> Optional[float]:
-        """Validate and correct implausible EV/EBITDA values."""
-        # Use provided ticker or try to extract from km_ttm
-        if not ticker:
-            ticker = km_ttm.get("symbol") or km_ttm.get("ticker") or ""
-        
-        # Detect sector from multiple sources
-        sector = None
-        
-        # Check key_metrics_ttm
-        for key in ("sector", "Sector", "GicSector", "gicSector", "industry", "Industry"):
-            v = km_ttm.get(key)
-            if v and isinstance(v, str) and len(v) > 2:
-                sector = v.lower()
-                logger.info(f"Found sector '{sector}' in key_metrics_ttm")
-                break
-        
-        # Check enterprise values if not found
-        if not sector:
-            for key in ("sector", "Sector", "industry", "Industry"):
-                v = enterprise.get(key)
-                if v and isinstance(v, str) and len(v) > 2:
-                    sector = v.lower()
-                    logger.info(f"Found sector '{sector}' in enterprise")
-                    break
-        
-        # Try income statement
-        if not sector:
-            for key in ("sector", "Sector", "industry", "Industry"):
-                v = income.get(key)
-                if v and isinstance(v, str) and len(v) > 2:
-                    sector = v.lower()
-                    logger.info(f"Found sector '{sector}' in income")
-                    break
-        
-        # Default sector based on ticker if still not found
-        if not sector:
-            ticker = km_ttm.get("symbol") or km_ttm.get("ticker") or ""
-            sector_map = {
-                "AAPL": "consumer electronics",
-                "MSFT": "software",
-                "GOOGL": "communication services",
-                "AMZN": "consumer discretionary",
-                "NVDA": "semiconductors",
-                "TSLA": "automobiles",
-            }
-            sector = sector_map.get(ticker.upper(), "technology")
-            logger.info(f"Using fallback sector '{sector}' for {ticker}")
-        
-        # Get threshold based on sector
-        threshold = 50  # default
-        ticker = km_ttm.get("symbol") or km_ttm.get("ticker") or ""
-        
-        # Check ticker-specific override first
-        if ticker.upper() in self.TICKER_EV_EBITDA_OVERRIDES:
-            threshold = self.TICKER_EV_EBITDA_OVERRIDES[ticker.upper()]
-            logger.info(f"Using ticker-specific threshold {threshold}x for {ticker}")
-        elif sector:
-            for sector_key, sector_threshold in self.EV_EBITDA_THRESHOLDS.items():
-                if sector_key in sector:
-                    threshold = sector_threshold
-                    logger.info(f"Using threshold {threshold}x for sector '{sector}'")
-                    break
-        
-        if current_value <= threshold:
-            return current_value
-        
-        logger.warning(f"EV/EBITDA {current_value}x exceeds {threshold}x threshold for sector '{sector}', attempting manual calculation...")
-        
-        # Fallback: compute manually from raw components
-        ev = _safe_float(
-            enterprise.get("enterpriseValue")
-            or enterprise.get("EnterpriseValue")
-            or enterprise.get("marketCapitalization")
-        )
-        ebitda = _safe_float(
-            income.get("ebitda")
-            or income.get("EBITDA")
-            or km_ttm.get("ebitdaTTM")
-            or km_ttm.get("EBITDA")
-        )
-        
-        if ev and ebitda and ebitda > 0:
-            manual_ev_ebitda = round(ev / ebitda, 2)
-            if 5 < manual_ev_ebitda < threshold:
-                logger.info(f"Manual EV/EBITDA calculation yielded {manual_ev_ebitda}x (was {current_value}x)")
-                return manual_ev_ebitda
-        
-        # If manual calculation also yields high value, return None to trigger peer median fallback
-        logger.warning(f"Could not validate EV/EBITDA, returning None to use peer median")
+            return round(ev / ebitda, 2)
         return None
 
     def _pe_trailing(
@@ -546,4 +333,4 @@ class CompsEngine:
         return None
 
 
-__all__ = ["CompsEngine", "winsorize_peer_multiples"]
+__all__ = ["CompsEngine"]

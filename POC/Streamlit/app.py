@@ -83,7 +83,7 @@ EXAMPLE_QUERIES = [
 # Node display labels / descriptions
 NODE_LABELS = {
     "planner":         ("Planning", "Resolving ticker, selecting agents, setting complexity…"),
-    "parallel_agents": ("Running Agents", "Business Analyst · Quant Fundamental · Financial Modelling · Web Search"),
+    "parallel_agents": ("Running Agents", "Dispatching selected agents…"),
     "react_check":     ("ReAct Check", "Evaluating agent outputs for gaps or errors…"),
     "summarizer":      ("Summarizing", "Generating final research note with DeepSeek-R1…"),
     "memory_update":   ("Memory Update", "Persisting failure patterns to episodic memory…"),
@@ -278,6 +278,25 @@ def _fmt(val: Any, decimals: int = 2, suffix: str = "") -> str:
 
 def _pct(val: Any) -> str:
     return _fmt(val, 1, "%")
+
+
+def _parse_institution_from_doc_name(doc_name: str) -> str:
+    """Extract institution name from a broker doc_name string.
+
+    Format: "<Institution> <TICKER> <title...>"
+    Strategy: take everything before the first occurrence of an all-caps ticker
+    segment (2-5 uppercase letters), then strip trailing whitespace.
+    Falls back to the first token if no ticker pattern is found.
+    """
+    import re as _re
+    if not doc_name:
+        return "?"
+    # Find the position of the first ALL-CAPS word that looks like a ticker (2-5 chars)
+    m = _re.search(r'\b[A-Z]{2,5}\b', doc_name)
+    if m:
+        institution = doc_name[:m.start()].strip()
+        return institution if institution else doc_name.split()[0]
+    return doc_name.split()[0]
 
 
 def _safe_get(d: Any, *keys: str, default: Any = None) -> Any:
@@ -688,6 +707,114 @@ def _render_web_search(output: Dict[str, Any], ticker: str) -> None:
                 st.markdown(rationale)
 
 
+def _render_stock_research(output: Dict[str, Any], ticker: str) -> None:
+    """Render Stock Research agent card (broker reports + earnings call analysis)."""
+    data_source = output.get("data_source", "neo4j")
+    source_badge = "Neo4j" if data_source == "neo4j" else "PDF"
+    with st.expander(f"Stock Research — {ticker}", expanded=True):
+
+        # Data source badge
+        badge_color = "status-ok" if data_source == "neo4j" else "status-warn"
+        st.markdown(
+            f"Data source: <span class='{badge_color}'>{source_badge}</span>",
+            unsafe_allow_html=True,
+        )
+
+        # Error check
+        err = output.get("error")
+        if err:
+            st.error(f"Agent error: {err}")
+
+        # Transcript names
+        latest = output.get("latest_transcript") or ""
+        previous = output.get("previous_transcript") or ""
+        if latest or previous:
+            col1, col2 = st.columns(2)
+            col1.caption(f"**Latest:** {latest}")
+            col2.caption(f"**Previous:** {previous}")
+
+        # NLP features
+        features = output.get("features") or {}
+        feat_latest = features.get("latest") or {}
+        feat_prev   = features.get("previous") or {}
+        kpi_diff    = features.get("kpi_diff") or {}
+        if feat_latest:
+            st.markdown("**NLP Signal Features (latest transcript)**")
+            c1, c2, c3, c4 = st.columns(4)
+            _hedge = feat_latest.get("hedge_ratio")
+            _tone = round(1.0 - _hedge, 4) if _hedge is not None else None
+            c1.metric("KPI Density",    _fmt(feat_latest.get("kpi_per_1k_words")))
+            c2.metric("Hedge Ratio",    _fmt(_hedge))
+            c3.metric("Evasive Count",  _fmt(feat_latest.get("evasive_count")))
+            c4.metric("Tone Score",     _fmt(_tone))
+            if feat_prev:
+                _kpi_latest = feat_latest.get("kpi_per_1k_words")
+                _kpi_prev   = feat_prev.get("kpi_per_1k_words")
+                _hedge_prev = feat_prev.get("hedge_ratio")
+                delta_kpi   = round(_kpi_latest - _kpi_prev, 4) if (_kpi_latest is not None and _kpi_prev is not None) else None
+                delta_hedge = round((_hedge or 0) - (_hedge_prev or 0), 4) if (_hedge is not None and _hedge_prev is not None) else None
+                if delta_kpi is not None or delta_hedge is not None:
+                    st.caption(
+                        f"Period-over-period: KPI density Δ{_fmt(delta_kpi)}  "
+                        f"Hedge ratio Δ{_fmt(delta_hedge)}"
+                    )
+
+        # Broker rating distribution
+        broker_parsed = output.get("broker_parsed") or []
+        if broker_parsed:
+            st.markdown("**Broker Ratings**")
+            counts: Dict[str, int] = {"bullish": 0, "neutral": 0, "bearish": 0}
+            for b in broker_parsed:
+                r = (b.get("rating") or "neutral").lower()
+                if r in counts:
+                    counts[r] += 1
+                else:
+                    counts["neutral"] += 1
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Bullish",  counts["bullish"])
+            c2.metric("Neutral",  counts["neutral"])
+            c3.metric("Bearish",  counts["bearish"])
+
+            # Per-broker price targets
+            pt_rows = [
+                b for b in broker_parsed
+                if b.get("price_target") not in (None, "", "N/A")
+            ]
+            if pt_rows:
+                with st.expander("Price targets by broker", expanded=False):
+                    for b in pt_rows:
+                        inst   = b.get("institution") or _parse_institution_from_doc_name(b.get("doc_name", ""))
+                        rating = (b.get("rating") or "neutral").capitalize()
+                        pt     = b.get("price_target") or "—"
+                        color  = (
+                            "status-ok"  if "bullish" in rating.lower() else
+                            "status-err" if "bearish" in rating.lower() else
+                            "status-warn"
+                        )
+                        st.markdown(
+                            f"**{inst}** — <span class='{color}'>{rating}</span> | PT: {pt}",
+                            unsafe_allow_html=True,
+                        )
+
+        # Three main analysis sections
+        transcript_comparison = output.get("transcript_comparison") or ""
+        qa_behavior           = output.get("qa_behavior") or ""
+        broker_consensus      = output.get("broker_consensus") or ""
+
+        if transcript_comparison:
+            with st.expander("Transcript comparison (YoY)", expanded=False):
+                st.markdown(transcript_comparison)
+        if qa_behavior:
+            with st.expander("Q&A behaviour analysis", expanded=False):
+                st.markdown(qa_behavior)
+        if broker_consensus:
+            with st.expander("Broker consensus synthesis", expanded=False):
+                st.markdown(broker_consensus)
+
+        # Thinking trace
+        _render_thinking_trace(output.get("thinking_trace") or [])
+
+
 def _render_visualisations(state: Dict[str, Any]) -> None:
     """Render Plotly charts driven by planner chart_hints + available data.
 
@@ -1009,6 +1136,14 @@ def _render_agent_outputs(state: Dict[str, Any]) -> None:
         t = tickers[i] if i < len(tickers) else out.get("ticker", "?")
         _render_web_search(out, t)
 
+    # ── Stock Research ───────────────────────────────────────────────────────
+    sr_outputs: List[Dict] = state.get("stock_research_outputs") or []
+    if not sr_outputs and state.get("stock_research_output"):
+        sr_outputs = [state["stock_research_output"]]
+    for i, out in enumerate(sr_outputs):
+        t = tickers[i] if i < len(tickers) else out.get("ticker", "?")
+        _render_stock_research(out, t)
+
 
 def _render_plan_info(plan: Optional[Dict[str, Any]], state: Dict[str, Any]) -> None:
     """Show plan metadata in a compact info bar."""
@@ -1023,6 +1158,7 @@ def _render_plan_info(plan: Optional[Dict[str, Any]], state: Dict[str, Any]) -> 
             ("QF",  state.get("run_quant_fundamental")),
             ("FM",  state.get("run_financial_modelling")),
             ("WS",  state.get("run_web_search")),
+            ("SR",  state.get("run_stock_research")),
         ] if flag
     ]
     react_iter = state.get("react_iteration") or 0
@@ -1109,6 +1245,7 @@ _AGENT_DISPLAY = {
     "quant_fundamental":  "Quant Fundamental",
     "financial_modelling":"Financial Modelling",
     "web_search":         "Web Search",
+    "stock_research":     "Stock Research",
 }
 
 
@@ -1244,7 +1381,20 @@ def _run_with_streaming(query: str, output_language: Optional[str] = None) -> Op
                         in_parallel_agents = True  # Start tracking while agents run
                         agent_area.empty()           # clear per-agent box
                         agent_statuses.clear()
-                        line = f"**Pass {pass_count} — {label}:** {desc}"
+                        # Build dynamic agent list from which run_* flags are True
+                        _run_flag_map = [
+                            ("run_business_analyst",   "Business Analyst"),
+                            ("run_quant_fundamental",  "Quant Fundamental"),
+                            ("run_financial_modelling","Financial Modelling"),
+                            ("run_web_search",         "Web Search"),
+                            ("run_stock_research",     "Stock Research"),
+                        ]
+                        active_agents = [
+                            name for key, name in _run_flag_map
+                            if node_output.get(key)
+                        ] if isinstance(node_output, dict) else []
+                        agent_list_str = " · ".join(active_agents) if active_agents else "selected agents"
+                        line = f"**Pass {pass_count} — {label}:** {agent_list_str}"
 
                     elif node_name == "react_check":
                         iteration = node_output.get("react_iteration") or pass_count
@@ -1392,7 +1542,26 @@ def main() -> None:
         # Show API status
         if not st.session_state.get("api_verified"):
             st.warning("⚠️ API key required for analysis")
-        
+
+        st.divider()
+
+        # Perplexity API Key (for web search agent)
+        st.markdown("### Web Search (Optional)")
+        st.caption("Required only when the analysis needs recent news or live web data.")
+        perplexity_api_key = st.text_input(
+            "Perplexity API Key",
+            type="password",
+            value=st.session_state.get("perplexity_api_key", os.getenv("PERPLEXITY_API_KEY", "")),
+            help="Enter your Perplexity API key to enable the web search agent. Get one at https://www.perplexity.ai/settings/api",
+            key="perplexity_key_input",
+        )
+        if perplexity_api_key:
+            st.session_state["perplexity_api_key"] = perplexity_api_key
+            os.environ["PERPLEXITY_API_KEY"] = perplexity_api_key
+            st.success("✓ Perplexity key set")
+        else:
+            st.info("No Perplexity key — web search agent disabled")
+
         st.divider()
         _render_sidebar_availability()
         st.divider()

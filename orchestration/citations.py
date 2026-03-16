@@ -265,7 +265,8 @@ def build_citation_block(
 
         # 1c. Sentiment — always sourced from PostgreSQL
         if ba_output.get("sentiment"):
-            sent_src = (ba_output["sentiment"].get("source") or "postgresql:sentiment_trends")
+            _sent = ba_output["sentiment"]
+            sent_src = (_sent.get("source") if isinstance(_sent, dict) else None) or "postgresql:sentiment_trends"
             _add(
                 "business_analyst",
                 "postgresql",

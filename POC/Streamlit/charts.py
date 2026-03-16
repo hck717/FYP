@@ -1663,14 +1663,14 @@ def chart_altman_z(
         domain=dict(x=[0, 1], y=[0, 1]),
     ))
 
-    fig.update_layout(
+    fig.update_layout(**{
         **_LAYOUT_BASE,
-        margin=dict(l=30, r=30, t=60, b=20),
-        title=dict(
+        "margin": dict(l=30, r=30, t=60, b=20),
+        "title": dict(
             text=f"{ticker} — Altman Z-Score  (< 1.23 Distress | 1.23–3.0 Grey | > 3.0 Safe)",
             x=0.02,
             font=dict(size=13, color=_TEXT),
         ),
-        height=270,
-    )
+        "height": 270,
+    })
     return fig

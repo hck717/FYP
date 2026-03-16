@@ -478,7 +478,13 @@ def _compute_altman_z_from_stmts(
     retained_earnings  = _g((bal, "retainedEarnings", "retainedEarningsAccumulatedDeficit"))
     ebit               = _g((inc, "operatingIncome", "ebit"))
     market_cap         = _g((km, "marketCapTTM", "MarketCapitalizationTTM"))
-    total_liabilities  = _g((bal, "totalLiabilities", "totalDebt"))
+    # EODHD uses "totalLiab" (not "totalLiabilities") and non-current + current sum as fallback
+    total_liabilities  = _g((bal, "totalLiabilities", "totalLiab", "totalDebt"))
+    if total_liabilities is None:
+        _cl = _g((bal, "totalCurrentLiabilities", "currentLiabilities"))
+        _ncl = _g((bal, "nonCurrentLiabilitiesTotal", "nonCurrentLiabilitiesOther"))
+        if _cl is not None and _ncl is not None:
+            total_liabilities = _cl + _ncl
     revenue            = _g((inc, "revenue", "totalRevenue"))
 
     wc: float = 0.0
@@ -496,7 +502,9 @@ def _compute_altman_z_from_stmts(
 
     if x4 is None:
         # Without market cap, fall back to book equity / total liabilities
-        equity = _g((bal, "totalStockholdersEquity", "totalShareholdersEquity", "stockholdersEquity"))
+        # EODHD uses "totalStockholderEquity" (no trailing 's')
+        equity = _g((bal, "totalStockholdersEquity", "totalStockholderEquity",
+                     "totalShareholdersEquity", "stockholdersEquity"))
         if equity is not None and total_liabilities and total_liabilities > 0:
             x4 = equity / total_liabilities
         else:

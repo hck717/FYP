@@ -1991,7 +1991,10 @@ def load_valuation_metrics_from_profile(ticker_symbol: str) -> int:
     "neo4j", so the main CSV loop skips it.  We call this from
     load_postgres_for_ticker automatically, and it can also be run standalone.
     """
-    profile_path = BASE_ETL_DIR / ticker_symbol / "company_profile.json"
+    # Prefer the full nested profile (has Highlights/Valuation sections)
+    profile_path = BASE_ETL_DIR / ticker_symbol / "company_profile_neo4j.json"
+    if not profile_path.exists():
+        profile_path = BASE_ETL_DIR / ticker_symbol / "company_profile.json"
     if not profile_path.exists():
         # Fall back to CSV
         csv_path = BASE_ETL_DIR / ticker_symbol / "company_profile.csv"
@@ -2007,7 +2010,7 @@ def load_valuation_metrics_from_profile(ticker_symbol: str) -> int:
         with open(profile_path) as f:
             profile: dict = json.load(f)
     except Exception as exc:
-        print(f"[PG Loader] {ticker_symbol}/company_profile.json read error: {exc}")
+        print(f"[PG Loader] {ticker_symbol}/{profile_path.name} read error: {exc}")
         return 0
 
     hl  = profile.get("Highlights", {}) or {}
@@ -2491,9 +2494,12 @@ def _populate_raw_fundamentals_from_statements(ticker_symbol: str) -> int:
         except Exception as exc:
             print(f"[PG raw_fundamentals] {ticker_symbol}/financial_statements: ERROR — {exc}")
     
-    # ── 2. Extract ratios/metrics from company_profile.json (unchanged) ──
+    # ── 2. Extract ratios/metrics from company_profile_neo4j.json (full nested structure) ──
     ticker_dir = BASE_ETL_DIR / ticker_symbol
-    profile_path = ticker_dir / "company_profile.json"
+    # Prefer the full nested file (has Highlights/Valuation); fall back to flattened profile
+    profile_path = ticker_dir / "company_profile_neo4j.json"
+    if not profile_path.exists():
+        profile_path = ticker_dir / "company_profile.json"
     if profile_path.exists():
         try:
             with open(profile_path) as f:

@@ -53,9 +53,12 @@ from .config import QuantFundamentalConfig, load_config
 from .factors import (
     compute_value_factors,
     compute_quality_factors,
+    compute_piotroski,
+    compute_beneish_m_score,
     compute_key_metrics_quality,
     compute_momentum_risk,
 )
+from .factors.quality import _compute_altman_z_from_stmts, _compute_roic
 from .llm import QuantLLMClient
 from .schema import (
     AnomalyFlag,
@@ -478,6 +481,94 @@ def _node_calculate_quality_factors(
             roe=_float_or_none(mv_row.get("roe_ttm")),
             roic=_float_or_none(mv_row.get("roic_ttm")),
         )
+
+        # Supplement any null scores that the MV couldn't populate (e.g. EODHD doesn't
+        # provide Piotroski/Beneish/Altman/ROIC) by computing them in-memory from the
+        # financial statements stored on the bundle.
+        _needs_supplement = (
+            quality.piotroski_f_score is None
+            or quality.beneish_m_score is None
+            or quality.altman_z_score is None
+            or quality.roic is None
+        )
+        if _needs_supplement and bundle.income:
+            logger.info(
+                "[QF] MV has null score fields for %s — supplementing from financial statements",
+                ticker,
+            )
+            inc  = bundle.income   or {}
+            bal  = bundle.balance  or {}
+            cf   = bundle.cashflow or {}
+            inc_prev = getattr(bundle, "income_prev",  None) or state.get("inc_prev") or {}
+            bal_prev = getattr(bundle, "balance_prev", None) or state.get("bal_prev") or {}
+            cf_prev  = getattr(bundle, "cf_prev",      None) or state.get("cf_prev")  or {}
+
+            if quality.piotroski_f_score is None and inc and bal and cf:
+                try:
+                    _p = compute_piotroski(inc=inc, bal=bal, cf=cf,
+                                          inc_prev=inc_prev or None,
+                                          bal_prev=bal_prev or None)
+                    quality = QualityFactors(
+                        piotroski_f_score=_p,
+                        beneish_m_score=quality.beneish_m_score,
+                        altman_z_score=quality.altman_z_score,
+                        roe=quality.roe,
+                        roic=quality.roic,
+                        manipulation_risk=quality.manipulation_risk,
+                    )
+                    logger.debug("[QF] In-memory Piotroski for %s: %s", ticker, _p)
+                except Exception as _exc:
+                    logger.warning("[QF] Piotroski supplement failed: %s", _exc)
+
+            if quality.beneish_m_score is None and inc and bal and cf and inc_prev and bal_prev:
+                try:
+                    _b = compute_beneish_m_score(inc=inc, bal=bal, cf=cf,
+                                                 inc_prev=inc_prev, bal_prev=bal_prev)
+                    _manip = ("HIGH" if _b is not None and _b > -2.22 else "LOW") if _b is not None else None
+                    quality = QualityFactors(
+                        piotroski_f_score=quality.piotroski_f_score,
+                        beneish_m_score=_b,
+                        altman_z_score=quality.altman_z_score,
+                        roe=quality.roe,
+                        roic=quality.roic,
+                        manipulation_risk=_manip,
+                    )
+                    logger.debug("[QF] In-memory Beneish for %s: %s", ticker, _b)
+                except Exception as _exc:
+                    logger.warning("[QF] Beneish supplement failed: %s", _exc)
+
+            if quality.altman_z_score is None and inc and bal:
+                try:
+                    _z = _compute_altman_z_from_stmts(inc=inc, bal=bal,
+                                                       km_ttm=bundle.key_metrics_ttm)
+                    quality = QualityFactors(
+                        piotroski_f_score=quality.piotroski_f_score,
+                        beneish_m_score=quality.beneish_m_score,
+                        altman_z_score=_z,
+                        roe=quality.roe,
+                        roic=quality.roic,
+                        manipulation_risk=quality.manipulation_risk,
+                    )
+                    logger.debug("[QF] In-memory Altman Z for %s: %s", ticker, _z)
+                except Exception as _exc:
+                    logger.warning("[QF] Altman Z supplement failed: %s", _exc)
+
+            if quality.roic is None and inc and bal and cf:
+                try:
+                    _r = _compute_roic(inc=inc, bal=bal, cf=cf,
+                                       rt=bundle.ratios_ttm or {},
+                                       km_ttm=bundle.key_metrics_ttm or {})
+                    quality = QualityFactors(
+                        piotroski_f_score=quality.piotroski_f_score,
+                        beneish_m_score=quality.beneish_m_score,
+                        altman_z_score=quality.altman_z_score,
+                        roe=quality.roe,
+                        roic=_r,
+                        manipulation_risk=quality.manipulation_risk,
+                    )
+                    logger.debug("[QF] In-memory ROIC for %s: %s", ticker, _r)
+                except Exception as _exc:
+                    logger.warning("[QF] ROIC supplement failed: %s", _exc)
         km_dict = {
             "gross_margin":   _float_or_none(mv_row.get("gross_margin_ttm")),
             "ebit_margin":    _float_or_none(mv_row.get("net_margin_ttm")),   # best EODHD proxy for ebit_margin

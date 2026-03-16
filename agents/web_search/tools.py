@@ -89,8 +89,15 @@ class PostgresConnector:
 
 # Perplexity endpoint is fixed — no env var needed for URL
 PERPLEXITY_API_URL = "https://api.perplexity.ai/chat/completions"
-PERPLEXITY_API_KEY = os.getenv("PERPLEXITY_API_KEY", "").strip()
 DEFAULT_MODEL      = os.getenv("WEB_SEARCH_MODEL", "sonar-pro")
+
+# Key is read lazily at call time so that setting os.environ["PERPLEXITY_API_KEY"]
+# after module import (e.g. from the Streamlit UI) is honoured.
+def _get_perplexity_key() -> str:
+    return (
+        os.getenv("PERPLEXITY_API_KEY", "")
+        or os.getenv("PERPLEXITY_KEY", "")
+    ).strip()
 
 
 import time
@@ -103,11 +110,15 @@ def perplexity_chat_completions(
     max_tokens: int = 4096,
     max_retries: int = 3,
 ) -> Dict:
-    if not PERPLEXITY_API_KEY:
-        raise EnvironmentError("PERPLEXITY_API_KEY not found.")
+    api_key = _get_perplexity_key()
+    if not api_key:
+        raise EnvironmentError(
+            "PERPLEXITY_API_KEY not found. Set it in .env or enter it in the "
+            "Streamlit sidebar under 'Web Search (Optional)'."
+        )
 
     headers = {
-        "Authorization": f"Bearer {PERPLEXITY_API_KEY}",
+        "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
     payload = {

@@ -1,36 +1,42 @@
-"""Main LangGraph orchestration graph — parallel multi-agent pipeline with ReAct loop.
+"""Main LangGraph orchestration graph — native parallel multi-agent pipeline.
 
-Architecture (default — parallel dispatch + ReAct loop):
+Architecture (native LangGraph fan-out + per-agent ReAct retry):
 
-                          ┌──────────────────────────────────────────────────────┐
-  user_query              │              ORCHESTRATION GRAPH                      │
-      │                   │                                                       │
-      ▼                   │  planner (llama3.2:latest)                            │
-  [planner]  ─────────────┼──► decides: ticker, which agents, complexity (1-3)   │
-      │                   │    also queries episodic_memory for known failures     │
-      ▼                   │                                                       │
-  [parallel_agents] ──────┼──► BA + QF + FM + WS run concurrently               │◄─┐
-      │                   │    wall-clock = max(T_BA, T_QF, T_FM, T_WS)          │  │
-      ▼                   │                                                       │  │ loop if
-  [react_check] ──────────┼──► evaluate gaps/errors; decide loop or proceed      │  │ gaps & iters left
-      │                   │                                                       │  │
-      │  (loop)           │                                                       │──┘
-      │  (done)           │                                                       │
-      ▼                   │  summarizer (deepseek-r1:8b)                          │
-  [summarizer] (deepseek) │                                                       │
-      │                   │  memory_update                                        │
-      ▼                   │  persists failure patterns to agent_episodic_memory   │
-  [memory_update]         └──────────────────────────────────────────────────────┘
-      │
-      ▼
-   output dict / final_summary
+                          ┌─────────────────────────────────────────────────────┐
+  user_query              │              ORCHESTRATION GRAPH                     │
+      │                   │                                                      │
+      ▼                   │  planner (deepseek-chat)                             │
+  [planner]  ─────────────┼──► decides: ticker, which agents, complexity (1-3)  │
+      │                   │    also queries episodic_memory for known failures    │
+      │                   │                                                      │
+      ├──────────────────►│  node_business_analyst    ┐                         │
+      ├──────────────────►│  node_quant_fundamental   │  LangGraph native        │
+      ├──────────────────►│  node_web_search (opt)    │  fan-out — executed      │
+      ├──────────────────►│  node_financial_modelling │  simultaneously          │
+      └──────────────────►│  node_stock_research (opt)┘                         │
+                          │         │                                            │
+                          │  Per-agent conditional edges:                        │
+                          │    • if no output AND iters < max → retry agent      │
+                          │    • otherwise → node_summarizer (fan-in)            │
+                          │                                                      │
+                          │  [node_summarizer] — deepseek-chat (Stage1+2+3+4)   │
+                          │         │                                            │
+                          │  [node_post_processing]                              │
+                          │    RLAIF scoring + episodic memory persistence       │
+                          │         │                                            │
+                          │        END                                           │
+                          └─────────────────────────────────────────────────────┘
 
-ReAct loop behaviour:
-  - complexity 1 → max 1 pass  (simple metric look-up: no retry)
-  - complexity 2 → max 2 passes (moderate analysis: one retry on gaps/errors)
-  - complexity 3 → max 3 passes (full report: up to two retries on gaps/errors)
-  - On each loop iteration only agents with NO output yet (gaps) or errors are re-run.
-    A successful agent is never re-executed.
+ReAct retry behaviour (per-agent):
+  - Each agent node increments its own counter in agent_react_iterations.
+  - The conditional edge after each agent checks: no output AND counter < react_max
+    → re-route back to that agent for a retry pass.
+  - react_max is set by the planner from complexity (1=no retry, 2=1 retry, 3=2 retries).
+  - A successful agent is never re-executed.
+
+Translation:
+  - Translation (if output_language is set) is performed inside node_summarizer
+    as Stage 4 of summarise_results_structured, saving one extra API call.
 
 Usage:
     from orchestration.graph import build_graph, run
@@ -55,12 +61,14 @@ if str(_REPO_ROOT) not in sys.path:
 from langgraph.graph import END, StateGraph
 
 from .nodes import (
-    node_memory_update,
-    node_parallel_agents,
+    node_business_analyst,
+    node_financial_modelling,
     node_planner,
-    node_react_check,
-    node_rlaif_scorer,
+    node_post_processing,
+    node_quant_fundamental,
+    node_stock_research,
     node_summarizer,
+    node_web_search,
     subscribe_agent_progress,
     unsubscribe_agent_progress,
 )
@@ -69,90 +77,167 @@ from .state import OrchestrationState
 logger = logging.getLogger(__name__)
 
 
-# ── Parallel graph ────────────────────────────────────────────────────────────
+# ── Per-agent conditional edge functions ──────────────────────────────────────
+# Each returns the agent node name (for retry) or "summarizer" (to proceed).
 
-def _should_loop(state: OrchestrationState) -> str:
-    """Conditional edge router after react_check.
-
-    Returns "parallel_agents" to loop (re-run gap/error agents) or
-    "summarizer" to proceed when all agents are done or the iteration cap is reached.
-
-    The actual decision logic is mirrored from ``node_react_check``:
-      - gaps: an enabled agent produced no output
-      - errors: an enabled agent raised an exception (cleared in node_react_check for retry)
-      - iteration already incremented in node_react_check before this edge fires
-    """
-    iteration = state.get("react_iteration") or 0
-    react_max = state.get("react_max_iterations") or 1
-
-    # If we've already consumed all allowed passes, go to summarizer
-    if iteration >= react_max:
+def _route_after_ba(state: OrchestrationState) -> str:
+    """Route after business_analyst: retry if no output and under iteration cap."""
+    if not state.get("run_business_analyst"):
         return "summarizer"
-
-    # Check for gaps (enabled agents with no output) — these merit a retry
-    if state.get("run_business_analyst") and not state.get("business_analyst_outputs"):
-        return "parallel_agents"
-    if state.get("run_quant_fundamental") and not state.get("quant_fundamental_outputs"):
-        return "parallel_agents"
-    if state.get("run_web_search") and not state.get("web_search_outputs"):
-        return "parallel_agents"
-    if state.get("run_financial_modelling") and not state.get("financial_modelling_outputs"):
-        return "parallel_agents"
-
-    # No gaps — proceed to summarizer regardless of remaining iterations
+    iters = (state.get("agent_react_iterations") or {}).get("business_analyst", 0)
+    react_max = state.get("react_max_iterations") or 1
+    if not state.get("business_analyst_outputs") and iters < react_max:
+        logger.info("[route] business_analyst retry (iter=%d/%d)", iters, react_max)
+        return "node_business_analyst"
     return "summarizer"
 
 
+def _route_after_qf(state: OrchestrationState) -> str:
+    """Route after quant_fundamental: retry if no output and under iteration cap."""
+    if not state.get("run_quant_fundamental"):
+        return "summarizer"
+    iters = (state.get("agent_react_iterations") or {}).get("quant_fundamental", 0)
+    react_max = state.get("react_max_iterations") or 1
+    if not state.get("quant_fundamental_outputs") and iters < react_max:
+        logger.info("[route] quant_fundamental retry (iter=%d/%d)", iters, react_max)
+        return "node_quant_fundamental"
+    return "summarizer"
+
+
+def _route_after_ws(state: OrchestrationState) -> str:
+    """Route after web_search: retry if no output and under iteration cap."""
+    if not state.get("run_web_search"):
+        return "summarizer"
+    iters = (state.get("agent_react_iterations") or {}).get("web_search", 0)
+    react_max = state.get("react_max_iterations") or 1
+    if not state.get("web_search_outputs") and iters < react_max:
+        logger.info("[route] web_search retry (iter=%d/%d)", iters, react_max)
+        return "node_web_search"
+    return "summarizer"
+
+
+def _route_after_fm(state: OrchestrationState) -> str:
+    """Route after financial_modelling: retry if no output and under iteration cap."""
+    if not state.get("run_financial_modelling"):
+        return "summarizer"
+    iters = (state.get("agent_react_iterations") or {}).get("financial_modelling", 0)
+    react_max = state.get("react_max_iterations") or 1
+    if not state.get("financial_modelling_outputs") and iters < react_max:
+        logger.info("[route] financial_modelling retry (iter=%d/%d)", iters, react_max)
+        return "node_financial_modelling"
+    return "summarizer"
+
+
+def _route_after_sr(state: OrchestrationState) -> str:
+    """Route after stock_research: retry if no output and under iteration cap."""
+    if not state.get("run_stock_research"):
+        return "summarizer"
+    iters = (state.get("agent_react_iterations") or {}).get("stock_research", 0)
+    react_max = state.get("react_max_iterations") or 1
+    if not state.get("stock_research_outputs") and iters < react_max:
+        logger.info("[route] stock_research retry (iter=%d/%d)", iters, react_max)
+        return "node_stock_research"
+    return "summarizer"
+
+
+# ── Planner fan-out routing ────────────────────────────────────────────────────
+
+def _route_after_planner(state: OrchestrationState) -> list[str]:
+    """Fan out from planner to all enabled agent nodes simultaneously.
+
+    LangGraph executes all returned node names concurrently (native parallelism).
+    Disabled agents are not included — the graph never routes to them.
+    Always includes at least one agent to prevent routing to an empty list.
+    """
+    targets: list[str] = []
+    if state.get("run_business_analyst", True):
+        targets.append("node_business_analyst")
+    if state.get("run_quant_fundamental", True):
+        targets.append("node_quant_fundamental")
+    if state.get("run_web_search"):
+        targets.append("node_web_search")
+    if state.get("run_financial_modelling"):
+        targets.append("node_financial_modelling")
+    if state.get("run_stock_research"):
+        targets.append("node_stock_research")
+    # Fallback: if planner disabled everything, route to BA anyway
+    if not targets:
+        targets.append("node_business_analyst")
+    return targets
+
+
 def build_graph() -> Any:
-    """Assemble and compile the parallel orchestration LangGraph with ReAct loop.
+    """Assemble and compile the native parallel LangGraph orchestration graph.
 
     Topology:
-      planner → parallel_agents → react_check → (parallel_agents | summarizer)
-              → translator → memory_update → END
+      planner → [ba, qf, ws, fm, sr] (native fan-out)
+              → per-agent conditional retry edges
+              → summarizer (fan-in — waits for all branches)
+              → node_post_processing → END
 
-    All enabled agents (BA, QF, FM, WS) run concurrently inside
-    ``node_parallel_agents`` via a ThreadPoolExecutor.  After each pass,
-    ``node_react_check`` evaluates whether any enabled agents failed or produced
-    no output.  If gaps remain AND the current iteration is below
-    ``react_max_iterations`` (derived from the planner's complexity score 1-3),
-    the graph loops back to ``node_parallel_agents`` to retry only the gap agents.
-    Otherwise it advances to the summarizer.
-
-    After the summarizer, ``node_translator`` translates the final summary to the
-    requested language (if any). Then ``node_memory_update`` persists any failure patterns
-    to the ``agent_episodic_memory`` PostgreSQL table for future pre-emption.
+    Translation (if output_language set) is done inside node_summarizer Stage 4.
+    RLAIF scoring + episodic memory are merged in node_post_processing.
 
     Returns a compiled StateGraph ready to call with .invoke() or .stream().
     """
-    from .nodes import node_translator, node_rlaif_scorer
-
     graph = StateGraph(OrchestrationState)
 
-    graph.add_node("planner",          node_planner)
-    graph.add_node("parallel_agents",  node_parallel_agents)
-    graph.add_node("react_check",      node_react_check)
-    graph.add_node("summarizer",       node_summarizer)
-    graph.add_node("rlaif_scorer",     node_rlaif_scorer)
-    graph.add_node("translator",       node_translator)
-    graph.add_node("memory_update",    node_memory_update)
+    # Register nodes
+    graph.add_node("planner",                node_planner)
+    graph.add_node("node_business_analyst",  node_business_analyst)
+    graph.add_node("node_quant_fundamental", node_quant_fundamental)
+    graph.add_node("node_web_search",        node_web_search)
+    graph.add_node("node_financial_modelling", node_financial_modelling)
+    graph.add_node("node_stock_research",    node_stock_research)
+    graph.add_node("summarizer",             node_summarizer)
+    graph.add_node("post_processing",        node_post_processing)
 
+    # Entry point
     graph.set_entry_point("planner")
-    graph.add_edge("planner",          "parallel_agents")
-    graph.add_edge("parallel_agents",  "react_check")
 
+    # Fan-out: planner → all enabled agents simultaneously (native LangGraph parallel)
     graph.add_conditional_edges(
-        "react_check",
-        _should_loop,
+        "planner",
+        _route_after_planner,
         {
-            "parallel_agents": "parallel_agents",
-            "summarizer":      "summarizer",
+            "node_business_analyst":   "node_business_analyst",
+            "node_quant_fundamental":  "node_quant_fundamental",
+            "node_web_search":         "node_web_search",
+            "node_financial_modelling":"node_financial_modelling",
+            "node_stock_research":     "node_stock_research",
         },
     )
 
-    graph.add_edge("summarizer",       "rlaif_scorer")
-    graph.add_edge("rlaif_scorer",    "translator")
-    graph.add_edge("translator",       "memory_update")
-    graph.add_edge("memory_update",    END)
+    # Per-agent retry edges: each agent → retry self OR proceed to summarizer
+    graph.add_conditional_edges(
+        "node_business_analyst",
+        _route_after_ba,
+        {"node_business_analyst": "node_business_analyst", "summarizer": "summarizer"},
+    )
+    graph.add_conditional_edges(
+        "node_quant_fundamental",
+        _route_after_qf,
+        {"node_quant_fundamental": "node_quant_fundamental", "summarizer": "summarizer"},
+    )
+    graph.add_conditional_edges(
+        "node_web_search",
+        _route_after_ws,
+        {"node_web_search": "node_web_search", "summarizer": "summarizer"},
+    )
+    graph.add_conditional_edges(
+        "node_financial_modelling",
+        _route_after_fm,
+        {"node_financial_modelling": "node_financial_modelling", "summarizer": "summarizer"},
+    )
+    graph.add_conditional_edges(
+        "node_stock_research",
+        _route_after_sr,
+        {"node_stock_research": "node_stock_research", "summarizer": "summarizer"},
+    )
+
+    # Fan-in: LangGraph waits for all branches before proceeding to summarizer
+    graph.add_edge("summarizer",      "post_processing")
+    graph.add_edge("post_processing", END)
 
     return graph.compile()
 
@@ -214,6 +299,7 @@ def run(
         "session_id": session_id,
         "react_steps": [],
         "react_iteration": 0,
+        "agent_react_iterations": {},
         "agent_errors": {},
         "output_language": output_language,
     }
@@ -240,10 +326,9 @@ def stream(
     *before* the graph starts running (call subscribe_agent_progress(session_id)
     after receiving this first event).
 
-    In the parallel graph the nodes are:
-      planner → parallel_agents → react_check → summarizer → translator → memory_update.
-    For complexity-1 queries the UI sees exactly six node events.  For
-    complexity-2/3 queries, parallel_agents + react_check may repeat.
+    In the native parallel graph, agent nodes run simultaneously.
+    The UI progress queue receives per-agent "started"/"done"/"error" events
+    pushed directly from each agent node.
     """
     if not session_id:
         session_id = str(uuid.uuid4())[:12]
@@ -253,6 +338,7 @@ def stream(
         "session_id": session_id,
         "react_steps": [],
         "react_iteration": 0,
+        "agent_react_iterations": {},
         "agent_errors": {},
         "output_language": output_language,
     }

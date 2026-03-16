@@ -427,19 +427,23 @@ def _node_macro_environment(state: AgentState) -> AgentState:
     if bundle is None:
         return state
 
-    # ── 10Y Treasury (already in bundle) ─────────────────────────────────
+    # ── 10Y & 2Y Treasury from dedicated table ───────────────────────────
     rf: float = 0.043
-    if bundle.treasury_rates:
-        row = bundle.treasury_rates[0]
-        for key in ("year10", "tenYear", "10Y", "ten_year", "y10"):
-            v = row.get(key)
-            if v is not None:
-                try:
-                    fv = float(v)
-                    rf = fv / 100 if fv > 1 else fv
-                    break
-                except (TypeError, ValueError):
-                    pass
+    _rate_2y_raw: Optional[float] = None
+    for _tr in bundle.treasury_rates_dedicated:
+        _ind = str(_tr.get("indicator") or "").upper()
+        _v = _tr.get("rate")
+        if _v is None:
+            continue
+        try:
+            _fv = float(_v)
+            _fv_dec = _fv / 100 if _fv > 1 else _fv
+            if _ind == "US10Y":
+                rf = _fv_dec
+            elif _ind == "US2Y":
+                _rate_2y_raw = _fv_dec
+        except (TypeError, ValueError):
+            pass
 
     # ── HV30 VIX proxy ───────────────────────────────────────────────────
     hv30: Optional[float] = compute_benchmark_hv30(bundle.benchmark_history)
@@ -520,22 +524,33 @@ def _node_macro_environment(state: AgentState) -> AgentState:
     macro_env["fx_rates_summary"] = fx_summary
 
     # ── Interest rate sensitivity ─────────────────────────────────────────
-    # 2Y yield spread (yield curve slope) — if available from macro_indicators
-    rate_2y: Optional[float] = None
+    # 2Y yield from dedicated treasury table (populated above)
+    rate_2y: Optional[float] = _rate_2y_raw
     cpi_yoy: Optional[float] = None
     ppi_yoy: Optional[float] = None
-    if bundle.macro_indicators:
-        for row in bundle.macro_indicators:
-            key_name = str(row.get("indicator") or row.get("name") or "").lower()
-            val = _sf(row.get("value"))
-            if val is None:
-                continue
-            if "2y" in key_name or "2 year" in key_name or "two_year" in key_name:
-                rate_2y = val / 100 if val > 1 else val
-            elif "cpi" in key_name and "yoy" in key_name:
-                cpi_yoy = val / 100 if val > 10 else val
-            elif "ppi" in key_name and "yoy" in key_name:
-                ppi_yoy = val / 100 if val > 10 else val
+
+    # ── CPI YoY from global_macro_indicators ─────────────────────────────
+    # global_macro_indicators stores annual CPI index (2010=100).
+    # rows are dicts: {"indicator": "cpi", "ts_date": "...", "payload": {...}, "source": "..."}
+    # payload has key "Value" (the index level). Compute YoY from the two most recent rows.
+    cpi_rows = sorted(
+        [r for r in bundle.macro_indicators if str(r.get("indicator") or "").lower() == "cpi"],
+        key=lambda r: r.get("ts_date") or "",
+        reverse=True,
+    )
+    if len(cpi_rows) >= 2:
+        def _cpi_val(row: Dict) -> Optional[float]:
+            pl = row.get("payload") or {}
+            if isinstance(pl, str):
+                try:
+                    pl = json.loads(pl)
+                except Exception:
+                    return None
+            return _sf(pl.get("Value") or pl.get("value"))
+        v_current = _cpi_val(cpi_rows[0])
+        v_prev = _cpi_val(cpi_rows[1])
+        if v_current and v_prev and v_prev != 0:
+            cpi_yoy = round((v_current - v_prev) / v_prev, 5)  # already a decimal ratio
 
     yield_curve_slope = round(rf - rate_2y, 5) if rate_2y is not None else None  # 10Y - 2Y
     macro_env["yield_curve_slope_10y_2y"] = yield_curve_slope

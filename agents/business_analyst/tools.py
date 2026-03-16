@@ -6,9 +6,7 @@ Changes vs original:
     (2) TextBlob if VADER unavailable, then (3) raw chunk-count heuristic.
     Result is returned as a SentimentSnapshot with source annotation.
   - get_sentiment_snapshot() added as a clean single-call entry point that
-    orchestrates pg → local fallback → logs clearly.
-  - Rule-based query pre-classifier added (_rule_based_classify) to cheaply
-    detect COMPLEX queries before calling the LLM classifier.
+    orchestrates pg -> local fallback -> logs clearly.
 """
 
 from __future__ import annotations
@@ -123,30 +121,6 @@ def _is_boilerplate(text: str) -> bool:
 # ──────────────────────────────────────────────────────────────────────────────
 # Rule-based pre-classifier (fast, no LLM call needed)
 # ──────────────────────────────────────────────────────────────────────────────
-
-# Keywords that reliably indicate a COMPLEX (analytical) query.
-_COMPLEX_KEYWORDS = frozenset([
-    "moat", "competitive advantage", "risk", "threat", "guidance",
-    "sentiment trend", "outlook", "strategy", "valuation", "forecast",
-    "why", "explain", "compare", "versus", "vs", "analysis",
-    "long-term", "short-term", "catalyst", "headwind", "tailwind",
-    "margin", "growth rate", "dcf", "intrinsic value",
-])
-
-def rule_based_classify(query: str) -> Optional[str]:
-    """
-    Fast rule-based pre-classifier that returns 'complex' when the query
-    contains analytical keywords, or None to fall through to the LLM classifier.
-
-    Returning None means "no strong signal — let the LLM decide".
-    This runs before any LLM call so it adds zero latency on obvious cases.
-    """
-    q_lower = query.lower()
-    for kw in _COMPLEX_KEYWORDS:
-        if kw in q_lower:
-            logger.debug("[rule_based_classify] keyword=%r → complex", kw)
-            return "complex"
-    return None  # Fall through to LLM classifier
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -704,8 +678,14 @@ class Neo4jConnector:
         company_name = ticker
         try:
             with self.driver.session(database=None) as session:
+                # Company nodes only carry 'ticker'; the human-readable name
+                # lives on the connected DataRecord node as 'Name'.
                 name_result = session.run(
-                    "MATCH (c:Company {ticker: $ticker}) RETURN c.name AS name LIMIT 1",
+                    """
+                    MATCH (c:Company {ticker: $ticker})-[:HAS_DATA]->(d:DataRecord)
+                    WHERE d.Name IS NOT NULL
+                    RETURN d.Name AS name LIMIT 1
+                    """,
                     ticker=ticker,
                 )
                 name_row = name_result.single()
@@ -2044,5 +2024,4 @@ __all__ = [
     "CRAGEvaluation",
     "Neo4jConnector",
     "PostgresConnector",
-    "rule_based_classify",
 ]

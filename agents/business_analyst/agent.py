@@ -3,37 +3,33 @@
 Architecture:
 
     Query + Ticker
-        │
-        ▼
-    metadata_precheck         ←  Neo4j chunk counts, pgvector status, sentiment availability
-        │
-        ▼
-    precheck_data_coverage    ←  Coverage warnings, sentiment freshness, sentiment-query short-circuit
-        │
-        ▼
-    fetch_sentiment_data      ←  PostgreSQL sentiment snapshot (with 7-day recency gate + NLP fallback)
-        │
-        ▼
-    classify_query            ←  LLM (lightweight): SIMPLE / NUMERICAL / COMPLEX
-        │
-        ├─ SIMPLE     → fast_path_retrieval  (vector + BM25, small top_k) → generate_analysis
-        ├─ NUMERICAL  → numerical_path       (Cypher metric extraction + sentiment fetch) → generate_analysis
-        └─ COMPLEX    → complex_retrieval    (multi-stage bi+cross-encoder + RRF + graph) → crag_evaluate
-                                                 │
-                                                 ▼
-    crag_evaluate             ←  CORRECT (>0.6) / AMBIGUOUS (0.4-0.6) / INCORRECT (<0.4)
-        │
-        ├─ CORRECT    → generate_analysis
-        ├─ AMBIGUOUS  → rewrite_query → retry complex_retrieval (max 2 loops)
-        └─ INCORRECT  → web_search_fallback → generate_analysis
-        │
-        ▼ (All paths converge)
-    semantic_cache_check      ←  Hit? Return cached → Miss? Proceed + cache result
-        │
-        ▼
-    format_json_output        ←  Structured JSON for Supervisor
-        │
-       END → return to Supervisor
+        |
+        v
+    metadata_precheck         <- Neo4j chunk counts, pgvector status, sentiment availability
+        |
+        v
+    precheck_data_coverage    <- Coverage warnings, sentiment freshness, sentiment-query short-circuit
+        |
+        v
+    fetch_sentiment_data      <- PostgreSQL sentiment snapshot (with 7-day recency gate + NLP fallback)
+        |
+        v
+    complex_retrieval         <- unified multi-stage retrieval (Neo4j + pgvector + BM25 + CE + RRF)
+        |
+        v
+    generate_analysis         <- LLM decides whether context is sufficient
+        |
+        +-> INSUFFICIENT_DATA -> web_search_fallback
+        |                         |
+        +-------------------------+
+        |
+        v
+    semantic_cache_check      <- Hit? Return cached -> Miss? Proceed + cache result
+        |
+        v
+    format_json_output        <- Structured JSON for Supervisor
+        |
+       END -> return to Supervisor
 
 Usage (CLI):
     python -m agents.business_analyst.agent --ticker AAPL
@@ -73,7 +69,7 @@ from langgraph.graph import END, StateGraph
 from .config import BusinessAnalystConfig, load_config
 from .llm import LLMClient
 from .schema import CRAGStatus, MetadataProfile, RetrievalResult, SentimentSnapshot, serialise_chunk
-from .tools import BusinessAnalystToolkit, rule_based_classify
+from .tools import BusinessAnalystToolkit
 from .web_search_interface import web_search_fallback as _call_web_search
 
 logger = logging.getLogger(__name__)
@@ -137,9 +133,6 @@ class AgentState(TypedDict, total=False):
     # Availability profile (optional, injected by orchestration planner)
     availability_profile: Optional[Dict[str, bool]]
 
-    # Query classification — SIMPLE / NUMERICAL / COMPLEX
-    query_class: Optional[str]
-
     # Metadata pre-check profile (Neo4j counts, pgvector status, sentiment flag)
     metadata_profile: Optional[MetadataProfile]
 
@@ -153,7 +146,6 @@ class AgentState(TypedDict, total=False):
     company_node: Optional[Dict[str, Any]]   # raw Neo4j Company node properties
     community_summary: Optional[str]         # graph-community summary (2A: Graph RAG)
     retrieval: Optional[RetrievalResult]
-    rewrite_count: int          # guard: max config.max_rewrite_loops rewrites
 
     # CRAG evaluation
     crag_status: Optional[CRAGStatus]
@@ -456,53 +448,6 @@ def _node_precheck_data_coverage(state: AgentState) -> AgentState:
     return cast(AgentState, base)
 
 
-def _node_classify_query(
-    state: AgentState,
-    toolkit: BusinessAnalystToolkit,
-    llm: LLMClient,
-) -> AgentState:
-    """Classify the query as SIMPLE, NUMERICAL, or COMPLEX using a lightweight LLM.
-
-    A fast rule-based pre-classifier runs first (zero-latency keyword check).
-    If it produces a confident result, the LLM call is skipped entirely.
-
-    - SIMPLE   → fast_path_retrieval (vector + BM25, small top_k, <3 s target)
-    - NUMERICAL → numerical_path (Cypher time-series + sentiment metrics)
-    - COMPLEX  → complex_retrieval (multi-stage bi+cross-encoder + RRF + graph)
-
-    Falls back to COMPLEX on any error so the full pipeline is always available.
-    """
-    query = state.get("task", "")
-    _print_progress("CLASSIFY QUERY", f"query={query[:80]!r}")
-    t0 = time.monotonic()
-
-    # --- Rule-based pre-classifier (no LLM call) ---
-    rule_result = rule_based_classify(query)
-    if rule_result is not None:
-        query_class = rule_result.upper()
-        elapsed = time.monotonic() - t0
-        logger.info(
-            "[ClassifyQuery] rule-based classifier → class=%s (skipped LLM)", query_class
-        )
-        _print_progress(
-            "CLASSIFY QUERY done",
-            f"class={query_class}  method=rule-based  ({elapsed:.2f}s)",
-            symbol="  OK",
-        )
-        return {**state, "query_class": query_class}
-
-    # --- LLM classifier (lightweight model) ---
-    query_class = llm.classify_query(query)
-    elapsed = time.monotonic() - t0
-    logger.info("[ClassifyQuery] query=%r → class=%s (LLM)", query[:80], query_class)
-    _print_progress(
-        "CLASSIFY QUERY done",
-        f"class={query_class}  method=llm  ({elapsed:.2f}s)",
-        symbol="  OK",
-    )
-    return {**state, "query_class": query_class}
-
-
 def _node_fetch_sentiment(state: AgentState, toolkit: BusinessAnalystToolkit) -> AgentState:
     """Fetch bullish/bearish/neutral % from PostgreSQL sentiment_trends.
     Also fetches the Company node properties from Neo4j for company_overview,
@@ -527,80 +472,6 @@ def _node_fetch_sentiment(state: AgentState, toolkit: BusinessAnalystToolkit) ->
     if community_summary:
         logger.info("[BA] Graph community summary for %s: %s", ticker, community_summary[:120])
     return {**state, "sentiment": sentiment, "company_node": company_node, "community_summary": community_summary}
-
-
-def _node_fast_path_retrieval(state: AgentState, toolkit: BusinessAnalystToolkit) -> AgentState:
-    """Fast-path retrieval for SIMPLE queries.
-
-    Uses a smaller top_k budget (``config.fast_path_top_k``) and skips
-    graph traversal and cross-encoder reranking to minimise latency.
-    Target: <3 s wall-clock on warm cache.
-
-    Pre-sets crag_status=CORRECT and confidence=1.0 because SIMPLE queries
-    bypass CRAG evaluation entirely — the retrieved context is used directly.
-    """
-    query = state.get("task", "")
-    ticker = state.get("ticker")
-    if ticker and not query.upper().startswith(ticker.upper()):
-        query = f"{ticker.upper()}: {query}"
-    _print_progress("FAST PATH RETRIEVAL", f"ticker={ticker}")
-    t0 = time.monotonic()
-    retrieval = toolkit.retrieve_fast(query, ticker)
-    elapsed = time.monotonic() - t0
-    n_chunks = len(retrieval.chunks) if retrieval else 0
-    top_score = retrieval.chunks[0].score if (retrieval and retrieval.chunks) else 0.0
-    _print_progress(
-        "FAST PATH RETRIEVAL done",
-        f"chunks={n_chunks}  top_score={top_score:.3f}  ({elapsed:.2f}s)",
-        symbol="  OK",
-    )
-    return {
-        **state,
-        "retrieval": retrieval,
-        "crag_status": CRAGStatus.CORRECT,
-        "confidence": 1.0,
-    }
-
-
-def _node_numerical_path(state: AgentState, toolkit: BusinessAnalystToolkit) -> AgentState:
-    """Numerical-path retrieval for NUMERICAL queries.
-
-    Uses the fast-path retriever (sufficient for metric lookups) and
-    additionally ensures sentiment data is fetched when not already present.
-
-    Pre-sets crag_status=CORRECT and confidence=1.0 because NUMERICAL queries
-    bypass CRAG evaluation entirely.
-    """
-    query = state.get("task", "")
-    ticker = state.get("ticker")
-    if ticker and not query.upper().startswith(ticker.upper()):
-        query = f"{ticker.upper()}: {query}"
-    _print_progress("NUMERICAL PATH RETRIEVAL", f"ticker={ticker}")
-    t0 = time.monotonic()
-    retrieval = toolkit.retrieve_fast(query, ticker)
-    elapsed = time.monotonic() - t0
-    n_chunks = len(retrieval.chunks) if retrieval else 0
-    _print_progress(
-        "NUMERICAL PATH RETRIEVAL done",
-        f"chunks={n_chunks}  ({elapsed:.2f}s)",
-        symbol="  OK",
-    )
-    # Ensure sentiment is available for numerical context
-    if state.get("sentiment") is None and ticker:
-        sentiment = toolkit.fetch_sentiment(ticker)
-        return {
-            **state,
-            "retrieval": retrieval,
-            "sentiment": sentiment,
-            "crag_status": CRAGStatus.CORRECT,
-            "confidence": 1.0,
-        }
-    return {
-        **state,
-        "retrieval": retrieval,
-        "crag_status": CRAGStatus.CORRECT,
-        "confidence": 1.0,
-    }
 
 
 def _node_complex_retrieval(state: AgentState, toolkit: BusinessAnalystToolkit) -> AgentState:
@@ -639,37 +510,6 @@ def _node_complex_retrieval(state: AgentState, toolkit: BusinessAnalystToolkit) 
         symbol="  OK",
     )
     return {**state, "retrieval": retrieval}
-
-
-def _node_crag_evaluate(state: AgentState, toolkit: BusinessAnalystToolkit) -> AgentState:
-    """Score top retrieved chunks and classify as CORRECT / AMBIGUOUS / INCORRECT."""
-    retrieval: Optional[RetrievalResult] = state.get("retrieval")
-    chunks = retrieval.chunks if retrieval else []
-    ticker = state.get("ticker")
-    query = state.get("task", "")
-    _print_progress("CRAG EVALUATE", f"ticker={ticker}  chunks_to_score={len(chunks)}")
-    t0 = time.monotonic()
-    evaluation = toolkit.evaluate(chunks, ticker=ticker)
-    elapsed = time.monotonic() - t0
-    _print_progress(
-        "CRAG EVALUATE done",
-        f"status={evaluation.status.value}  confidence={evaluation.confidence:.3f}  ({elapsed:.2f}s)",
-        symbol="  OK",
-    )
-    # Structured per-query CRAG log — useful for threshold calibration and monitoring
-    logger.info(
-        "[CRAG] query=%r score=%.3f decision=%s chunks_retrieved=%d rewrite_count=%d",
-        query[:80],
-        evaluation.confidence,
-        evaluation.status.value,
-        len(chunks),
-        state.get("rewrite_count", 0),
-    )
-    return {
-        **state,
-        "crag_status": evaluation.status,
-        "confidence": evaluation.confidence,
-    }
 
 
 def _node_generate_analysis(state: AgentState, llm: LLMClient) -> AgentState:
@@ -843,17 +683,6 @@ def _node_generate_analysis(state: AgentState, llm: LLMClient) -> AgentState:
             "crag_status": state.get("crag_status", CRAGStatus.INCORRECT).value  # type: ignore[union-attr]
         }
     return {**state, "llm_output": raw, "fallback_triggered": False}
-
-
-def _node_rewrite_query(state: AgentState, llm: LLMClient) -> AgentState:
-    """Rewrite the query to improve retrieval (AMBIGUOUS path, max 1 iteration)."""
-    original_query = state.get("task", "")
-    _print_progress("REWRITE QUERY", f"original={original_query[:80]!r}")
-    rewritten = llm.rewrite_query(original_query)
-    logger.info("Query rewritten: %r → %r", original_query, rewritten)
-    _print_progress("REWRITE QUERY done", f"rewritten={rewritten[:80]!r}", symbol="  OK")
-    rewrite_count = state.get("rewrite_count", 0) + 1
-    return {**state, "task": rewritten, "rewrite_count": rewrite_count}
 
 
 def _node_web_search_fallback(state: AgentState, toolkit: BusinessAnalystToolkit) -> AgentState:
@@ -1596,72 +1425,13 @@ def _extract_company_overview_from_graph(
 # Routing functions
 # ---------------------------------------------------------------------------
 
-def _route_after_crag(state: AgentState, toolkit: BusinessAnalystToolkit) -> str:
-    """Branch after CRAG evaluation.
+def _route_after_sentiment(state: AgentState) -> str:
+    """Route after fetch_sentiment_data.
 
-    Routing logic:
-    - CORRECT (score >= config.crag_correct_threshold)    → generate_analysis immediately
-    - AMBIGUOUS (between thresholds)                       → rewrite_query up to max_rewrite_loops,
-                                                             then generate_analysis
-    - INCORRECT (score < config.crag_ambiguous_threshold) → web_search_fallback only if
-                                                             enable_web_fallback=True AND
-                                                             there is genuinely no local data;
-                                                             otherwise → generate_analysis
-
-    The web_search_fallback is a last resort, not a default for low cosine scores.
-    """
-    crag_status = state.get("crag_status")
-    rewrite_count = state.get("rewrite_count", 0)
-    max_loops = toolkit.config.max_rewrite_loops
-
-    if crag_status == CRAGStatus.CORRECT:
-        return "generate_analysis"
-
-    if crag_status == CRAGStatus.AMBIGUOUS and rewrite_count < max_loops:
-        return "rewrite_query"
-
-    # AMBIGUOUS loop exhausted or INCORRECT — log the outcome
-    if crag_status == CRAGStatus.AMBIGUOUS and rewrite_count >= max_loops:
-        logger.warning(
-            "[CRAG] Max rewrite loops reached (%d/%d) for ticker=%s — "
-            "proceeding to generate from available local data or web fallback.",
-            rewrite_count, max_loops, state.get("ticker"),
-        )
-    elif crag_status == CRAGStatus.INCORRECT:
-        logger.warning(
-            "[CRAG] INCORRECT verdict (confidence=%.3f) for ticker=%s — "
-            "checking for local data before triggering web fallback.",
-            state.get("confidence", 0.0), state.get("ticker"),
-        )
-    retrieval: Optional[RetrievalResult] = state.get("retrieval")
-    has_chunks = bool(retrieval and retrieval.chunks)
-    has_graph = bool(retrieval and retrieval.graph_facts)
-    has_sentiment = state.get("sentiment") is not None
-
-    if has_chunks or has_graph or has_sentiment:
-        # Local data exists — let the LLM generate from what we have.
-        # The system prompt instructs it to surface gaps in missing_context.
-        return "generate_analysis"
-
-    # Truly no data at all — use web fallback if enabled, else generate anyway
-    # (LLM will produce INSUFFICIENT_DATA response per prompt instructions)
-    if toolkit.config.enable_web_fallback:
-        return "web_search_fallback"
-    return "generate_analysis"
-
-
-def _route_after_rewrite(state: AgentState) -> str:
-    """Always go back to complex retrieval after a query rewrite."""
-    return "complex_retrieval"
-
-
-def _route_after_classification(state: AgentState) -> str:
-    """Route to the appropriate retrieval path based on query_class.
-
-    Short-circuit: if a precheck node already set crag_status=CORRECT (e.g.
-    fresh sentiment data for a sentiment-focused query), skip all retrieval and
-    jump straight to generate_analysis.  This prevents crag_evaluate from
-    overwriting the CORRECT status with INCORRECT (0 chunks scored).
+    Short-circuit: if precheck_data_coverage pre-set crag_status=CORRECT
+    (e.g. fresh sentiment data for a sentiment-focused query), jump straight
+    to generate_analysis to avoid running retrieval on pure sentiment queries.
+    Otherwise proceed to complex_retrieval.
     """
     if state.get("crag_status") == CRAGStatus.CORRECT:
         logger.info(
@@ -1669,13 +1439,21 @@ def _route_after_classification(state: AgentState) -> str:
             "routing directly to generate_analysis."
         )
         return "generate_analysis"
-
-    query_class = (state.get("query_class") or "COMPLEX").upper()
-    if query_class == "SIMPLE":
-        return "fast_path_retrieval"
-    if query_class == "NUMERICAL":
-        return "numerical_path"
     return "complex_retrieval"
+
+
+def _route_after_generation(state: AgentState) -> str:
+    """Route after generate_analysis.
+
+    If the LLM declared INSUFFICIENT_DATA, trigger the web search fallback.
+    Otherwise proceed to semantic cache check for normal output formatting.
+    """
+    llm_output = state.get("llm_output") or {}
+    summary = llm_output.get("qualitative_summary", "") or ""
+    if summary.startswith("INSUFFICIENT_DATA"):
+        logger.warning("LLM returned INSUFFICIENT_DATA — triggering web fallback.")
+        return "web_search_fallback"
+    return "semantic_cache_check"
 
 
 # ---------------------------------------------------------------------------
@@ -1704,47 +1482,23 @@ def build_graph(
         lambda state: _node_fetch_sentiment(cast(AgentState, state), toolkit),
     )
 
-    # --- Phase 2: Query classification ---
-    graph.add_node(
-        "classify_query",
-        lambda state: _node_classify_query(cast(AgentState, state), toolkit, llm),
-    )
-
-    # --- Phase 3: Adaptive retrieval paths ---
-    graph.add_node(
-        "fast_path_retrieval",
-        lambda state: _node_fast_path_retrieval(cast(AgentState, state), toolkit),
-    )
-    graph.add_node(
-        "numerical_path",
-        lambda state: _node_numerical_path(cast(AgentState, state), toolkit),
-    )
+    # --- Phase 2: Unified retrieval (always multi-stage) ---
     graph.add_node(
         "complex_retrieval",
         lambda state: _node_complex_retrieval(cast(AgentState, state), toolkit),
     )
 
-    # --- Phase 4: CRAG evaluate (complex path only) ---
-    graph.add_node(
-        "crag_evaluate",
-        lambda state: _node_crag_evaluate(cast(AgentState, state), toolkit),
-    )
-
-    # --- Phase 5: Generation ---
+    # --- Phase 3: Generation ---
     graph.add_node(
         "generate_analysis",
         lambda state: _node_generate_analysis(cast(AgentState, state), llm),
-    )
-    graph.add_node(
-        "rewrite_query",
-        lambda state: _node_rewrite_query(cast(AgentState, state), llm),
     )
     graph.add_node(
         "web_search_fallback",
         lambda state: _node_web_search_fallback(cast(AgentState, state), toolkit),
     )
 
-    # --- Phase 6: Semantic cache check + output formatting ---
+    # --- Phase 4: Semantic cache check + output formatting ---
     graph.add_node(
         "semantic_cache_check",
         lambda state: _node_semantic_cache_check(cast(AgentState, state), toolkit),
@@ -1757,51 +1511,36 @@ def build_graph(
     # Entry point
     graph.set_entry_point("metadata_precheck")
 
-    # Phase 1 → Phase 2
+    # Phase 1: linear pre-check chain
     graph.add_edge("metadata_precheck", "precheck_data_coverage")
     graph.add_edge("precheck_data_coverage", "fetch_sentiment_data")
-    graph.add_edge("fetch_sentiment_data", "classify_query")
 
-    # Phase 2 → Phase 3: three-way adaptive routing
-    # Note: "generate_analysis" is also a valid target when precheck pre-sets crag_status=CORRECT.
+    # After sentiment: short-circuit to generate_analysis if precheck set CORRECT,
+    # otherwise always go through complex_retrieval.
     graph.add_conditional_edges(
-        "classify_query",
-        lambda state: _route_after_classification(cast(AgentState, state)),
+        "fetch_sentiment_data",
+        lambda state: _route_after_sentiment(cast(AgentState, state)),
         {
-            "fast_path_retrieval": "fast_path_retrieval",
-            "numerical_path": "numerical_path",
+            "generate_analysis": "generate_analysis",
             "complex_retrieval": "complex_retrieval",
-            "generate_analysis": "generate_analysis",
         },
     )
 
-    # SIMPLE and NUMERICAL paths skip CRAG and go straight to generation
-    graph.add_edge("fast_path_retrieval", "generate_analysis")
-    graph.add_edge("numerical_path", "generate_analysis")
+    # Retrieval always feeds directly into generation (no CRAG gating)
+    graph.add_edge("complex_retrieval", "generate_analysis")
 
-    # COMPLEX path goes through CRAG evaluate
-    graph.add_edge("complex_retrieval", "crag_evaluate")
-
-    # Conditional branching after CRAG evaluation (complex path only)
+    # After generation: if LLM declares INSUFFICIENT_DATA → web fallback,
+    # otherwise proceed to semantic cache check.
     graph.add_conditional_edges(
-        "crag_evaluate",
-        lambda state: _route_after_crag(cast(AgentState, state), toolkit),
+        "generate_analysis",
+        lambda state: _route_after_generation(cast(AgentState, state)),
         {
-            "generate_analysis": "generate_analysis",
-            "rewrite_query": "rewrite_query",
             "web_search_fallback": "web_search_fallback",
+            "semantic_cache_check": "semantic_cache_check",
         },
     )
 
-    # After rewrite → back to complex retrieval (creates the AMBIGUOUS loop)
-    graph.add_conditional_edges(
-        "rewrite_query",
-        _route_after_rewrite,
-        {"complex_retrieval": "complex_retrieval"},
-    )
-
-    # All generation paths converge → semantic cache check → output formatting
-    graph.add_edge("generate_analysis", "semantic_cache_check")
+    # Web fallback rejoins the main path
     graph.add_edge("web_search_fallback", "semantic_cache_check")
     graph.add_edge("semantic_cache_check", "format_json_output")
 
@@ -1848,7 +1587,6 @@ def run(
     initial_state: AgentState = {
         "task": task,
         "ticker": ticker,
-        "rewrite_count": 0,
         "fallback_triggered": False,
         "availability_profile": availability_profile,
     }

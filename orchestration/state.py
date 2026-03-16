@@ -1,7 +1,8 @@
 """Shared state schema for the orchestration LangGraph pipeline.
 
 This TypedDict is the single source of truth for data flowing between:
-  planner → [business_analyst, quant_fundamental, web_search, financial_modelling] → summarizer
+  planner → [business_analyst, quant_fundamental, web_search, financial_modelling,
+             stock_research] → summarizer
 
 Multi-ticker support
 --------------------
@@ -18,7 +19,15 @@ For backward-compatibility, the legacy single-value keys
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, TypedDict
+import operator
+from typing import Annotated, Any, Dict, List, Optional, TypedDict
+
+
+def _merge_dicts(a: Optional[Dict], b: Optional[Dict]) -> Dict:
+    """Merge two dicts, with b taking precedence on key conflicts."""
+    result = dict(a or {})
+    result.update(b or {})
+    return result
 
 
 class OrchestrationState(TypedDict, total=False):
@@ -39,11 +48,15 @@ class OrchestrationState(TypedDict, total=False):
     run_quant_fundamental: bool             # whether to call quant agent
     run_web_search: bool                    # whether to call web search agent
     run_financial_modelling: bool           # whether to call financial modelling agent
+    run_stock_research: bool                # whether to call stock research (PDF broker/transcript) agent
 
     # ── ReAct iteration tracking ─────────────────────────────────────────────
-    react_steps: List[Dict[str, Any]]       # [{tool, input, observation}, ...]
+    # react_steps uses operator.add so concurrent agent writes are concatenated
+    react_steps: Annotated[List[Dict[str, Any]], operator.add]  # [{tool, input, observation}, ...]
     react_iteration: int                    # current pass index (0-based)
     react_max_iterations: int               # max passes allowed — set by planner from complexity (1-3)
+    # Per-agent independent retry counters — _merge_dicts so concurrent writes are merged
+    agent_react_iterations: Annotated[Optional[Dict[str, int]], _merge_dicts]  # {agent_name: retry_count}
 
     # ── Agent raw outputs (multi-ticker lists) ───────────────────────────────
     # Each list contains one result dict per ticker in ``tickers``.
@@ -51,12 +64,14 @@ class OrchestrationState(TypedDict, total=False):
     quant_fundamental_outputs: List[Dict[str, Any]]
     web_search_outputs: List[Dict[str, Any]]
     financial_modelling_outputs: List[Dict[str, Any]]
+    stock_research_outputs: List[Dict[str, Any]]
 
     # Legacy single-output aliases — set to outputs[0] for backward-compat
     business_analyst_output: Optional[Dict[str, Any]]
     quant_fundamental_output: Optional[Dict[str, Any]]
     web_search_output: Optional[Dict[str, Any]]
     financial_modelling_output: Optional[Dict[str, Any]]
+    stock_research_output: Optional[Dict[str, Any]]
 
     # ── Data availability snapshot ───────────────────────────────────────────
     # Populated by node_planner once per request; consumed by all agent nodes
@@ -70,7 +85,8 @@ class OrchestrationState(TypedDict, total=False):
     episodic_hints: Optional[Dict[str, Any]]
 
     # ── Errors ───────────────────────────────────────────────────────────────
-    agent_errors: Dict[str, str]            # {agent_name: error_message}
+    # _merge_dicts so concurrent parallel agent writes are combined
+    agent_errors: Annotated[Dict[str, str], _merge_dicts]  # {agent_name: error_message}
 
     # ── Thinking traces ──────────────────────────────────────────────────────
     planner_trace: Optional[str]            # DeepSeek reasoning from node_planner

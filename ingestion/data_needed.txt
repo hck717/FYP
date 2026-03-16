@@ -1,5 +1,4 @@
-====================================================================================================
-EODHD API DATA INGESTION - COMPLETE REFERENCE GUIDE
+# EODHD API DATA INGESTION - COMPLETE REFERENCE GUIDE
 ====================================================================================================
 
 ## SECTION 1: ALL DATA TYPES FROM EODHD API
@@ -7,135 +6,174 @@ EODHD API DATA INGESTION - COMPLETE REFERENCE GUIDE
 
 Data Type                                      | Source | Destination     | Date Range / Coverage                  | What It Unlocks
 -----------------------------------------------|--------|-----------------|----------------------------------------|----------------------------------------------
-Company Profiles / Tickers                     | EODHD  | PostgreSQL      | Current snapshot                       | Global 150k+ tickers across 70+ exchanges (Code, Type, Name, Exchange, CurrencyCode, CurrencyName, CurrencySymbol, CountryName, CountryISO, OpenFigi, ISIN, LEI, PrimaryTicker, CUSIP, CIK, EmployerIdNumber, FiscalYearEnd, IPODate, InternationalDomestic, Sector, Industry, GicSector, GicGroup, GicIndustry, GicSubIndustry, HomeCategory, IsDelisted, Description, Address Street, Address City, Address State, Address Country, Address ZIP, Listings Code, Listings Exchange, Listings Name, Officers Name, Officers Title, Officers YearBorn, Phone, WebURL, LogoURL, FullTimeEmployees, UpdatedAt)
-Financial News (Ticker-Tagged)                 | EODHD  | PostgreSQL      | Last 1 month (rolling)                 | Recent news augments RAG retrieval & sentiment (publish date, title, content, summary, url, image url, symbols/tickers, sentiment score, relevance score, source name, author, language)
-Insider Transactions                           | EODHD  | PostgreSQL      | Last 1–2 years (recent filings)        | Management confidence & ownership signals (date, ownerCik, ownerName, transactionDate, transactionCode, transactionAmount, transactionPrice, transactionAcquiredDisposed, postTransactionAmount, secLink, owner title, owner relationship, form type)
-Major Institutional / Mutual Fund Holders      | EODHD  | PostgreSQL      | Current snapshot (top holders)         | Basic smart money positioning (name, date, totalShares, totalAssets, currentShares, change, change_p, holder type)
-Historical Stock Prices (EOD, Adjusted)        | EODHD  | PostgreSQL      | Last ~1 week (for viz only)            | Short-term charts, momentum visualization (date, open, high, low, close, adjusted_close, unadjusted_close, volume, unadjusted_dividend, unadjusted_split, split_coefficient, dividend_amount)
-Intraday / Delayed Live Quotes                 | EODHD  | PostgreSQL      | Current day + last ~1 week             | Anomaly detection & short-term monitoring (timestamp, gmtoffset, datetime, open, high, low, close, volume, previous_close, change, change_p, bid, ask, bid_size, ask_size)
-Beta & Volatility / Technicals                 | EODHD  | PostgreSQL      | Calculated from recent prices (~1 week) | Short-term indicators (RSI 14, MACD line, MACD signal, MACD histogram, SMA 20, EMA 50, Bollinger upper, Bollinger middle, Bollinger lower, ATR 14, Stochastic %K, Stochastic %D, ADX, CCI 20, Williams %R, ROC, Momentum)
-Screener API (Cross-Sectional, Bulk)           | EODHD  | PostgreSQL      | Current cross-section                  | Bulk filtering across 150k+ tickers
-Basic Fundamentals (EPS, key metrics)          | EODHD  | PostgreSQL      | Last 1–2 years                         | Recent EPS trends, margin averages for projections (MarketCapitalization, MarketCapitalizationMln, EBITDA, PERatio, PEGRatio, WallStreetTargetPrice, BookValue, DividendShare, DividendYield, EarningsShare, EPSEstimateCurrentYear, EPSEstimateNextYear, EPSEstimateNextQuarter, EPSEstimateCurrentQuarter, MostRecentQuarter, ProfitMargin, OperatingMarginTTM, ReturnOnAssetsTTM, ReturnOnEquityTTM, RevenueTTM, RevenuePerShareTTM, QuarterlyRevenueGrowthYOY, GrossProfitTTM, DilutedEpsTTM, QuarterlyEarningsGrowthYOY)
-Dividend History / Stock Splits                | EODHD  | PostgreSQL      | Last 1–2 years (recent actions)        | Recent corporate actions adjustment (ForwardAnnualDividendRate, ForwardAnnualDividendYield, PayoutRatio, DividendDate, ExDividendDate, LastSplitFactor, LastSplitDate, NumberDividendsByYear)
-Treasury Rates / Macro Indicators              | EODHD  | PostgreSQL      | Last 1 month (economic events)         | Recent risk-free rate & scenario assumptions (rate date, 3 month, 6 month, 1 year, 2 year, 5 year, 10 year, 20 year, 30 year treasury yield)
-Economic Events Data API                       | EODHD  | PostgreSQL      | Last 1 month (rolling; history from 2020 available) | Global macro events (event date, country code, event name, actual value, forecast value, previous value, impact level, currency affected, comparison period, unit, source url) for event-driven macro analysis, surprises, and DCF scenario inputs
-Bonds Data (Yields, Pricing)                   | EODHD  | PostgreSQL      | Last 1–2 years                         | Recent credit-adjusted cost of debt inputs (bond isin, maturity date, coupon rate, yield to maturity, current price, accrued interest, duration, modified duration, convexity, issue date, issuer name, credit rating)
-Forex Historical Rates (EOD)                   | EODHD  | PostgreSQL      | Last 1 month                           | Recent multi-currency conversion for segments (date, open, high, low, close, adjusted_close, volume)
-ETF & Index Constituent Holdings               | EODHD  | PostgreSQL      | Current constituents                   | Peer grouping & passive flow impact (ticker, name, weight percentage, shares held, market value, sector weight, country weight, dividend yield, expense ratio, inception date, ongoing charge, average market capitalization mln, net expense ratio, annual holdings turnover, total net assets, market cap breakdown, asset allocation, world regions, sector weights, top 10 holdings, valuation growth rates, performance volatility, expected returns, sharpe ratio, returns ytd 3y 5y 10y)
-Financial Calendar (Earnings, IPO, Splits, Dividends) | EODHD | PostgreSQL      | Current + upcoming + last 1–2 years    | Event-driven triggers & recent catalysts (event date, event type, ticker, event title, eps actual, eps estimate, revenue actual, revenue estimate, dividend amount, split factor, ipo price, ipo shares)
-Real-Time News Feed (Ticker-Tagged)            | EODHD  | PostgreSQL      | Last 1 month (rolling)                 | Structured recent news for context & sentiment (publish date, title, content, summary, url, image url, symbols, source name, author, language, relevance score, sentiment score)
-Financial Statements (Balance Sheet, Income, Cash Flow) | EODHD | PostgreSQL      | Last 1–2 years (recent quarterly/annual) | Detailed historical financials for DCF modeling, debt/margin analysis, FCF projections (report date, period, revenue, cost of revenue, gross profit, research development, selling general administrative, operating expenses, operating income, interest expense, pretax income, income tax expense, net income, eps diluted, total assets, cash cash equivalents, short term investments, accounts receivable, inventory, total current assets, property plant equipment net, total non current assets, accounts payable, short term debt, total current liabilities, long term debt, total liabilities, common stock, retained earnings, total equity, operating cash flow, investing cash flow, financing cash flow, capital expenditures, free cash flow)
-Valuation Metrics                              | EODHD  | PostgreSQL      | Last 1–2 years                         | Relative valuation multiples for peer comps & terminal value in DCF (TrailingPE, ForwardPE, PriceSalesTTM, PriceBookMRQ, EnterpriseValue, EnterpriseValueRevenue, EnterpriseValueEbitda)
-Short Interest & Shares Stats                  | EODHD  | PostgreSQL      | Current + recent months                | Short squeeze potential, float analysis, contrarian signals (SharesOutstanding, SharesFloat, PercentInsiders, PercentInstitutions, SharesShort, SharesShortPriorMonth, ShortRatio, ShortPercentOutstanding, ShortPercentFloat, short interest update date)
-Earnings History & Surprises                   | EODHD  | PostgreSQL      | Last 1–2 years (historical quarters)   | EPS surprises, beats/misses patterns for post-earnings strategies (quarter end date, eps actual, eps estimate, surprise percent, revenue actual, revenue estimate, revenue surprise percent, earnings call date)
-Outstanding Shares History                     | EODHD  | PostgreSQL      | Last 1–2 years                         | Accurate per-share metrics, dilution tracking for DCF share count (Date, NumberOfOutstandingShares)
-Analyst Ratings                                | EODHD  | PostgreSQL      | Current snapshot                       | Consensus ratings (Rating, TargetPrice, StrongBuy, Buy, Hold, Sell, StrongSell counts)
-
+Company Profiles / Tickers                     | EODHD  | PostgreSQL      | Current snapshot                       | **Global 150k+ tickers** across 70+ exchanges with **30+ years of metadata**: Code, Type, Name, Exchange, CurrencyCode, CurrencyName, CurrencySymbol, CountryName, CountryISO, OpenFigi, ISIN, LEI, PrimaryTicker, CUSIP, CIK, EmployerIdNumber, FiscalYearEnd, IPODate, InternationalDomestic, Sector, Industry, GicSector, GicGroup, GicIndustry, GicSubIndustry, HomeCategory, IsDelisted, DelistedDate, Description, Address Street, Address City, Address State, Address Country, Address ZIP, Listings Code, Listings Exchange, Listings Name, Officers Name, Officers Title, Officers YearBorn, Phone, WebURL, LogoURL, FullTimeEmployees, UpdatedAt
+Financial News (Ticker-Tagged)                 | EODHD  | PostgreSQL      | Last 1 month (rolling)                 | Recent news with **sentiment scoring** augments RAG retrieval (publish date, title, content, summary, url, image url, symbols/tickers, sentiment score, relevance score, source name, author, language)
+Insider Transactions                           | EODHD  | PostgreSQL      | Last 1–2 years (recent filings)        | **SEC Form 4 filings** revealing management confidence & ownership signals (date, ownerCik, ownerName, transactionDate, transactionCode, transactionAmount, transactionPrice, transactionAcquiredDisposed, postTransactionAmount, secLink, owner title, owner relationship, form type)
+Major Institutional / Mutual Fund Holders      | EODHD  | PostgreSQL      | Current snapshot (top holders)         | **Smart money positioning** with change tracking (name, date, totalShares, totalAssets, currentShares, change, change_p, holder type)
+Historical Stock Prices (EOD, Adjusted)        | EODHD  | PostgreSQL      | **Up to 30+ years** (major US from 1985, int'l from 2000) | Long-term charts, backtesting, momentum visualization (date, open, high, low, close, adjusted_close, volume, dividend_amount, split_coefficient)
+Intraday / Delayed Live Quotes                 | EODHD  | PostgreSQL      | Current day + last ~1 week             | **Real-time anomaly detection** & short-term monitoring (timestamp, datetime, open, high, low, close, volume, previous_close, change, change_p, bid, ask, bid_size, ask_size)
+Beta & Volatility / Technicals                 | EODHD  | PostgreSQL      | Calculated from recent prices          | **Full technical indicator suite**: Beta, 52WeekHigh, 52WeekLow, 50DayMA, 200DayMA, RSI 14, MACD line/signal/histogram, SMA 20, EMA 50, Bollinger bands, ATR 14, Stochastic %K/%D, ADX, CCI 20, Williams %R, ROC, Momentum
+Screener API (Cross-Sectional, Bulk)           | EODHD  | PostgreSQL      | Current cross-section                  | **Bulk filtering & scanning** across entire universe of 150k+ tickers
+Basic Fundamentals (EPS, key metrics)          | EODHD  | PostgreSQL      | Last 1–2 years + **historical trends** | EPS trends, margin averages for projections: MarketCapitalization, EBITDA, PERatio, PEGRatio, WallStreetTargetPrice, BookValue, DividendShare, DividendYield, EarningsShare, EPSEstimateCurrentYear/NextYear/NextQuarter/CurrentQuarter, MostRecentQuarter, ProfitMargin, OperatingMarginTTM, ReturnOnAssetsTTM, ReturnOnEquityTTM, RevenueTTM, RevenuePerShareTTM, QuarterlyRevenueGrowthYOY, GrossProfitTTM, DilutedEpsTTM, QuarterlyEarningsGrowthYOY
+Dividend History / Stock Splits                | EODHD  | PostgreSQL      | **Complete historical record** (since IPO for many) | Corporate actions adjustment: ForwardAnnualDividendRate, ForwardAnnualDividendYield, PayoutRatio, DividendDate, ExDividendDate, LastSplitFactor, LastSplitDate, NumberDividendsByYear (complete yearly dividend count)
+Treasury Rates / Macro Indicators              | EODHD  | PostgreSQL      | Last 1 month + **historical**          | Risk-free rate term structure (rate date, 3 month, 6 month, 1 year, 2 year, 5 year, 10 year, 20 year, 30 year treasury yield)
+Economic Events Data API                       | EODHD  | PostgreSQL      | **Historical from 2020**, rolling last month | Global macro events with surprises: event date, country code, event name, actual value, forecast value, previous value, impact level, currency affected, comparison period, unit, source url
+Bonds Data (Yields, Pricing)                   | EODHD  | PostgreSQL      | Last 1–2 years                         | **Credit-adjusted cost of debt** inputs: bond isin, maturity date, coupon rate, yield to maturity, current price, accrued interest, duration, modified duration, convexity, issue date, issuer name, credit rating
+Forex Historical Rates (EOD)                   | EODHD  | PostgreSQL      | Last 1 month + **historical**          | Multi-currency conversion (date, open, high, low, close, adjusted_close, volume)
+ETF & Index Constituent Holdings               | EODHD  | PostgreSQL      | Current constituents + **historical** (selected indices) | Peer grouping & passive flow impact: ticker, name, weight %, shares held, market value, sector weight, country weight, dividend yield, expense ratio, inception date, ongoing charge, avg market cap, net expense ratio, holdings turnover, total net assets, market cap breakdown, asset allocation, world regions, sector weights, top 10 holdings, valuation metrics, growth rates, performance (volatility, expected returns, Sharpe ratio, returns YTD/3y/5y/10y)
+Financial Calendar (Earnings, IPO, Splits, Dividends) | EODHD | PostgreSQL      | Current + upcoming + last 1–2 years    | **Event-driven triggers**: event date, event type, ticker, event title, eps actual, eps estimate, revenue actual, revenue estimate, dividend amount, split factor, ipo price, ipo shares
+Real-Time News Feed (Ticker-Tagged)            | EODHD  | PostgreSQL      | Last 1 month (rolling)                 | Structured news for **real-time sentiment**: publish date, title, content, summary, url, image url, symbols, source name, author, language, relevance score, sentiment score
+Financial Statements (Balance Sheet, Income, Cash Flow) | EODHD | PostgreSQL      | **Up to 30+ years** (quarterly & annual) | Complete historical financials: report date, period, revenue, cost of revenue, gross profit, R&D, SG&A, operating expenses, operating income, interest expense, pretax income, tax, net income, EPS diluted, total assets, cash equivalents, short-term investments, receivables, inventory, current assets, PP&E, non-current assets, accounts payable, short-term debt, current liabilities, long-term debt, total liabilities, common stock, retained earnings, total equity, operating/investing/financing cash flow, CapEx, free cash flow
+Valuation Metrics                              | EODHD  | PostgreSQL      | Last 1–2 years + **current**           | Relative valuation multiples: TrailingPE, ForwardPE, PriceSalesTTM, PriceBookMRQ, EnterpriseValue, EnterpriseValueRevenue, EnterpriseValueEbitda
+Short Interest & Shares Stats                  | EODHD  | PostgreSQL      | Current + recent months                | **Complete float analysis**: SharesOutstanding, SharesFloat, PercentInsiders, PercentInstitutions, SharesShort, SharesShortPriorMonth, ShortRatio, ShortPercentOutstanding, ShortPercentFloat, short interest update date
+Earnings History & Surprises                   | EODHD  | PostgreSQL      | **Full historical quarterly data**     | EPS surprises, beats/misses patterns: quarter end date, eps actual, eps estimate, surprise %, revenue actual/revenue estimate, revenue surprise %, earnings call date
+Outstanding Shares History                     | EODHD  | PostgreSQL      | **Historical time series**             | Per-share metrics accuracy, dilution tracking (Date, NumberOfOutstandingShares)
+Analyst Ratings                                | EODHD  | PostgreSQL      | Current snapshot                       | **Consensus & detailed ratings**: Rating (1-5 scale), TargetPrice, StrongBuy count, Buy count, Hold count, Sell count, StrongSell count
+Index Constituents (Current & Historical)      | EODHD  | PostgreSQL      | Current + **historical snapshots** (from 1960s for major) | Index composition changes: date, code, exchange, name, sector, industry, weight, addition/exclusion dates
+Mutual Fund Fundamentals                       | EODHD  | PostgreSQL      | Current snapshot                       | **20,000+ US funds** with asset allocation, sector weightings, world regions, valuation metrics
 
 ## SECTION 2: TEXTUAL DATA (BROKER REPORTS, EARNINGS CALLS)
 ====================================================================================================
 
 Data Type                                      | Source | Destination     | Description                                | What It Unlocks
 -----------------------------------------------|--------|-----------------|-------------------------------------------|----------------------------------------------
-Broker Reports                                 | PDF    | Neo4j + Qdrant | Institutional research reports           | RAG retrieval, competitive moat analysis
-Earnings Call Transcripts                      | PDF    | Neo4j + Qdrant | Quarterly earnings call transcripts      | Management sentiment, forward guidance
-Textual Documents Metadata                     | -      | PostgreSQL      | Document index (ticker, type, institution) | Document tracking
-Text Chunks                                    | -      | PostgreSQL      | Chunked text with embeddings              | Semantic search
-
+Broker Reports                                 | PDF    | Neo4j + Qdrant | Institutional research reports           | RAG retrieval, competitive moat analysis, qualitative insights
+Earnings Call Transcripts                      | PDF    | Neo4j + Qdrant | Quarterly earnings call transcripts      | Management sentiment, forward guidance, strategic priorities
+Textual Documents Metadata                     | -      | PostgreSQL      | Document index (ticker, type, institution, date) | Document tracking, source attribution
+Text Chunks                                    | -      | PostgreSQL      | Chunked text with vector embeddings      | Semantic search, similarity matching
 
 ## SECTION 3: AGENT DATA USAGE MAPPING
 ====================================================================================================
 
 ### AGENT 1: QUANTITATIVE FUNDAMENTAL AGENT
 ---------------------------------------
-Data Type                                      | Current Status | After Update
------------------------------------------------|----------------|--------------
-raw_fundamentals (EPS, margins)                | ✓ Present      | + Enhanced
-valuation_metrics (P/E, EV/EBITDA)            | ✓ Present      | + Complete
-short_interest (short squeeze)                 | ✓ Present      | + Full
-earnings_surprises (EPS beats)                 | ✓ Present      | ✓
-dividends_history                              | ✓ Present      | ✓
-splits_history                                 | ✓ Present      | ✓
-raw_timeseries (prices)                        | ✓ Present      | ✓
-institutional_holders (smart money)           | ✓ Present      | ✓
-insider_transactions (management)              | ✓ Present      | ✓
-analyst_ratings                                | ✗ MISSING      | + ADD
-Beta & Technicals (RSI, MACD, Bollinger)     | ✗ MISSING      | + ADD
-Shares Stats (Outstanding, Float)              | ✗ MISSING      | + ADD
+**Primary Focus**: Factor analysis, signal generation, screening, anomaly detection
 
-
-### AGENT 2: FINANCIAL MODELLING AGENT
----------------------------------------
 Data Type                                      | Current Status | After Update
 -----------------------------------------------|----------------|--------------
 raw_fundamentals                               | ✓ Present      | + Enhanced
 valuation_metrics                              | ✓ Present      | + Complete
-financial_statements (IS/BS/CF)                | ✓ Present      | ✓
-dividends_history                             | ✓ Present      | ✓
+short_interest                                 | ✓ Present      | + Full
+earnings_surprises                             | ✓ Present      | ✓
+dividends_history                              | ✓ Present      | ✓
+splits_history                                 | ✓ Present      | ✓
+raw_timeseries                                 | ✓ Present      | ✓
+institutional_holders                          | ✓ Present      | ✓
+insider_transactions                           | ✓ Present      | ✓
+analyst_ratings                                | ✓ Present      | + ADD
+Beta & Technicals                              | ✓ Present      | + ADD
+Shares Stats                                    | ✓ Present      | + ADD
+**Market Capitalization**                      | ✓ Present      | ✓
+**EBITDA, PE ratio, PEG ratio**                 | ✓ Present      | ✓
+**EPS, book value, dividend share, yield**      | ✓ Present      | ✓
+**Profit/operating margin, ROA, ROE**           | ✓ Present      | ✓
+**Revenue, revenue/share, gross profit**        | ✓ Present      | ✓
+**Quarterly earnings growth (YOY)**             | ✓ Present      | ✓
+**Trailing P/E, Forward P/E**                   | ✓ Present      | + Complete
+**Price/Sales, Price/Book**                     | ✓ Present      | + Complete
+**EV/Revenue, EV/EBITDA**                       | ✓ Present      | + Complete
+**Quarterly/annual earnings reports**           | ✓ Present      | ✓
+**Balance sheet, Cash flow, Income statement**  | ✓ Present      | ✓
+Index Constituent Data                          | ✗ Missing      | + ADD
+Mutual Fund Holdings                            | ✗ Missing      | + ADD
+
+### AGENT 2: FINANCIAL MODELLING AGENT
+---------------------------------------
+**Primary Focus**: DCF modeling, scenario analysis, cost of capital, valuation
+
+Data Type                                      | Current Status | After Update
+-----------------------------------------------|----------------|--------------
+raw_fundamentals                               | ✓ Present      | + Enhanced
+valuation_metrics                              | ✓ Present      | + Complete
+financial_statements                           | ✓ Present      | ✓
+dividends_history                              | ✓ Present      | ✓
 splits_history                                 | ✓ Present      | ✓
 outstanding_shares                             | ✓ Present      | ✓
-treasury_rates                                | ✓ Present      | ✓
-corporate_bond_yields                         | ✓ Present      | ✓
-forex_rates                                   | ✓ Present      | ✓
-economic_events                               | ✓ Present      | ✓
-financial_calendar                             | ✓ Present      | ✓
-analyst_ratings                               | ✗ MISSING      | + ADD
-Beta & Technicals (SMA, EMA, ATR)             | ✗ MISSING      | + ADD
-Company Profiles                               | ✗ MISSING      | + ADD
-
+treasury_rates                                 | ✓ Present      | ✓
+corporate_bond_yields                          | ✓ Present      | ✓
+forex_rates                                    | ✓ Present      | ✓
+economic_events                                | ✓ Present      | ✓
+financial_calendar                              | ✓ Present      | ✓
+analyst_ratings                                | ✓ Present      | + ADD
+Beta & Technicals                              | ✓ Present      | + ADD
+Company Profiles                               | ✓ Present      | + ADD
+**Market Capitalization**                      | ✓ Present      | ✓
+**EBITDA, PE ratio, PEG ratio**                 | ✓ Present      | ✓
+**EPS, book value, dividend share, yield**      | ✓ Present      | ✓
+**Profit/operating margin, ROA, ROE**           | ✓ Present      | ✓
+**Revenue, revenue/share, gross profit**        | ✓ Present      | ✓
+**Quarterly earnings growth (YOY)**             | ✓ Present      | ✓
+**Trailing P/E, Forward P/E**                   | ✓ Present      | + Complete
+**Price/Sales, Price/Book**                     | ✓ Present      | + Complete
+**EV/Revenue, EV/EBITDA**                       | ✓ Present      | + Complete
+**Forward annual dividend rate & yield**        | ✓ Present      | + Enhanced
+**Payout ratio, dividend date, ex-div date**    | ✓ Present      | + Enhanced
+**Last split factor & date**                    | ✓ Present      | ✓
+**Historical earnings trends**                   | ✓ Present      | ✓
+**Quarterly/annual earnings reports**           | ✓ Present      | ✓
+**Balance sheet, Cash flow, Income statement**  | ✓ Present      | ✓
+ETF Holdings                                    | ✗ Missing      | + ADD
+Index Historical Constituents                   | ✗ Missing      | + ADD
 
 ### AGENT 3: BUSINESS ANALYST AGENT
 ---------------------------------------
+**Primary Focus**: Competitive positioning, qualitative analysis, sentiment, narrative
+
 Data Type                                      | Current Status | After Update
 -----------------------------------------------|----------------|--------------
-Neo4j Chunks (RAG retrieval)                 | ✓ Present      | 5,044 chunks
+Neo4j Chunks (RAG retrieval)                   | ✓ Present      | 5,044 chunks
 PostgreSQL text_chunks                         | ⚠ Partial      | 48 (need sync)
 textual_documents (metadata)                   | ✓ Present      | 40 docs
 sentiment_trends                               | ✓ Present      | 177 rows
 broker_reports                                 | ✓ Present      | Neo4j
 earnings_calls                                 | ✓ Present      | Neo4j
-analyst_ratings                               | ✗ MISSING      | + ADD
-Company Profiles                               | ✗ MISSING      | + ADD
-institutional_holders (smart money)           | ✓ Present      | ✓
-insider_transactions (management)             | ✓ Present      | ✓
-
+analyst_ratings                                | ✓ Present      | + ADD
+Company Profiles                               | ✓ Present      | + ADD
+institutional_holders                          | ✓ Present      | ✓
+insider_transactions                           | ✓ Present      | ✓
+Financial News (sentiment-scored)              | ✓ Present      | + ADD
+Economic Events                                | ✓ Present      | + ADD
+ETF Holdings                                   | ✗ Missing      | + ADD
 
 ## SECTION 4: POSTGRESQL TABLES STATUS
 ====================================================================================================
 
-Table Name                     | Row Count | Status
--------------------------------|-----------|------------------------
-raw_fundamentals               | 2,524     | ✓ Present (JSON payload)
-valuation_metrics              | 15        | ⚠ Partial
-short_interest                 | 30        | ⚠ Partial
-earnings_surprises             | 521       | ✓ Present
-insider_transactions           | 3,627     | ✓ Present
-institutional_holders          | 243       | ✓ Present
-financial_statements           | 2,229     | ✓ Present
-dividends_history              | 394       | ✓ Present
-splits_history                 | 39        | ✓ Present
-outstanding_shares             | ?         | Need check
-corporate_bond_yields         | 1,005     | ✓ Present
-treasury_rates                | 176       | ✓ Present
-forex_rates                   | 36        | ✓ Present
-economic_events               | 26        | ✓ Present
-financial_calendar            | 3,637     | ✓ Present
-news_articles                 | 713       | ✓ Present
-text_chunks                   | 48        | ⚠ Need sync with Neo4j
-textual_documents             | 40        | ✓ Present
-sentiment_trends              | 177       | ✓ Present
-market_eod_us                 | 504       | ✓ Present
-raw_timeseries               | 884,073   | ✓ Present
-
+Table Name                     | Row Count | Status | Notes
+-------------------------------|-----------|------------------------|---------------------------------------------------
+raw_fundamentals               | 2,524     | ✓ Present (JSON payload) | Contains Highlights, Valuation, SharesStats
+valuation_metrics              | 15        | ⚠ Partial | Missing EnterpriseValue multiples, ForwardPE
+short_interest                 | 30        | ⚠ Partial | Missing historical short interest trends
+earnings_surprises             | 521       | ✓ Present | Quarterly EPS surprises with estimates
+insider_transactions           | 3,627     | ✓ Present | SEC Form 4 filings
+institutional_holders          | 243       | ✓ Present | Top holders with change tracking
+financial_statements           | 2,229     | ✓ Present | IS/BS/CF quarterly + annual
+dividends_history              | 394       | ✓ Present | Historical dividend payments
+splits_history                 | 39        | ✓ Present | Stock split events
+outstanding_shares             | ?         | Need check | Historical share count time series
+corporate_bond_yields         | 1,005     | ✓ Present | Bond-level pricing
+treasury_rates                | 176       | ✓ Present | Daily yield curve
+forex_rates                   | 36        | ✓ Present | Currency pairs EOD
+economic_events               | 26        | ✓ Present | Macro announcements
+financial_calendar            | 3,637     | ✓ Present | Upcoming/past events
+news_articles                 | 713       | ✓ Present | Ticker-tagged with sentiment
+text_chunks                   | 48        | ⚠ Need sync with Neo4j | Vector embeddings
+textual_documents             | 40        | ✓ Present | Document metadata
+sentiment_trends              | 177       | ✓ Present | Aggregated sentiment
+market_eod_us                 | 504       | ✓ Present | US EOD prices
+raw_timeseries               | 884,073   | ✓ Present | Multi-symbol price history
+etf_holdings                  | 0         | ✗ Missing | **NEW**: 10,000+ ETFs
+index_constituents            | 0         | ✗ Missing | **NEW**: Major indices
+mutual_funds                  | 0         | ✗ Missing | **NEW**: 20,000+ funds
+technicals                    | 0         | ✗ Missing | **NEW**: Technical indicators
 
 ## SECTION 5: NEO4J DATA STATUS
 ====================================================================================================
 
-Node Type    | Count  | Status
--------------|--------|-------
-Company      | 51     | ✓ Present
-Chunk        | 5,044  | ✓ Present (with embeddings)
-
+Node Type    | Count  | Status | Content
+-------------|--------|--------|------------------------------------------------
+Company      | 51     | ✓ Present | Ticker nodes with metadata
+Chunk        | 5,044  | ✓ Present | Text chunks with embeddings
+Document     | 40     | ✓ Present | Document nodes linking to sources
 
 ## SECTION 6: DATA FIELDS TO ADD
 ====================================================================================================
@@ -145,35 +183,94 @@ Chunk        | 5,044  | ✓ Present (with embeddings)
 1. **Analyst Ratings** (NEW)
    - Fields: Rating, TargetPrice, StrongBuy, Buy, Hold, Sell, StrongSell
    - For: All 3 agents
+   - Source: `AnalystRatings` section
 
 2. **Company Profiles** (NEW)
-   - Fields: Code, Name, Exchange, Sector, Industry, Description, Address, Officers, Listings
+   - Fields: Code, Name, Exchange, Sector, Industry, Description, Address, Officers, Listings, Phone, WebURL, LogoURL, IPODate, IsDelisted, GICS taxonomy
    - For: Business Analyst, Financial Modelling
+   - Source: `General` section
 
 3. **Full Technical Indicators** (NEW)
-   - Fields: Beta, 52WeekHigh, 52WeekLow, 50DayMA, 200DayMA, RSI, MACD, Bollinger
+   - Fields: Beta, 52WeekHigh, 52WeekLow, 50DayMA, 200DayMA, RSI, MACD, Bollinger, ATR, Stochastic, ADX
    - For: Quant Fundamental, Financial Modelling
+   - Source: `Technicals` section
 
 4. **Shares Stats** (NEW)
    - Fields: SharesOutstanding, SharesFloat, PercentInsiders, PercentInstitutions
    - For: All 3 agents
+   - Source: `SharesStats` section
 
 5. **Enhanced Valuation Metrics** (UPDATE)
-   - Fields: Add missing fields from EODHD Highlights and Valuation sections
+   - Fields: Add missing EnterpriseValue, ForwardPE, PriceSalesTTM, PriceBookMRQ, EV/Revenue, EV/EBITDA
    - For: Financial Modelling
+   - Source: `Valuation` section
 
 6. **Dividend Details** (UPDATE)
-   - Fields: ForwardAnnualDividendRate, ForwardAnnualDividendYield, PayoutRatio
+   - Fields: ForwardAnnualDividendRate, ForwardAnnualDividendYield, PayoutRatio, NumberDividendsByYear
    - For: Financial Modelling
+   - Source: `SplitsDividends` section
+
+7. **Earnings History & Trends** (NEW)
+   - Fields: Complete quarterly history with estimates, future estimates by period
+   - For: Quant Fundamental, Financial Modelling
+   - Source: `Earnings` section (History & Trend)
+
+8. **ETF Holdings & Fundamentals** (NEW)
+   - Fields: Complete ETF breakdowns (asset allocation, sector weights, top holdings, performance metrics)
+   - For: Quant Fundamental, Business Analyst
+   - Source: ETF fundamentals endpoint
+
+9. **Index Constituents (Historical)** (NEW)
+   - Fields: Historical index composition with addition/exclusion dates
+   - For: Quant Fundamental, Financial Modelling
+   - Source: Index fundamentals with `historical=1` parameter
+
+10. **Mutual Fund Fundamentals** (NEW)
+    - Fields: Asset allocation, sector weightings, world regions, valuation metrics
+    - For: Quant Fundamental, Business Analyst
+    - Source: Mutual fund fundamentals endpoint
 
 
-## SECTION 7: IMPLEMENTATION PRIORITY
+## SECTION 8: API ENDPOINTS REFERENCE
 ====================================================================================================
 
-Priority | Data Type              | Agent Impact
----------|----------------------|--------------
-1        | Analyst Ratings       | All 3 agents
-2        | Company Profiles      | BA, FM
-3        | Full Technicals       | Quant, FM
-4        | Shares Stats          | All 3 agents
-5        | Text Chunk Sync       | BA (RAG)
+### Core Fundamentals Endpoint:
+```
+https://eodhd.com/api/fundamentals/{TICKER}.{EXCHANGE}?api_token={KEY}&fmt=json
+```
+
+### Filtered Requests (reduce payload):
+```
+# Single section
+https://eodhd.com/api/fundamentals/AAPL.US?filter=General&api_token={KEY}&fmt=json
+
+# Nested field
+https://eodhd.com/api/fundamentals/AAPL.US?filter=General::Code&api_token={KEY}&fmt=json
+
+# Multiple sections
+https://eodhd.com/api/fundamentals/AAPL.US?filter=General,Highlights,Valuation&api_token={KEY}&fmt=json
+```
+
+### Index Constituents (with historical):
+```
+# Current constituents only
+https://eodhd.com/api/fundamentals/GSPC.INDX?api_token={KEY}&fmt=json
+
+# With historical snapshots (from 1960s for S&P 500)
+https://eodhd.com/api/fundamentals/GSPC.INDX?historical=1&from=2020-01-01&to=2023-01-01&api_token={KEY}&fmt=json
+```
+
+### ETF & Mutual Fund Fundamentals:
+```
+# ETF fundamentals
+https://eodhd.com/api/fundamentals/SPY.US?api_token={KEY}&fmt=json
+
+# Mutual fund fundamentals
+https://eodhd.com/api/fundamentals/SWPPX.US?api_token={KEY}&fmt=json
+```
+
+### Bulk Fundamentals:
+```
+# Documentation: https://eodhd.com/financial-apis/bulk-fundamental-data-api
+```
+

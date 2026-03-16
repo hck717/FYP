@@ -37,12 +37,18 @@ def web_search_fallback(
     Falls back to a stub result if the web_search agent module is unavailable.
     """
     try:
-        # Attempt live import of the Web Search Agent (available from Week 7 onward)
-        from agents.web_search.agent import run as web_run  # type: ignore[import]
+        # Attempt live import of the Web Search Agent
+        from agents.web_search.agent import run_web_search_agent, WebSearchInput  # type: ignore[import]
 
         logger.info("Calling Web Search Agent for ticker=%s query=%r", ticker, query)
-        result = web_run(task=query, ticker=ticker, config=config)
-        return result if isinstance(result, dict) else {"summary": str(result), "key_risks": [], "sources": []}
+        agent_input = WebSearchInput(
+            query=query,
+            ticker=ticker,
+            recency_filter="week",
+            model=None,
+        )
+        result = run_web_search_agent(agent_input)
+        return dict(result) if result else {"summary": "", "key_risks": [], "sources": []}
 
     except ImportError:
         # Web Search Agent not yet implemented — return a structured stub

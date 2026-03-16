@@ -1868,10 +1868,13 @@ class FMDataFetcher:
 
         # ── Macro indicators (Row 11: dedicated treasury_rates + global_macro) ─
         try:
-            # Dedicated treasury_rates table (US10Y as primary WACC input)
+            # Dedicated treasury_rates table (US10Y + US2Y for yield curve slope)
             bundle.treasury_rates_dedicated = self.pg.fetch_treasury_rates_dedicated("US10Y", limit=5)
-            # Global macro indicators: GDP, CPI, Unemployment
-            for indicator in ("GDP", "CPI", "UNEMPLOYMENT"):
+            bundle.treasury_rates_dedicated.extend(
+                self.pg.fetch_treasury_rates_dedicated("US2Y", limit=5)
+            )
+            # Global macro indicators: GDP, CPI, Unemployment (stored lowercase in DB)
+            for indicator in ("gdp", "cpi", "unemployment"):
                 rows = self.pg.fetch_macro_indicators(indicator, limit=5)
                 bundle.macro_indicators.extend(rows)
         except Exception as exc:

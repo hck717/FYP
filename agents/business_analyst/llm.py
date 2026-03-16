@@ -5,9 +5,7 @@ Ollama is retained for embeddings only (nomic-embed-text:v1.5); it is NOT used
 for any generation in this module.
 
 One API call per agent run:
-  - generate()      → single chat.completions.create() call; no retry loops.
-  - classify_query() → rule-based only; never calls the API.
-  - rewrite_query() → one API call; only fires on AMBIGUOUS CRAG path (rare).
+  - generate() -> single chat.completions.create() call; no retry loops.
 """
 
 from __future__ import annotations
@@ -20,7 +18,7 @@ from typing import Any, Dict, List, Optional
 from openai import OpenAI
 
 from .config import BusinessAnalystConfig
-from .prompts import SYSTEM_PROMPT, JSON_SCHEMA_PROMPT, REWRITE_PROMPT
+from .prompts import SYSTEM_PROMPT, JSON_SCHEMA_PROMPT
 from .schema import SentimentSnapshot
 
 logger = logging.getLogger(__name__)
@@ -289,34 +287,6 @@ class LLMClient:
             )
             logger.debug("LLM full raw response:\n%s", content)
             raise
-
-    def classify_query(self, query: str) -> str:
-        """Rule-based query classification — never calls the DeepSeek API.
-
-        The real classification logic lives in agent.py's rule-based
-        pre-classifier which runs before this method is ever reached.
-        This method is a dead fallback that returns COMPLEX unconditionally
-        to preserve the one-API-call-per-run budget.
-        """
-        logger.debug("[ClassifyQuery] rule-based fallback → COMPLEX (query: %.80s)", query)
-        return "COMPLEX"
-
-    def rewrite_query(self, query: str) -> str:
-        """Rewrite an ambiguous query via one DeepSeek API call.
-
-        Only fires on the AMBIGUOUS CRAG path (rare). Counts against the
-        one-call budget (acceptable for this exceptional path).
-        """
-        response = self._client.chat.completions.create(
-            model=self.config.llm_model,
-            messages=[
-                {"role": "user", "content": REWRITE_PROMPT.replace("{{query}}", query)},
-            ],
-            max_tokens=200,
-            temperature=0.2,
-        )
-        raw = response.choices[0].message.content or query
-        return _strip_think_tags(raw).strip() or query
 
     def _build_messages(
         self,

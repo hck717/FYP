@@ -238,6 +238,22 @@ SUPPORTED TICKERS: AAPL, MSFT, GOOGL, TSLA, NVDA (PostgreSQL data available)
 MULTI-TICKER: Supported — returns one result dict per ticker
 DO NOT USE FOR: Qualitative moat analysis, real-time news, sentiment analysis
 
+AGENT: stock_research
+README SUMMARY: The earnings-call and broker-report intelligence layer. Uses a RAG pipeline over
+earnings call transcripts and broker research reports stored in Neo4j (with Ollama embeddings),
+falling back to local PDFs. 8-step pipeline: load → quality-parse → broker labelling → transcript
+feature extraction → FAISS/vector retrieval → LLM synthesis. Handles:
+  - Earnings call transcript analysis: management tone, guidance language, Q&A behaviour,
+    forward-looking statements, analyst pushback, key themes across calls
+  - Broker report synthesis: consensus ratings, price targets, bull/bear thesis comparison,
+    analyst disagreements, upgrade/downgrade drivers
+  - Transcript-vs-broker comparison: whether broker sentiment aligns with management commentary
+  - Quarter-over-quarter narrative changes in earnings calls
+  - Identification of red flags or positive signals in management language
+SUPPORTED TICKERS: Any ticker with earnings call transcripts or broker reports ingested into
+  Neo4j (AAPL, MSFT, GOOGL, TSLA, NVDA have data); falls back to local PDFs if available
+DO NOT USE FOR: Financial ratios, DCF valuation, real-time news, technical analysis, price charts
+
 === OUTPUT SCHEMA ===
 
 Output ONLY a valid JSON object with this schema:
@@ -249,6 +265,7 @@ Output ONLY a valid JSON object with this schema:
   "run_quant_fundamental": <true|false>,
   "run_web_search": <true|false>,
   "run_financial_modelling": <true|false>,
+  "run_stock_research": <true|false>,
   "complexity": <1|2|3>,
   "reasoning": "<2-3 sentences explaining tool selection and multi-ticker handling>",
   "chart_hints": ["<chart_type1>", "<chart_type2>"]
@@ -342,16 +359,23 @@ Default to 2 if uncertain.
   value of...?" or "should I buy/sell based on technicals?"
   ALSO enable for any "fundamental analysis", "complete analysis", "full analysis",
   "comprehensive analysis", or "deep dive" query — these always benefit from DCF + technicals.
+- run_stock_research: true when the question explicitly asks about earnings call transcripts,
+  broker reports, analyst reports, management commentary, earnings call Q&A, guidance language,
+  broker consensus, price targets from brokers, analyst upgrades/downgrades, or any synthesis
+  of what management said vs. what brokers think.
+  Also enable for "complete analysis", "full analysis", "comprehensive analysis", or "deep dive"
+  queries — these benefit from transcript and broker report context.
+  Do NOT enable for standard financial ratios, DCF, real-time news, or technical analysis.
 
 COMPREHENSIVE QUERY RULE: If the query contains any of: "fundamental analysis",
 "complete analysis", "full analysis", "comprehensive analysis", "deep dive", "full report",
-"complete report" — set ALL FOUR of run_business_analyst, run_quant_fundamental,
-run_financial_modelling to true. Only keep run_web_search=false unless news is
+"complete report" — set ALL FIVE of run_business_analyst, run_quant_fundamental,
+run_financial_modelling, run_stock_research to true. Only keep run_web_search=false unless news is
 explicitly requested.
 
 Always enable at least one tool. If the question is ambiguous, enable both
 business_analyst and quant_fundamental.
-For "complete", "full", "comprehensive", or "fundamental analysis" queries, enable ALL FOUR agents.
+For "complete", "full", "comprehensive", or "fundamental analysis" queries, enable ALL FIVE agents.
 """
 
 
@@ -838,7 +862,16 @@ Forbidden headers (use the correct one above instead): ## Competitive Moat Analy
 any numbered prefix (1. 2.1).
 Do NOT write a title, date, or ticker line before ## Executive Summary.
 
-RULE 3 — ZERO FABRICATION. Only use numbers, names, and ratings that appear verbatim in the data.
+RULE 3 — ZERO FABRICATION. Only use numbers, names, and ratings that appear verbatim in the data block.
+Any numeric value (P/E, EV/EBITDA, ROE, ROIC, Piotroski score, Beneish M-Score, Altman Z, RSI, price,
+margin, growth rate, etc.) that is NOT explicitly present in the data block is FORBIDDEN.
+The system prompt contains illustrative FORMAT EXAMPLES (e.g. "Nx", "Y%") — these are format patterns only,
+NOT actual data values. DO NOT use any number from the instructional examples as a data point.
+A LOCKED DATA ANCHOR block appears in the data section labelled "=== LOCKED DATA ANCHOR ===".
+The values in that block are the sole authoritative source for P/E, EV/EBITDA, ROE, ROIC,
+Piotroski F-Score, Beneish M-Score, Altman Z-Score, WACC, and DCF values.
+You MUST copy them into the report exactly as stated — no rounding, no substitution from prior knowledge.
+If a metric is absent from the data, omit it or state it is unavailable.
 
 RULE 4 — BANNED WORDS. Replace each with a specific number or mechanism:
   robust, solid, strong performance, impressive, compelling, notable, remarkable,
@@ -921,9 +954,10 @@ Write 3 substantive prose paragraphs:
   Paragraph 1 — VALUATION MULTIPLES (minimum 5 sentences): Anchor on trailing P/E, EV/EBITDA, and P/FCF
     together. Benchmark each against large-cap tech norms (P/E 22–38x, EV/EBITDA 16–28x, P/FCF 20–35x).
     State explicitly whether each multiple is cheap, fair, or expensive relative to peers AND quantify the
-    premium or discount as a percentage — e.g. "EV/EBITDA of 25.6x sits 28% above the sector median of
-    20x" or "P/E of 33x is at the midpoint of the 22–38x large-cap tech range". NEVER describe a premium
+    premium or discount as a percentage — e.g. "EV/EBITDA of Nx sits Y% above/below the sector median"
+    or "P/E of Nx is at the midpoint/high-end/low-end of the 22–38x large-cap tech range". NEVER describe a premium
     or discount in vague language — always name the exact spread in percentage points or absolute turns.
+    Use ONLY the exact numbers from the provided data — do NOT substitute illustrative examples for actual figures.
     For the trailing P/E, calculate the implied 5-year annual EPS growth rate the multiple embeds
     (at 33x → ~12–15%; at 25x → ~8–10%; at 40x+ → ~18–22%). Cover EV/Revenue and dividend yield where
     available. Explain what the composite multiple picture tells us about whether the market is pricing
@@ -939,9 +973,11 @@ Write 3 substantive prose paragraphs:
     specifically whether it reflects genuine operating leverage or equity base compression from sustained buybacks,
     and what that structural distinction means for interpreting capital efficiency. Do NOT describe a ROE of 100%+
     as "moderate" or "within-range" — it is far above cost of capital and demands explicit explanation.
-    Similarly, if ROIC is materially above WACC (>20pp spread), quantify the spread explicitly (e.g. "ROIC of
-    51% represents a ~42pp spread above the ~9% WACC, indicative of a durable economic moat") and name the
-    mechanism sustaining that spread.
+     Similarly, if ROIC is materially above WACC (>20pp spread), quantify the spread explicitly using
+     the ACTUAL ROIC value from the data (e.g. "ROIC of [actual value]% represents a [actual spread]pp
+     spread above the ~[WACC]% WACC, indicative of a durable economic moat") and name the
+     mechanism sustaining that spread. NEVER use placeholder or example numbers — use only the exact
+     figures from the agent output data.
     Assess the Piotroski F-Score with full interpretation (8–9 = exceptional quality across profitability,
     leverage, and operating efficiency; 7 = above-average; 5–6 = mixed signals; ≤4 = deteriorating trend).
     If Beneish M-Score is available, interpret it fully (< -2.22 = low manipulation risk, earnings quality
@@ -1211,11 +1247,14 @@ def _build_quant_context(quant_output: Dict[str, Any]) -> List[str]:
         beneish = qf.get('beneish_m_score')
         manipulation_risk = qf.get('manipulation_risk')
         altman_z = qf.get('altman_z_score')
-        roe = qf.get('roe')
-        roic = qf.get('roic')
+        roe_raw = qf.get('roe')
+        roic_raw = qf.get('roic')
+        # Format as percentages to avoid LLM misinterpretation of decimal ratios
+        roe_fmt = f"{float(roe_raw)*100:.2f}%" if roe_raw is not None else "N/A"
+        roic_fmt = f"{float(roic_raw)*100:.2f}%" if roic_raw is not None else "N/A"
         beneish_str = str(beneish) if beneish is not None else "N/A (prior-year financials not in DB)"
         parts.append(
-            f"Quality Factors: ROE={roe}, ROIC={roic}, "
+            f"Quality Factors: ROE={roe_fmt} (decimal={roe_raw}), ROIC={roic_fmt} (decimal={roic_raw}), "
             f"Piotroski F-Score={piotroski}/9, "
             f"Beneish M-Score={beneish_str}, Manipulation Risk={manipulation_risk}, "
             f"Altman Z-Score={altman_z}"
@@ -1260,9 +1299,9 @@ def _build_quant_context(quant_output: Dict[str, Any]) -> List[str]:
             except (TypeError, ValueError):
                 pass
         # WACC context for ROE/ROIC — tiered interpretation for very high values
-        if roe is not None:
+        if roe_raw is not None:
             try:
-                roe_pct = float(roe) * 100
+                roe_pct = float(roe_raw) * 100
                 if roe_pct > 100:
                     # ROE >100% typically signals shareholder equity has been compressed
                     # to near-zero or negative by aggressive buybacks — not pure operating leverage.
@@ -1291,9 +1330,9 @@ def _build_quant_context(quant_output: Dict[str, Any]) -> List[str]:
                     )
             except (TypeError, ValueError):
                 pass
-        if roic is not None:
+        if roic_raw is not None:
             try:
-                roic_pct = float(roic) * 100
+                roic_pct = float(roic_raw) * 100
                 if roic_pct > 40:
                     parts.append(
                         f"  → ROIC of {roic_pct:.1f}% is FAR above the implied WACC of ~8–10% — "
@@ -1556,6 +1595,8 @@ def _build_ba_context(ba_output: Dict[str, Any]) -> List[str]:
         )
 
     s = ba_output.get("sentiment") or {}
+    if not isinstance(s, dict):
+        s = {}
     if s:
         bullish = s.get('bullish_pct')
         bearish = s.get('bearish_pct')
@@ -2036,6 +2077,918 @@ def _build_data_tables(
     return "\n".join(tables)
 
 
+def _build_stock_research_context(sr_output: Dict[str, Any]) -> List[str]:
+    """Format stock-research-agent output into readable lines for the summarizer prompt.
+
+    Surfaces broker consensus, transcript comparison, Q&A behaviour analysis,
+    deterministic NLP features, and broker rating distribution.
+    All text is LLM-generated by the stock-research pipeline and is clearly
+    labelled so the summarizer knows the source.
+    """
+    ticker = sr_output.get("ticker", "?")
+    parts: List[str] = [f"=== STOCK RESEARCH OUTPUT: {ticker} ==="]
+    parts.append(
+        "NOTE: This section is generated by a separate PDF-based pipeline that reads "
+        "broker research reports and earnings call transcripts directly.  All LLM "
+        "analyses below include [doc_name p.N] inline citations."
+    )
+
+    # ── Error / empty guard ───────────────────────────────────────────────────
+    if sr_output.get("error"):
+        parts.append(f"Pipeline error: {sr_output['error']}")
+        return parts
+
+    # ── Transcript metadata ───────────────────────────────────────────────────
+    latest_t   = sr_output.get("latest_transcript", "")
+    previous_t = sr_output.get("previous_transcript", "")
+    if latest_t or previous_t:
+        parts.append(f"Latest transcript: {latest_t} | Previous transcript: {previous_t}")
+
+    # ── Deterministic NLP features ────────────────────────────────────────────
+    features = sr_output.get("features") or {}
+    latest_feat = features.get("latest") or {}
+    prev_feat   = features.get("previous") or {}
+    kpi_diff    = features.get("kpi_diff") or {}
+
+    if latest_feat:
+        parts.append(
+            f"Transcript features (latest): "
+            f"kpi_per_1k_words={latest_feat.get('kpi_per_1k_words')}, "
+            f"hedge_ratio={latest_feat.get('hedge_ratio')}, "
+            f"evasive_count={latest_feat.get('evasive_count')}, "
+            f"qa_vs_prep_hedge_delta={latest_feat.get('qa_vs_prep_hedge_delta')}, "
+            f"pivot_per_1k_words={latest_feat.get('pivot_per_1k_words')}"
+        )
+    if prev_feat:
+        parts.append(
+            f"Transcript features (previous): "
+            f"kpi_per_1k_words={prev_feat.get('kpi_per_1k_words')}, "
+            f"hedge_ratio={prev_feat.get('hedge_ratio')}"
+        )
+    if kpi_diff:
+        dropped = kpi_diff.get("dropped_kpis") or []
+        added   = kpi_diff.get("added_kpis") or []
+        if dropped or added:
+            parts.append(f"KPI changes: dropped={dropped}, added={added}")
+
+    # ── Broker rating distribution ─────────────────────────────────────────────
+    broker_labels_raw = sr_output.get("broker_labels") or {}
+    broker_parsed = sr_output.get("broker_parsed") or []
+
+    # broker_labels may be a list (from agent_step4_broker_labels) or a dict.
+    # Normalise to list[dict] for counting.
+    if isinstance(broker_labels_raw, dict):
+        broker_labels_list = list(broker_labels_raw.values())
+    elif isinstance(broker_labels_raw, list):
+        broker_labels_list = broker_labels_raw
+    else:
+        broker_labels_list = []
+
+    if broker_labels_list:
+        bullish = sum(1 for v in broker_labels_list if (v or {}).get("rating") == "bullish")
+        neutral = sum(1 for v in broker_labels_list if (v or {}).get("rating") == "neutral")
+        bearish = sum(1 for v in broker_labels_list if (v or {}).get("rating") == "bearish")
+        unknown = sum(1 for v in broker_labels_list if (v or {}).get("rating") not in ("bullish","neutral","bearish"))
+        parts.append(
+            f"Broker rating distribution: {bullish} bullish / {neutral} neutral / "
+            f"{bearish} bearish / {unknown} unknown  (from {len(broker_labels_list)} broker reports)"
+        )
+
+    # Per-broker price targets and EPS estimates (up to 5 brokers)
+    if broker_parsed:
+        for bp in broker_parsed[:5]:
+            pt   = bp.get("price_target")
+            eps  = bp.get("eps_estimates") or {}
+            name = bp.get("broker_name", bp.get("institution", "unknown"))
+            rating = bp.get("rating", "")
+            line = f"  Broker {name} [{rating}]:"
+            if pt is not None:
+                line += f" price_target={pt}"
+            if eps:
+                # eps_estimates may be a dict or a list of strings — handle both
+                if isinstance(eps, dict):
+                    eps_str = ", ".join(f"{k}={v}" for k, v in list(eps.items())[:3])
+                elif isinstance(eps, list):
+                    eps_str = "; ".join(str(e) for e in eps[:3])
+                else:
+                    eps_str = str(eps)
+                line += f" eps={{{eps_str}}}"
+            if line.strip().endswith(":"):
+                line += " (no structured data extracted)"
+            parts.append(line)
+
+    # ── LLM-generated analyses ────────────────────────────────────────────────
+    transcript_cmp = sr_output.get("transcript_comparison", "")
+    if transcript_cmp:
+        parts.append("Transcript Comparison (LLM, cited):")
+        parts.append(transcript_cmp.strip())
+
+    qa_behavior = sr_output.get("qa_behavior", "")
+    if qa_behavior:
+        parts.append("Q&A Behaviour Analysis (LLM, cited):")
+        parts.append(qa_behavior.strip())
+
+    broker_consensus = sr_output.get("broker_consensus", "")
+    if broker_consensus:
+        parts.append("Broker Consensus (LLM, cited):")
+        parts.append(broker_consensus.strip())
+
+    return parts
+
+
+# ---------------------------------------------------------------------------
+# Structured summarisation: JSON-schema-enforced hallucination prevention
+# ---------------------------------------------------------------------------
+
+def _build_anchor_dict(
+    tickers: List[str],
+    quant_outputs: List[Dict[str, Any]],
+    fm_outputs: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Extract all authoritative numeric values from agent outputs into a flat dict.
+
+    These are the ONLY numbers the LLM is permitted to use.  Every key maps to
+    a value that came directly from the PostgreSQL DB — no training-data numbers.
+    """
+    anchor: Dict[str, Any] = {}
+    for i, t in enumerate(tickers):
+        quant_o = quant_outputs[i] if i < len(quant_outputs) else None
+        fm_o    = fm_outputs[i]    if i < len(fm_outputs)    else None
+        prefix  = t.upper()
+
+        if quant_o:
+            vf     = quant_o.get("value_factors")    or {}
+            qfact  = quant_o.get("quality_factors")  or {}
+            km     = quant_o.get("key_metrics")      or {}
+            mr     = quant_o.get("momentum_risk") or quant_o.get("momentum_factors") or {}
+            yoy    = quant_o.get("yoy_deltas")        or {}
+            qt     = quant_o.get("quarterly_trends")  or []
+
+            # Value factors
+            if vf.get("pe_trailing")  is not None: anchor[f"{prefix}_pe_trailing"]  = round(float(vf["pe_trailing"]),  4)
+            if vf.get("ev_ebitda")    is not None: anchor[f"{prefix}_ev_ebitda"]    = round(float(vf["ev_ebitda"]),    2)
+            if vf.get("p_fcf")        is not None: anchor[f"{prefix}_p_fcf"]        = round(float(vf["p_fcf"]),        2)
+            if vf.get("ev_revenue")   is not None: anchor[f"{prefix}_ev_revenue"]   = round(float(vf["ev_revenue"]),   2)
+
+            # Quality factors
+            if qfact.get("roe")               is not None: anchor[f"{prefix}_roe_pct"]          = round(float(qfact["roe"]) * 100, 2)
+            if qfact.get("roic")              is not None: anchor[f"{prefix}_roic_pct"]         = round(float(qfact["roic"]) * 100, 2)
+            if qfact.get("piotroski_f_score") is not None: anchor[f"{prefix}_piotroski"]        = int(qfact["piotroski_f_score"])
+            if qfact.get("beneish_m_score")   is not None: anchor[f"{prefix}_beneish_m"]        = round(float(qfact["beneish_m_score"]), 4)
+            if qfact.get("altman_z_score")    is not None: anchor[f"{prefix}_altman_z"]         = round(float(qfact["altman_z_score"]),  3)
+
+            # Key metrics
+            if km.get("gross_margin")   is not None: anchor[f"{prefix}_gross_margin_pct"]  = round(float(km["gross_margin"]) * 100, 2)
+            if km.get("ebit_margin")    is not None: anchor[f"{prefix}_ebit_margin_pct"]   = round(float(km["ebit_margin"])  * 100, 2)
+            if km.get("current_ratio")  is not None: anchor[f"{prefix}_current_ratio"]     = round(float(km["current_ratio"]), 2)
+            if km.get("debt_to_equity") is not None: anchor[f"{prefix}_debt_to_equity"]    = round(float(km["debt_to_equity"]), 4)
+
+            # Momentum/risk
+            if mr.get("beta_60d")         is not None: anchor[f"{prefix}_beta_60d"]          = round(float(mr["beta_60d"]),         4)
+            if mr.get("sharpe_ratio_12m") is not None: anchor[f"{prefix}_sharpe_ratio_12m"]  = round(float(mr["sharpe_ratio_12m"]), 4)
+            if mr.get("return_12m_pct")   is not None: anchor[f"{prefix}_return_12m_pct"]    = round(float(mr["return_12m_pct"]),   2)
+            if mr.get("sma_50")           is not None: anchor[f"{prefix}_sma_50"]            = round(float(mr["sma_50"]),           2)
+            if mr.get("sma_200")          is not None: anchor[f"{prefix}_sma_200"]           = round(float(mr["sma_200"]),          2)
+
+            # YoY deltas
+            if yoy.get("revenue_yoy_pct")          is not None: anchor[f"{prefix}_revenue_yoy_pct"]          = round(float(yoy["revenue_yoy_pct"]),          2)
+            if yoy.get("gross_profit_yoy_pct")      is not None: anchor[f"{prefix}_gross_profit_yoy_pct"]     = round(float(yoy["gross_profit_yoy_pct"]),      2)
+            if yoy.get("operating_income_yoy_pct")  is not None: anchor[f"{prefix}_operating_income_yoy_pct"] = round(float(yoy["operating_income_yoy_pct"]),  2)
+            if yoy.get("net_income_yoy_pct")        is not None: anchor[f"{prefix}_net_income_yoy_pct"]       = round(float(yoy["net_income_yoy_pct"]),        2)
+
+            # Quarterly trends (TTM and latest quarter)
+            if qt:
+                q0 = qt[0]
+                if q0.get("revenue")    is not None: anchor[f"{prefix}_revenue_latest_q_b"]    = round(float(q0["revenue"])    / 1e9, 2)
+                if q0.get("net_income") is not None: anchor[f"{prefix}_net_income_latest_q_b"] = round(float(q0["net_income"]) / 1e9, 2)
+                anchor[f"{prefix}_latest_q_period"] = q0.get("period", "")
+                if len(qt) >= 4:
+                    ttm_r = sum((q.get("revenue")    or 0) for q in qt[:4])
+                    ttm_n = sum((q.get("net_income") or 0) for q in qt[:4])
+                    if ttm_r: anchor[f"{prefix}_revenue_ttm_b"]    = round(ttm_r / 1e9, 2)
+                    if ttm_n: anchor[f"{prefix}_net_income_ttm_b"] = round(ttm_n / 1e9, 2)
+
+        if fm_o:
+            dcf   = (fm_o.get("valuation") or {}).get("dcf") or {}
+            tsm   = fm_o.get("three_statement_model") or {}
+            cf_s  = tsm.get("cash_flows")        or []
+            bs_s  = tsm.get("balance_sheets")    or []
+            inc_s = tsm.get("income_statements") or []
+            divs  = fm_o.get("dividends")        or {}
+            earn  = fm_o.get("earnings")         or {}
+
+            # DCF
+            if dcf.get("wacc_used")              is not None: anchor[f"{prefix}_wacc_pct"]           = round(float(dcf["wacc_used"]) * 100, 2)
+            if dcf.get("intrinsic_value_base")   is not None: anchor[f"{prefix}_dcf_base"]           = round(float(dcf["intrinsic_value_base"]),   2)
+            if dcf.get("intrinsic_value_bull")   is not None: anchor[f"{prefix}_dcf_bull"]           = round(float(dcf["intrinsic_value_bull"]),   2)
+            if dcf.get("intrinsic_value_bear")   is not None: anchor[f"{prefix}_dcf_bear"]           = round(float(dcf["intrinsic_value_bear"]),   2)
+            if dcf.get("intrinsic_value_weighted")is not None: anchor[f"{prefix}_dcf_weighted"]       = round(float(dcf["intrinsic_value_weighted"]), 2)
+            if dcf.get("terminal_growth_rate")   is not None: anchor[f"{prefix}_terminal_growth_pct"]= round(float(dcf["terminal_growth_rate"]) * 100, 1)
+            if dcf.get("reverse_dcf_implied_cagr")is not None: anchor[f"{prefix}_implied_cagr_pct"]  = round(float(dcf["reverse_dcf_implied_cagr"]) * 100, 1)
+
+            # Cash flows (most recent annual)
+            if cf_s:
+                cf = cf_s[0]
+                anchor[f"{prefix}_cf_period"] = cf.get("period", "")
+                if cf.get("operating_cash_flow") is not None: anchor[f"{prefix}_ocf_b"]  = round(float(cf["operating_cash_flow"]) / 1e9, 2)
+                if cf.get("free_cash_flow")      is not None: anchor[f"{prefix}_fcf_b"]  = round(float(cf["free_cash_flow"])      / 1e9, 2)
+                if cf.get("capital_expenditures")is not None: anchor[f"{prefix}_capex_b"]= round(float(cf["capital_expenditures"]) / 1e9, 2)
+                if cf.get("dividends_paid")      is not None: anchor[f"{prefix}_dividends_paid_b"] = round(float(cf["dividends_paid"]) / 1e9, 2)
+                if cf.get("share_buybacks")      is not None: anchor[f"{prefix}_buybacks_b"]       = round(abs(float(cf["share_buybacks"])) / 1e9, 2)
+                if cf.get("fcf_margin")          is not None: anchor[f"{prefix}_fcf_margin_pct"]   = round(float(cf["fcf_margin"]) * 100, 2)
+                if cf.get("cfo_ni_ratio")        is not None: anchor[f"{prefix}_cfo_ni_ratio"]     = round(float(cf["cfo_ni_ratio"]), 4)
+
+            # Balance sheet (most recent annual)
+            if bs_s:
+                bs = bs_s[0]
+                anchor[f"{prefix}_bs_period"] = bs.get("period", "")
+                if bs.get("total_assets")        is not None: anchor[f"{prefix}_total_assets_b"]    = round(float(bs["total_assets"])        / 1e9, 2)
+                if bs.get("total_liabilities")   is not None: anchor[f"{prefix}_total_liabilities_b"]= round(float(bs["total_liabilities"])   / 1e9, 2)
+                if bs.get("total_equity")        is not None: anchor[f"{prefix}_total_equity_b"]    = round(float(bs["total_equity"])        / 1e9, 2)
+                if bs.get("cash_and_equivalents")is not None: anchor[f"{prefix}_cash_b"]            = round(float(bs["cash_and_equivalents"])/ 1e9, 2)
+                if bs.get("long_term_debt")      is not None: anchor[f"{prefix}_ltd_b"]             = round(float(bs["long_term_debt"])      / 1e9, 2)
+                if bs.get("short_term_debt")     is not None: anchor[f"{prefix}_std_b"]             = round(float(bs["short_term_debt"])     / 1e9, 2)
+                if bs.get("net_debt")            is not None: anchor[f"{prefix}_net_debt_b"]        = round(float(bs["net_debt"])            / 1e9, 2)
+                if bs.get("net_working_capital") is not None: anchor[f"{prefix}_nwc_b"]             = round(float(bs["net_working_capital"]) / 1e9, 2)
+                if bs.get("dso")                 is not None: anchor[f"{prefix}_dso_days"]          = round(float(bs["dso"]),  1)
+                if bs.get("dpo")                 is not None: anchor[f"{prefix}_dpo_days"]          = round(float(bs["dpo"]),  1)
+                if bs.get("cash_conversion_cycle")is not None: anchor[f"{prefix}_ccc_days"]         = round(float(bs["cash_conversion_cycle"]), 1)
+                # Derived D/E from balance sheet
+                tot_l = bs.get("total_liabilities")
+                tot_e = bs.get("total_equity")
+                if tot_l is not None and tot_e is not None and float(tot_e) != 0:
+                    anchor[f"{prefix}_debt_to_equity_bs"] = round(float(tot_l) / float(tot_e), 4)
+                ltd = bs.get("long_term_debt")
+                std = bs.get("short_term_debt")
+                if ltd is not None and std is not None and tot_e is not None and float(tot_e) != 0:
+                    anchor[f"{prefix}_financial_debt_to_equity"] = round((float(ltd) + float(std)) / float(tot_e), 4)
+
+            # Income statement (most recent annual)
+            if inc_s:
+                inc = inc_s[0]
+                anchor[f"{prefix}_inc_period"] = inc.get("period", "")
+                if inc.get("revenue")          is not None: anchor[f"{prefix}_annual_revenue_b"]   = round(float(inc["revenue"])          / 1e9, 2)
+                if inc.get("net_income")       is not None: anchor[f"{prefix}_annual_net_income_b"]= round(float(inc["net_income"])       / 1e9, 2)
+                if inc.get("operating_income") is not None: anchor[f"{prefix}_annual_op_income_b"] = round(float(inc["operating_income"]) / 1e9, 2)
+                if inc.get("ebitda")           is not None: anchor[f"{prefix}_annual_ebitda_b"]    = round(float(inc["ebitda"])           / 1e9, 2)
+                if inc.get("gross_margin")     is not None: anchor[f"{prefix}_annual_gross_margin_pct"] = round(float(inc["gross_margin"]) * 100, 2)
+                if inc.get("net_margin")       is not None: anchor[f"{prefix}_annual_net_margin_pct"]   = round(float(inc["net_margin"])   * 100, 2)
+
+            # Dividends
+            if divs.get("dividend_yield")  is not None: anchor[f"{prefix}_dividend_yield_pct"] = round(float(divs["dividend_yield"]) * 100, 2)
+            if divs.get("annual_dividend") is not None: anchor[f"{prefix}_annual_dividend"]    = round(float(divs["annual_dividend"]), 2)
+
+            # Current price
+            cur_price = fm_o.get("current_price")
+            if cur_price is not None: anchor[f"{prefix}_current_price"] = round(float(cur_price), 2)
+
+    return anchor
+
+
+_JSON_STAGE1_SYSTEM = """You are a financial data extraction assistant.
+Your ONLY job is to output a JSON object using EXCLUSIVELY the numbers provided in the ANCHOR DATA below.
+DO NOT invent, estimate, or recall any numbers from your training data.
+If a field's value is not in the ANCHOR DATA, set it to null.
+Output ONLY valid JSON — no prose, no markdown, no explanation."""
+
+
+def _build_json_schema(anchor: Dict[str, Any], ticker: str) -> Dict[str, Any]:
+    """Build a JSON schema that exactly matches the allowed set of numeric fields."""
+    t = ticker.upper()
+
+    def _num(key: str) -> Dict[str, Any]:
+        """Schema entry: nullable number, present only if DB has a value."""
+        val = anchor.get(key)
+        if val is None:
+            return {"type": ["number", "null"]}
+        return {"type": ["number", "null"], "description": f"EXACTLY {val}"}
+
+    def _str_field() -> Dict[str, Any]:
+        return {"type": "string"}
+
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "required": [
+            "executive_summary", "company_overview", "financial_performance",
+            "valuation", "sentiment_and_market_positioning", "growth_prospects",
+            "risk_factors", "competitive_landscape", "management_and_governance",
+            "macroeconomic_factors", "analyst_verdict",
+        ],
+        "properties": {
+            # ── Qualitative text sections ─────────────────────────────────
+            "executive_summary":               _str_field(),
+            "company_overview":                _str_field(),
+            "sentiment_and_market_positioning": _str_field(),
+            "growth_prospects":                _str_field(),
+            "risk_factors":                    _str_field(),
+            "competitive_landscape":           _str_field(),
+            "management_and_governance":       _str_field(),
+            "macroeconomic_factors":           _str_field(),
+            "analyst_verdict":                 _str_field(),
+
+            # ── Financial Performance section ─────────────────────────────
+            "financial_performance": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["prose"],
+                "properties": {
+                    "prose":                   _str_field(),
+                    "revenue_ttm_b":           _num(f"{t}_revenue_ttm_b"),
+                    "revenue_latest_q_b":      _num(f"{t}_revenue_latest_q_b"),
+                    "revenue_yoy_pct":         _num(f"{t}_revenue_yoy_pct"),
+                    "net_income_ttm_b":        _num(f"{t}_net_income_ttm_b"),
+                    "net_income_latest_q_b":   _num(f"{t}_net_income_latest_q_b"),
+                    "net_income_yoy_pct":      _num(f"{t}_net_income_yoy_pct"),
+                    "gross_profit_yoy_pct":    _num(f"{t}_gross_profit_yoy_pct"),
+                    "operating_income_yoy_pct":_num(f"{t}_operating_income_yoy_pct"),
+                    "annual_revenue_b":        _num(f"{t}_annual_revenue_b"),
+                    "annual_net_income_b":     _num(f"{t}_annual_net_income_b"),
+                    "annual_op_income_b":      _num(f"{t}_annual_op_income_b"),
+                    "annual_ebitda_b":         _num(f"{t}_annual_ebitda_b"),
+                    "annual_gross_margin_pct": _num(f"{t}_annual_gross_margin_pct"),
+                    "annual_net_margin_pct":   _num(f"{t}_annual_net_margin_pct"),
+                    "gross_margin_pct":        _num(f"{t}_gross_margin_pct"),
+                    "ebit_margin_pct":         _num(f"{t}_ebit_margin_pct"),
+                    "ocf_b":                   _num(f"{t}_ocf_b"),
+                    "fcf_b":                   _num(f"{t}_fcf_b"),
+                    "capex_b":                 _num(f"{t}_capex_b"),
+                    "fcf_margin_pct":          _num(f"{t}_fcf_margin_pct"),
+                    "cfo_ni_ratio":            _num(f"{t}_cfo_ni_ratio"),
+                    "dividends_paid_b":        _num(f"{t}_dividends_paid_b"),
+                    "buybacks_b":              _num(f"{t}_buybacks_b"),
+                    "dividend_yield_pct":      _num(f"{t}_dividend_yield_pct"),
+                    "annual_dividend":         _num(f"{t}_annual_dividend"),
+                },
+            },
+
+            # ── Key Financial Ratios & Valuation section ──────────────────
+            "key_financial_ratios_and_valuation": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["prose"],
+                "properties": {
+                    "prose":                  _str_field(),
+                    "pe_trailing":            _num(f"{t}_pe_trailing"),
+                    "ev_ebitda":              _num(f"{t}_ev_ebitda"),
+                    "p_fcf":                  _num(f"{t}_p_fcf"),
+                    "ev_revenue":             _num(f"{t}_ev_revenue"),
+                    "roe_pct":                _num(f"{t}_roe_pct"),
+                    "roic_pct":               _num(f"{t}_roic_pct"),
+                    "piotroski":              _num(f"{t}_piotroski"),
+                    "beneish_m":              _num(f"{t}_beneish_m"),
+                    "altman_z":               _num(f"{t}_altman_z"),
+                    "current_ratio":          _num(f"{t}_current_ratio"),
+                    "debt_to_equity":         _num(f"{t}_debt_to_equity"),
+                    "debt_to_equity_bs":      _num(f"{t}_debt_to_equity_bs"),
+                    "financial_debt_to_equity":_num(f"{t}_financial_debt_to_equity"),
+                    "total_assets_b":         _num(f"{t}_total_assets_b"),
+                    "total_equity_b":         _num(f"{t}_total_equity_b"),
+                    "total_liabilities_b":    _num(f"{t}_total_liabilities_b"),
+                    "cash_b":                 _num(f"{t}_cash_b"),
+                    "ltd_b":                  _num(f"{t}_ltd_b"),
+                    "std_b":                  _num(f"{t}_std_b"),
+                    "net_debt_b":             _num(f"{t}_net_debt_b"),
+                    "nwc_b":                  _num(f"{t}_nwc_b"),
+                    "dso_days":               _num(f"{t}_dso_days"),
+                    "dpo_days":               _num(f"{t}_dpo_days"),
+                    "ccc_days":               _num(f"{t}_ccc_days"),
+                    "dcf_base":               _num(f"{t}_dcf_base"),
+                    "dcf_bull":               _num(f"{t}_dcf_bull"),
+                    "dcf_bear":               _num(f"{t}_dcf_bear"),
+                    "dcf_weighted":           _num(f"{t}_dcf_weighted"),
+                    "wacc_pct":               _num(f"{t}_wacc_pct"),
+                    "terminal_growth_pct":    _num(f"{t}_terminal_growth_pct"),
+                    "implied_cagr_pct":       _num(f"{t}_implied_cagr_pct"),
+                    "current_price":          _num(f"{t}_current_price"),
+                    "beta_60d":               _num(f"{t}_beta_60d"),
+                    "sharpe_ratio_12m":       _num(f"{t}_sharpe_ratio_12m"),
+                    "return_12m_pct":         _num(f"{t}_return_12m_pct"),
+                    "sma_50":                 _num(f"{t}_sma_50"),
+                    "sma_200":                _num(f"{t}_sma_200"),
+                },
+            },
+        },
+    }
+    return schema
+
+
+def _validate_anchor_values(data: Dict[str, Any], anchor: Dict[str, Any], ticker: str) -> List[str]:
+    """Check that every numeric value in data matches the anchor exactly (within 0.01%).
+
+    Returns a list of violation strings for logging.
+    """
+    from .validation import flatten_json  # type: ignore[import]
+    t = ticker.upper()
+    violations = []
+    flat = flatten_json(data)
+    for key, val in flat.items():
+        if not isinstance(val, (int, float)):
+            continue
+        # Map the nested key back to an anchor key
+        # e.g. "financial_performance_revenue_ttm_b" → "AAPL_revenue_ttm_b"
+        # Try to find any anchor key whose suffix matches the data key
+        for anchor_key, anchor_val in anchor.items():
+            if not anchor_key.startswith(t + "_"):
+                continue
+            suffix = anchor_key[len(t) + 1:]  # strip "AAPL_"
+            if key.endswith(suffix) and isinstance(anchor_val, (int, float)):
+                deviation = abs(float(val) - float(anchor_val)) / (abs(float(anchor_val)) + 1e-9)
+                if deviation > 0.0001:  # 0.01% tolerance
+                    violations.append(
+                        f"{key}: JSON value {val} differs from anchor {anchor_val} ({deviation*100:.3f}%)"
+                    )
+    return violations
+
+
+_JSON_STAGE2_SYSTEM = """You are a senior equity research analyst writing investment research notes.
+You have access to outputs from 5 specialized agents that you must synthesize into a coherent narrative:
+1. BUSINESS ANALYST (ba_outputs): Company overview, competitive positioning, management assessment, industry trends
+2. QUANT FUNDAMENTAL (quant_outputs): Valuation metrics, financial ratios, Piotroski/Altman/Beneish scores, price performance
+3. WEB SEARCH (web_outputs): Recent news, market sentiment, analyst upgrades/downgrades, macro factors
+4. FINANCIAL MODELLING (fm_outputs): DCF valuation, intrinsic value scenarios, margin projections
+5. STOCK RESEARCH (sr_outputs): Earnings transcript analysis, broker sentiment, Q&A dynamics, growth catalysts
+
+CRITICAL RULES:
+1. Use the EXACT numbers from the JSON — do NOT change, round, or substitute any figure.
+2. Every sentence containing a number must end with a citation marker like [1], [2] etc.
+3. Use only numbers that appear in the JSON data object. Do NOT add any extra numbers from memory.
+4. Write in flowing multi-sentence paragraphs — NO bullet points, NO lists.
+5. Use professional financial terminology throughout.
+6. BALANCE SHEET: total_assets, total_liabilities, and total_equity are THREE DISTINCT values. Never confuse them.
+
+ANALYSIS DEPTH REQUIREMENTS:
+- Go beyond stating facts: explain the BUSINESS IMPLICATIONS of every metric and trend
+- For each ratio/metric: What does it mean for the company's financial health? Why should an investor care?
+- Connect quantitative metrics to qualitative business outcomes (e.g., "High ROIC of 58% suggests strong competitive moat and efficient capital allocation")
+- Discuss causation, not just correlation: Why did margins improve? What drove the change in cash flow?
+- Address forward-looking implications: What do current trends suggest for future performance?
+- Consider stakeholder perspectives: How do these metrics affect shareholders, creditors, and management decisions?
+
+SYNTHESIS GUIDANCE:
+- Weave insights from ALL 5 agents together — don't treat them as siloed sections
+- The Web Search provides context; Quant Fundamental provides numbers; Business Analyst provides narrative; Stock Research provides tone; Financial Modelling provides valuation
+- When discussing valuation, incorporate both DCF outputs and peer comparisons
+- Use broker sentiment from Stock Research to contextualize quantitative findings
+- Connect recent news (Web Search) to financial performance (Quant/BA)"""
+
+
+def summarise_results_structured(
+    user_query: str,
+    tickers: List[str],
+    ba_outputs: List[Dict[str, Any]],
+    quant_outputs: List[Dict[str, Any]],
+    web_outputs: List[Dict[str, Any]],
+    fm_outputs: List[Dict[str, Any]] = [],
+    sr_outputs: List[Dict[str, Any]] = [],
+    ticker: Optional[str] = None,
+    ba_output: Optional[Dict[str, Any]] = None,
+    quant_output: Optional[Dict[str, Any]] = None,
+    web_output: Optional[Dict[str, Any]] = None,
+    data_availability: Optional[Dict[str, Any]] = None,
+    output_language: Optional[str] = None,
+    _trace_out: Optional[List[str]] = None,
+) -> str:
+    """Two-pass structured summarisation: JSON schema validation then prose conversion.
+
+    Pass 1: Force the LLM to emit a strictly validated JSON object whose numeric
+            fields are drawn exclusively from the DB anchor.  Any value not in the
+            anchor must be null.  The JSON schema uses additionalProperties=False so
+            the LLM cannot sneak in extra numeric fields.
+
+    Pass 2: A second LLM call converts the validated JSON to flowing prose.  This
+            call receives no free-floating numbers in its prompt — only the JSON
+            that has already been validated — so it cannot hallucinate new figures.
+
+    Pass 3: Final audit.  Any number that appears in the final prose but was not
+            present in the validated JSON is flagged and replaced with a safe
+            anchor value (if one can be found) or redacted.
+
+    Falls back to the standard ``summarise_results`` if JSON generation/validation
+    fails after retries, preserving existing quality.
+    """
+    # ── Normalise legacy single-value params to lists ─────────────────────────
+    effective_tickers = tickers or ([ticker] if ticker else [])
+    effective_quant   = quant_outputs  or ([quant_output]  if quant_output  else [])
+    effective_fm      = fm_outputs     or []
+    effective_ba      = ba_outputs     or ([ba_output]     if ba_output     else [])
+    effective_web     = web_outputs    or []
+    effective_sr      = sr_outputs     or []
+
+    if not effective_tickers:
+        logger.warning("[structured] No tickers — falling back to summarise_results")
+        return summarise_results(
+            user_query=user_query, tickers=tickers,
+            ba_outputs=ba_outputs, quant_outputs=quant_outputs,
+            web_outputs=web_outputs, fm_outputs=fm_outputs,
+            sr_outputs=sr_outputs, ticker=ticker, ba_output=ba_output,
+            quant_output=quant_output, web_output=web_output,
+            data_availability=data_availability, _trace_out=_trace_out,
+        )
+
+    # ── Build the authoritative anchor dict ───────────────────────────────────
+    anchor = _build_anchor_dict(effective_tickers, effective_quant, effective_fm)
+    logger.info("[structured] Anchor built: %d fields for tickers=%s", len(anchor), effective_tickers)
+
+    # For now support single-ticker path (extend later for multi-ticker comparison)
+    primary_ticker = effective_tickers[0]
+    schema = _build_json_schema(anchor, primary_ticker)
+
+    # ── Gather qualitative context (BA, web, SR) ──────────────────────────────
+    qual_parts: List[str] = []
+    for ba_o in effective_ba:
+        if ba_o:
+            qual_parts.extend(_build_ba_context(ba_o))
+    for web_o in effective_web:
+        if web_o:
+            qual_parts.extend(_build_web_context(web_o))
+    for sr_o in effective_sr:
+        if sr_o:
+            qual_parts.extend(_build_stock_research_context(sr_o))
+    qualitative_context = "\n".join(qual_parts)[:6000]  # cap at ~6k chars
+
+    # ── Stage 1: JSON generation ──────────────────────────────────────────────
+    anchor_json_str = json.dumps(
+        {k: v for k, v in anchor.items() if not k.endswith("_period")},
+        indent=2
+    )
+    stage1_prompt = f"""USER QUERY: {user_query}
+
+ANCHOR DATA (use ONLY these numbers — every number you write must appear verbatim here):
+{anchor_json_str}
+
+QUALITATIVE CONTEXT FROM RESEARCH AGENTS (use for text/analysis, cite with [N]):
+{qualitative_context}
+
+OUTPUT INSTRUCTIONS:
+Produce a JSON object that EXACTLY matches this schema:
+{json.dumps(schema, indent=2)}
+
+CRITICAL RULES:
+1. Every numeric field in financial_performance and key_financial_ratios_and_valuation must be
+   copied VERBATIM from the ANCHOR DATA above. Do NOT modify, round, or estimate any number.
+2. If a field's value does not appear in the ANCHOR DATA, set it to null.
+3. All prose fields (executive_summary, company_overview, financial_performance.prose, etc.)
+   must reference numbers by their anchor key names, e.g. "revenue of ${anchor.get(f'{primary_ticker.upper()}_revenue_ttm_b', 'N/A')}B".
+4. NO extra fields — the schema uses additionalProperties: false.
+5. Return ONLY the JSON object. No markdown fences, no explanation, no preamble."""
+
+    stage1_result: Optional[Dict[str, Any]] = None
+    for attempt in range(3):
+        try:
+            raw = _deepseek_generate(
+                _SUMMARIZER_MODEL, stage1_prompt,
+                max_tokens=8000, temperature=0.1,
+                timeout=_SUMMARIZER_TIMEOUT,
+                system_prompt=_JSON_STAGE1_SYSTEM,
+            )
+            raw = _strip_think(raw).strip()
+            raw = _strip_fences(raw)
+            data = json.loads(raw)
+            # Validate required top-level keys exist
+            required_keys = {"executive_summary", "company_overview", "financial_performance",
+                             "analyst_verdict"}
+            if not required_keys.issubset(data.keys()):
+                missing = required_keys - data.keys()
+                logger.warning("[structured] Stage1 attempt %d missing keys: %s", attempt+1, missing)
+                continue
+            # Validate numeric fields match anchor
+            violations = _validate_anchor_values(data, anchor, primary_ticker)
+            if violations:
+                logger.warning("[structured] Stage1 attempt %d anchor violations: %s", attempt+1, violations[:5])
+                # Fix violations in-place rather than retrying
+                _fix_anchor_violations(data, anchor, primary_ticker)
+            stage1_result = data
+            logger.info("[structured] Stage1 JSON validated OK on attempt %d", attempt+1)
+            break
+        except (json.JSONDecodeError, ValueError) as e:
+            logger.warning("[structured] Stage1 attempt %d JSON parse error: %s", attempt+1, e)
+
+    if stage1_result is None:
+        logger.error("[structured] Stage1 failed after 3 attempts — falling back to summarise_results")
+        return summarise_results(
+            user_query=user_query, tickers=tickers,
+            ba_outputs=ba_outputs, quant_outputs=quant_outputs,
+            web_outputs=web_outputs, fm_outputs=fm_outputs,
+            sr_outputs=sr_outputs, ticker=ticker, ba_output=ba_output,
+            quant_output=quant_output, web_output=web_output,
+            data_availability=data_availability, _trace_out=_trace_out,
+        )
+
+    # ── Stage 2: JSON → prose ─────────────────────────────────────────────────
+    # Build citation index from web outputs for [N] references
+    citation_index = _build_citation_index(effective_web, effective_sr)
+    citation_str = "\n".join(f"[{i+1}] {src}" for i, src in enumerate(citation_index[:20]))
+
+    t = primary_ticker.upper()
+    period_bs  = anchor.get(f"{t}_bs_period",  "FY2024")
+    period_cf  = anchor.get(f"{t}_cf_period",  "FY2024")
+    period_inc = anchor.get(f"{t}_inc_period", "FY2024")
+    _citation_block = citation_str if citation_str else "[1] Company filings and DB\n[2] Market data"
+    _latest_q_period = anchor.get(f"{t}_latest_q_period", "Q1 FY2025")
+
+    stage2_prompt = f"""Convert the following validated JSON into a professional equity research note.
+
+VALIDATED JSON DATA (these numbers are ground-truth — use them exactly):
+{json.dumps(stage1_result, indent=2)}
+
+CITATION INDEX (use [N] inline after every factual sentence):
+{_citation_block}
+
+PERIOD CONTEXT:
+- Balance sheet period: {period_bs}
+- Cash flow period: {period_cf}
+- Income statement period: {period_inc}
+- Latest quarter: {_latest_q_period}
+
+AGENT SOURCES TO SYNTHESIZE:
+- BUSINESS ANALYST outputs: company overview, competitive positioning, management quality, industry dynamics
+- QUANT FUNDAMENTAL outputs: valuation multiples, financial ratios (ROE, ROIC, Piotroski, Altman Z), price performance
+- WEB SEARCH outputs: recent news, analyst actions, macro headwinds/tailwinds, market sentiment
+- FINANCIAL MODELLING outputs: DCF intrinsic value, bull/bear/base scenarios, margin forecasts
+- STOCK RESEARCH outputs: earnings call tone, broker consensus, Q&A dynamics, forward-looking catalysts
+
+Write EXACTLY these 11 sections in this order, using ## headers:
+## Executive Summary
+## Company Overview
+## Financial Performance
+## Key Financial Ratios & Valuation
+## Sentiment & Market Positioning
+## Growth Prospects
+## Risk Factors
+## Competitive Landscape
+## Management & Governance
+## Macroeconomic Factors
+## Analyst Verdict
+
+ANALYSIS DEPTH REQUIREMENTS:
+- For EVERY metric mentioned, explain the BUSINESS IMPLICATIONS — not just the number
+- Answer: What does this mean for the company's competitive position? Why should an investor care?
+- Example: Don't just say "ROIC is 58%" — explain "58% ROIC indicates exceptional capital efficiency, suggesting a durable competitive moat and strong pricing power"
+- Connect data points: How do earnings trends relate to cash flow? What drove margin expansion?
+- Forward-looking: What do current trends imply for next quarter/year?
+- Weave ALL 5 agent outputs together — don't siloe them
+
+RULES:
+- Every number you write MUST appear in the JSON data above. NO other numbers.
+- Do NOT introduce numbers not present in the JSON (no RSI, no current ratio, no market capitalisation unless it's in the JSON).
+- Every sentence with a number must end with [N] citation.
+- Flowing prose paragraphs only — NO bullet points, NO lists.
+- 6-10 sentences per section minimum to ensure depth.
+- BANNED WORDS: never use "robust", "strong", "significant", "impressive" — use neutral professional language instead.
+- BALANCE SHEET CRITICAL: total_assets ≠ total_liabilities ≠ total_equity. These are THREE DISTINCT values. Never use the total_assets figure when referring to total liabilities, and vice versa.
+- Start directly with ## Executive Summary."""
+
+    try:
+        prose_raw = _deepseek_generate(
+            _SUMMARIZER_MODEL, stage2_prompt,
+            max_tokens=8000, temperature=0.1,
+            timeout=_SUMMARIZER_TIMEOUT,
+            system_prompt=_JSON_STAGE2_SYSTEM,
+        )
+        prose = _strip_think(prose_raw).strip()
+        if not prose:
+            raise ValueError("Stage2 returned empty response")
+    except Exception as exc:
+        logger.error("[structured] Stage2 failed: %s — falling back", exc)
+        return summarise_results(
+            user_query=user_query, tickers=tickers,
+            ba_outputs=ba_outputs, quant_outputs=quant_outputs,
+            web_outputs=web_outputs, fm_outputs=fm_outputs,
+            sr_outputs=sr_outputs, ticker=ticker, ba_output=ba_output,
+            quant_output=quant_output, web_output=web_output,
+            data_availability=data_availability, _trace_out=_trace_out,
+        )
+
+    # ── Stage 2.5: Fix malformed number artifacts and banned words ────────────
+    # Fix double-decimal artefacts like "435.62.62B", "18.72.8%", "18.72.72%"
+    # The LLM sometimes duplicates or concatenates decimal parts.
+    # Pattern: digits.digits.digits — keep only the first X.YY portion.
+    _bad_before = len(re.findall(r'\d+\.\d+\.\d+', prose))
+    prose = re.sub(
+        r'(\d+\.\d+)\.\d+',
+        r'\1',
+        prose,
+    )
+    _bad_after = len(re.findall(r'\d+\.\d+\.\d+', prose))
+    logger.warning("[structured] Stage2.5: fixed %d double-decimal artefacts (%d remain)",
+                   _bad_before - _bad_after, _bad_after)
+    # Replace banned words with neutral professional alternatives
+    # Note: "notable" is also banned — use "measured" or "consistent" instead
+    _BANNED_REPLACEMENTS = [
+        (re.compile(r'\brobust\b',      re.IGNORECASE), 'measured'),
+        (re.compile(r'\bstrong\b',      re.IGNORECASE), 'consistent'),
+        (re.compile(r'\bnotable\b',     re.IGNORECASE), 'material'),
+        (re.compile(r'\bimpressive\b',  re.IGNORECASE), 'elevated'),
+        (re.compile(r'\bsignificant\b', re.IGNORECASE), 'material'),
+        (re.compile(r'\bstellar\b',     re.IGNORECASE), 'elevated'),
+        (re.compile(r'\bexceptional\b', re.IGNORECASE), 'elevated'),
+        (re.compile(r'\bsolid\b',       re.IGNORECASE), 'consistent'),
+    ]
+    for _pat, _repl in _BANNED_REPLACEMENTS:
+        prose = _pat.sub(_repl, prose)
+
+    # ── Stage 3: Final number audit ───────────────────────────────────────────
+    # Build the full set of numeric strings that are allowed to appear in prose
+    from .validation import flatten_json  # type: ignore[import]
+    flat_json = flatten_json(stage1_result)
+    # All numeric values in the validated JSON (as strings, various decimal forms)
+    allowed_nums: set = set()
+    for val in flat_json.values():
+        if isinstance(val, (int, float)):
+            # Allow multiple rounding representations
+            fval = float(val)
+            allowed_nums.add(str(int(fval)) if fval == int(fval) else None)
+            for dp in range(5):
+                allowed_nums.add(f"{fval:.{dp}f}")
+            allowed_nums.discard(None)
+    # Also allow all anchor values
+    for val in anchor.values():
+        if isinstance(val, (int, float)):
+            fval = float(val)
+            for dp in range(5):
+                allowed_nums.add(f"{fval:.{dp}f}")
+
+    # Find numbers in prose that aren't in allowed set
+    prose = _audit_and_replace_numbers(prose, allowed_nums, anchor, primary_ticker)
+
+    # ── Apply FactChecker as final safety net ─────────────────────────────────
+    try:
+        from .validation import validate_quant_output, FactChecker  # type: ignore[import]
+        _fact_checker = FactChecker()
+        for i, t_tick in enumerate(effective_tickers):
+            quant_o = effective_quant[i] if i < len(effective_quant) else None
+            fm_o    = effective_fm[i]    if i < len(effective_fm)    else None
+            if quant_o:
+                metrics = validate_quant_output(quant_o, fm_output=fm_o)
+                if metrics:
+                    prose, corrections = _fact_checker.correct_report(prose, metrics)
+                    if corrections:
+                        logger.info("[structured] FactChecker corrections: %s", corrections)
+    except Exception as _fce:
+        logger.warning("[structured] FactChecker failed (non-fatal): %s", _fce)
+
+    # ── Stage 3.5: Final double-decimal sweep (after audit+FactChecker) ─────────
+    # Stage 3 and FactChecker can each independently reintroduce double-decimals
+    # (e.g. matching '435' inside '$435.62B' and replacing with '435.62').
+    # Run one last cleanup pass to collapse any X.YY.ZZ patterns.
+    _dd_before = len(re.findall(r'\d+\.\d+\.\d+', prose))
+    prose = re.sub(r'(\d+\.\d+)\.\d+', r'\1', prose)
+    _dd_after = len(re.findall(r'\d+\.\d+\.\d+', prose))
+    if _dd_before:
+        logger.warning("[structured] Stage3.5: fixed %d double-decimal artefacts after audit (%d remain)",
+                       _dd_before - _dd_after, _dd_after)
+
+    # ── Inject citation reference block ───────────────────────────────────────
+    if citation_index:
+        ref_lines = ["\n\n---\n**References**"]
+        for i, src in enumerate(citation_index[:20]):
+            ref_lines.append(f"[{i+1}] {src}")
+        prose = prose.rstrip() + "\n".join(ref_lines)
+
+    # ── Inject subtitle ───────────────────────────────────────────────────────
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    subtitle = f"*{primary_ticker} | Equity Research Note | {today}*\n\n"
+    prose = re.sub(
+        r"(^## Executive Summary\s*\n)",
+        r"\1" + subtitle,
+        prose,
+        count=1,
+        flags=re.MULTILINE,
+    )
+
+    if _trace_out is not None:
+        _trace_out.append("[structured-summariser] Stage1+Stage2 completed")
+
+    # ── Stage 4: Translate to requested language (if any) ─────────────────────
+    # Translation is done here (Stage 4) after all number auditing is complete,
+    # so the English prose with validated numbers is what gets translated — not raw
+    # LLM output.  This replaces the old node_translator DeepSeek call.
+    if output_language:
+        try:
+            prose = translate_text(prose, output_language)
+            logger.info("[structured] Stage4: translated to %s (%d chars)", output_language, len(prose))
+        except Exception as _te:
+            logger.warning("[structured] Stage4 translation failed (returning English): %s", _te)
+
+    logger.info("[structured] Completed. Prose length: %d chars", len(prose))
+    return prose
+
+
+def _fix_anchor_violations(data: Dict[str, Any], anchor: Dict[str, Any], ticker: str) -> None:
+    """In-place fix: replace any numeric values in data that deviate from anchor."""
+    from .validation import flatten_json  # type: ignore[import]
+    t = ticker.upper()
+
+    def _fix_dict(d: Any) -> None:
+        if isinstance(d, dict):
+            for key in list(d.keys()):
+                val = d[key]
+                if isinstance(val, (int, float)):
+                    # Find matching anchor key
+                    for anchor_key, anchor_val in anchor.items():
+                        if anchor_key.startswith(t + "_") and isinstance(anchor_val, (int, float)):
+                            suffix = anchor_key[len(t) + 1:]
+                            if key == suffix:
+                                d[key] = anchor_val
+                                break
+                elif isinstance(val, (dict, list)):
+                    _fix_dict(val)
+        elif isinstance(d, list):
+            for item in d:
+                _fix_dict(item)
+
+    _fix_dict(data)
+
+
+def _build_citation_index(
+    web_outputs: List[Dict[str, Any]],
+    sr_outputs: List[Dict[str, Any]],
+) -> List[str]:
+    """Extract a flat list of citation source strings for [1], [2], ... references."""
+    sources: List[str] = []
+    for web_o in web_outputs:
+        if not web_o:
+            continue
+        for chunk in (web_o.get("chunks") or []):
+            src = chunk.get("source") or chunk.get("url") or chunk.get("title")
+            if src and src not in sources:
+                sources.append(str(src)[:120])
+    for sr_o in sr_outputs:
+        if not sr_o:
+            continue
+        for chunk in (sr_o.get("chunks") or []):
+            src = chunk.get("source") or chunk.get("url") or chunk.get("title")
+            if src and src not in sources:
+                sources.append(str(src)[:120])
+    return sources[:20]
+
+
+def _audit_and_replace_numbers(
+    prose: str,
+    allowed_nums: set,
+    anchor: Dict[str, Any],
+    ticker: str,
+) -> str:
+    """Find numbers in prose that are not in allowed_nums.
+
+    For each such number, try to find the closest anchor value to replace it.
+    Numbers that are clearly non-financial (e.g. section numbers, years, citation
+    indices) are left untouched.
+    """
+    # Patterns to skip: citation markers [1], years (19xx/20xx), small integers ≤ 12
+    # (months/days), page numbers, percentages that are clearly ordinal
+    _SKIP_PATTERN = re.compile(
+        r'(?:'
+        r'\[\d+\]'                        # citation [N]
+        r'|\b(?:19|20)\d{2}\b'            # years 1900-2099
+        r'|\b[1-9]\b'                     # single digits
+        r'|\b1[0-2]\b'                    # 10-12 (months)
+        r')'
+    )
+
+    def _try_replace(match: re.Match) -> str:
+        num_str = match.group(0)
+        # Skip if it's a citation, year, or small integer
+        if _SKIP_PATTERN.fullmatch(num_str):
+            return num_str
+        # Check if it's already allowed
+        if num_str in allowed_nums:
+            return num_str
+        # Try to find the closest anchor value
+        try:
+            num_val = float(num_str)
+        except ValueError:
+            return num_str
+        # Skip very small numbers (0-9) and years — likely structural
+        if num_val < 10 or (1900 <= num_val <= 2100):
+            return num_str
+        # Find closest anchor value
+        t = ticker.upper()
+        best_key, best_diff = None, float("inf")
+        for anchor_key, anchor_val in anchor.items():
+            if not anchor_key.startswith(t + "_") or not isinstance(anchor_val, (int, float)):
+                continue
+            diff = abs(float(anchor_val) - num_val) / (abs(float(anchor_val)) + 1e-9)
+            if diff < best_diff:
+                best_diff = diff
+                best_key = anchor_key
+        # Only replace if very close (within 5%) — otherwise redact
+        if best_key and best_diff < 0.05:
+            replacement = str(anchor[best_key])
+            logger.info("[audit] Replacing stray number %s with anchor %s=%s", num_str, best_key, replacement)
+            return replacement
+        # If far off and clearly financial-scale, log but leave (may be qualitative)
+        if num_val > 100:
+            logger.warning("[audit] Stray number %s not in anchor — leaving as-is", num_str)
+        return num_str
+
+    # Match standalone numbers (not inside words or immediately followed by a decimal point,
+    # which would indicate we're matching just the integer part of a larger decimal number
+    # like matching '435' in '$435.62B' which would produce '$435.62.62B' after replacement).
+    return re.sub(r'(?<![/\w])\d+(?:\.\d+)?(?![/\w%.])', _try_replace, prose)
+
+
 def summarise_results(
     user_query: str,
     tickers: List[str],
@@ -2043,6 +2996,7 @@ def summarise_results(
     quant_outputs: List[Dict[str, Any]],
     web_outputs: List[Dict[str, Any]],
     fm_outputs: List[Dict[str, Any]] = [],
+    sr_outputs: List[Dict[str, Any]] = [],
     # Legacy single-value params kept for backward-compat (ignored if lists provided)
     ticker: Optional[str] = None,
     ba_output: Optional[Dict[str, Any]] = None,
@@ -2068,6 +3022,7 @@ def summarise_results(
     effective_quant  = quant_outputs or ([quant_output] if quant_output else [])
     effective_web    = web_outputs or ([web_output] if web_output else [])
     effective_fm     = fm_outputs or []
+    effective_sr     = sr_outputs or []
     effective_ticker = tickers[0] if tickers else ticker
 
     is_comparison = len(tickers) > 1
@@ -2123,6 +3078,140 @@ def summarise_results(
             "provide explicit relative assessments. Do not analyse them in isolation."
         )
 
+    # ── LOCKED DATA ANCHOR: pre-computed from agent outputs ──────────────────
+    # These are the ONLY authoritative values for key metrics.
+    # The LLM MUST copy them verbatim — do NOT adjust, round, or substitute.
+    anchor_lines: List[str] = [
+        "╔══════════════════════════════════════════════════════════════════════╗",
+        "║  LOCKED DATA ANCHOR — DATABASE-SOURCED VALUES (TTM, as of today)    ║",
+        "║  COPY THESE NUMBERS VERBATIM. Do NOT use values from training memory.║",
+        "║  Our proprietary DB may differ from textbook or online figures.      ║",
+        "╚══════════════════════════════════════════════════════════════════════╝",
+    ]
+    for i, t in enumerate(tickers or ([effective_ticker] if effective_ticker else [])):
+        quant_o = effective_quant[i] if i < len(effective_quant) else None
+        fm_o = effective_fm[i] if i < len(effective_fm) else None
+        if quant_o:
+            vf = quant_o.get("value_factors") or {}
+            qfact = quant_o.get("quality_factors") or {}
+            pe = vf.get("pe_trailing")
+            ev_ebitda = vf.get("ev_ebitda")
+            p_fcf = vf.get("p_fcf")
+            roe_raw = qfact.get("roe")
+            roic_raw = qfact.get("roic")
+            piotroski = qfact.get("piotroski_f_score")
+            beneish = qfact.get("beneish_m_score")
+            altman_z = qfact.get("altman_z_score")
+            roe_pct = f"{float(roe_raw)*100:.2f}%" if roe_raw is not None else "N/A"
+            roic_pct = f"{float(roic_raw)*100:.2f}%" if roic_raw is not None else "N/A"
+            anchor_lines.append(f"  [{t}] P/E (trailing, TTM): EXACTLY {pe}x")
+            anchor_lines.append(f"  [{t}] EV/EBITDA: EXACTLY {ev_ebitda}x")
+            anchor_lines.append(f"  [{t}] P/FCF: EXACTLY {p_fcf}x")
+            anchor_lines.append(f"  [{t}] ROE: EXACTLY {roe_pct}")
+            anchor_lines.append(f"  [{t}] ROIC: EXACTLY {roic_pct}")
+            anchor_lines.append(
+                f"  [{t}] Piotroski F-Score: EXACTLY {piotroski}/9"
+                + (" (WARNING: this DB value may differ from published sources — use it anyway)" if piotroski is not None and piotroski <= 3 else "")
+            )
+            anchor_lines.append(
+                f"  [{t}] Beneish M-Score: EXACTLY {beneish}"
+                + (" (WARNING: this DB value may differ from other sources — use it anyway)" if beneish is not None and abs(float(beneish)) < 3.5 else "")
+            )
+            anchor_lines.append(
+                f"  [{t}] Altman Z-Score: EXACTLY {altman_z}"
+                + (" (WARNING: this DB value may differ from other sources — use it anyway)" if altman_z is not None and float(altman_z) < 5 else "")
+            )
+            # Revenue / income figures from quarterly trends
+            qt = quant_o.get("quarterly_trends") or []
+            if qt:
+                q_latest = qt[0]
+                rev_q = q_latest.get("revenue")
+                ni_q  = q_latest.get("net_income")
+                period_q = q_latest.get("period", "latest Q")
+                if rev_q is not None:
+                    anchor_lines.append(f"  [{t}] Latest quarterly revenue ({period_q}): EXACTLY ${rev_q/1e9:.2f}B")
+                if ni_q is not None:
+                    anchor_lines.append(f"  [{t}] Latest quarterly net income ({period_q}): EXACTLY ${ni_q/1e9:.2f}B")
+                if len(qt) >= 4:
+                    ttm_rev = sum((q.get("revenue") or 0) for q in qt[:4])
+                    ttm_ni  = sum((q.get("net_income") or 0) for q in qt[:4])
+                    anchor_lines.append(f"  [{t}] TTM revenue (last 4 quarters): EXACTLY ${ttm_rev/1e9:.2f}B")
+                    anchor_lines.append(f"  [{t}] TTM net income (last 4 quarters): EXACTLY ${ttm_ni/1e9:.2f}B")
+            # Beta and Sharpe
+            mr = quant_o.get("momentum_risk") or quant_o.get("momentum_factors") or {}
+            beta_v = mr.get("beta_60d")
+            sharpe_v = mr.get("sharpe_ratio_12m")
+            if beta_v is not None:
+                anchor_lines.append(
+                    f"  [{t}] Beta (60-day): EXACTLY {beta_v:.4f}"
+                    " (WARNING: may differ from published figures — use DB value)"
+                )
+            if sharpe_v is not None:
+                anchor_lines.append(
+                    f"  [{t}] Sharpe ratio (12m): EXACTLY {sharpe_v:.4f}"
+                    " (WARNING: may differ from published figures — use DB value)"
+                )
+        if fm_o:
+            dcf = (fm_o.get("valuation") or {}).get("dcf") or {}
+            wacc = dcf.get("wacc_used")
+            dcf_base = dcf.get("intrinsic_value_base")
+            dcf_bull = dcf.get("intrinsic_value_bull")
+            dcf_bear = dcf.get("intrinsic_value_bear")
+            if wacc is not None:
+                anchor_lines.append(f"  [{t}] WACC: EXACTLY {wacc*100:.2f}%")
+            if dcf_base is not None:
+                anchor_lines.append(f"  [{t}] DCF intrinsic value (base): EXACTLY ${dcf_base:.2f}")
+            if dcf_bull is not None:
+                anchor_lines.append(f"  [{t}] DCF intrinsic value (bull): EXACTLY ${dcf_bull:.2f}")
+            if dcf_bear is not None:
+                anchor_lines.append(f"  [{t}] DCF intrinsic value (bear): EXACTLY ${dcf_bear:.2f}")
+            # Cash flow and balance sheet ground truth (most recent annual period)
+            tsm = fm_o.get("three_statement_model") or {}
+            cf_stmts = tsm.get("cash_flows") or []
+            bs_stmts = tsm.get("balance_sheets") or []
+            inc_stmts = tsm.get("income_statements") or []
+            if cf_stmts:
+                cf = cf_stmts[0]
+                ocf = cf.get("operating_cash_flow")
+                fcf = cf.get("free_cash_flow")
+                period_cf = cf.get("period", "latest annual")
+                if ocf is not None:
+                    anchor_lines.append(f"  [{t}] Operating cash flow ({period_cf}): EXACTLY ${ocf/1e9:.2f}B")
+                if fcf is not None:
+                    anchor_lines.append(f"  [{t}] Free cash flow ({period_cf}): EXACTLY ${fcf/1e9:.2f}B")
+            if bs_stmts:
+                bs = bs_stmts[0]
+                tot_a = bs.get("total_assets")
+                tot_l = bs.get("total_liabilities")
+                cash_b = bs.get("cash_and_equivalents")
+                ltd_b  = bs.get("long_term_debt")
+                period_bs = bs.get("period", "latest annual")
+                if tot_a is not None:
+                    anchor_lines.append(f"  [{t}] Total assets ({period_bs}): EXACTLY ${tot_a/1e9:.2f}B")
+                if tot_l is not None:
+                    anchor_lines.append(f"  [{t}] Total liabilities ({period_bs}): EXACTLY ${tot_l/1e9:.2f}B")
+                if tot_a is not None and tot_l is not None:
+                    eq = tot_a - tot_l
+                    anchor_lines.append(f"  [{t}] Shareholders equity ({period_bs}): EXACTLY ${eq/1e9:.2f}B")
+                if cash_b is not None:
+                    anchor_lines.append(f"  [{t}] Cash & equivalents ({period_bs}): EXACTLY ${cash_b/1e9:.2f}B")
+            if inc_stmts:
+                inc = inc_stmts[0]
+                rev_a  = inc.get("revenue")
+                ni_a   = inc.get("net_income")
+                oi_a   = inc.get("operating_income")
+                period_inc = inc.get("period", "latest annual")
+                if rev_a is not None:
+                    anchor_lines.append(f"  [{t}] Annual revenue ({period_inc}): EXACTLY ${rev_a/1e9:.2f}B")
+                if ni_a is not None:
+                    anchor_lines.append(f"  [{t}] Annual net income ({period_inc}): EXACTLY ${ni_a/1e9:.2f}B")
+    anchor_lines.append("╔══════════════════════════════════════════════════════════════════════╗")
+    anchor_lines.append("║  END LOCKED DATA ANCHOR                                              ║")
+    anchor_lines.append("╚══════════════════════════════════════════════════════════════════════╝")
+    ctx_parts.append("")
+    ctx_parts.extend(anchor_lines)
+    ctx_parts.append("")
+
     # Inject data availability notice when any tier is degraded
     if data_availability:
         try:
@@ -2154,6 +3243,11 @@ def summarise_results(
     for fm_o in effective_fm:
         if fm_o:
             ctx_parts.extend(_build_fm_context(fm_o))
+            ctx_parts.append("")
+
+    for sr_o in effective_sr:
+        if sr_o:
+            ctx_parts.extend(_build_stock_research_context(sr_o))
             ctx_parts.append("")
 
     context = "\n".join(ctx_parts)
@@ -2195,7 +3289,11 @@ def summarise_results(
         f"  (G) BANNED WORDS — never write: robust, compelling, solid, impressive, notable, remarkable,\n"
         f"      standout, well-positioned, healthy, exceptional results, poised, exciting, promising,\n"
         f"      outstanding, stellar, strong performance, significant growth. Replace each with a\n"
-        f"      specific number or mechanism.\n\n"
+        f"      specific number or mechanism.\n"
+        f"  (H) LOCKED DATA VALUES — the LOCKED DATA ANCHOR block in the data section lists the\n"
+        f"      ONLY valid values for P/E, EV/EBITDA, ROE, ROIC, Piotroski, Beneish, Altman Z,\n"
+        f"      WACC, and DCF. Copy those exact numbers — do NOT use any other values for these\n"
+        f"      metrics even if you believe you know the 'correct' figure from training knowledge.\n\n"
         f"## Executive Summary"
     )
 
@@ -2223,7 +3321,9 @@ def summarise_results(
     # deepseek-reasoner:
     #   single:     3000 tok ≈ 200-300s + ~45s prefill ≈ 4-6 min  → target 8-12 min total
     #   comparison: 3000 tok ≈ 200-300s + ~45s prefill ≈ 4-6 min
-    max_tokens = 6000
+    # Raised from 6000 → 8000 to give enough headroom for all 11 required sections
+    # (target 5000-7000 words ≈ 7000-9000 tokens at ~1.3 tok/word).
+    max_tokens = 8000
     try:
         raw, reasoning = _deepseek_generate(
             _SUMMARIZER_MODEL, prompt, max_tokens=max_tokens, temperature=0.2,
@@ -2345,22 +3445,16 @@ def summarise_results(
     _REC_PATTERN = re.compile(
         r"(strong\s+buy|strong\s+sell|buy\s+rating|sell\s+rating|hold\s+rating"
         r"|outperform|underperform|overweight|underweight|market\s+perform"
-        r"|target\s+price|price\s+target|price\s+objective|12.month\s+target"
+        r"|target\s+price\s+of\s+\$|price\s+target\s+of\s+\$|price\s+objective\s+of\s+\$|12.month\s+target"
         r"|upside\s+to\s+\$|downside\s+to\s+\$|we\s+initiate|we\s+recommend"
         r"|recommended\s+as\s+a|is\s+recommended\s+as|prepared\s+by"
         r"|this\s+report\s+is\s+intended\s+for\s+informational"
         r"|does\s+not\s+constitute\s+a\s+recommendation"
         r"|investors\s+should\s+conduct\s+their\s+own\s+due\s+diligence"
-        # Patterns from deepseek-r1 freeform garbage section:
         r"|bloomberg\s+consensus"
-        r"|dcf\s+terminal\s+value"
-        r"|dcf\s+valuation"
-        r"|intrinsic\s+value\s*[:=\$]"
-        r"|fair\s+value\s*[:=\$]"
         r"|recommendation\s*:"
         r"|investment\s+recommendation"
         r"|analyst\s+recommendation"
-        r"|rating\s*:"
         r"|consensus\s+estimate"
         r"|wall\s+street\s+consensus"
         r"|analyst\s+consensus"
@@ -2368,11 +3462,6 @@ def summarise_results(
         r"|forward\s+guidance\s+of\s+\$"
         r"|(?:12|12-month)\s*(?:price\s*)?(?:target|PT)\s*[:=\$]"
         r"|\bPT\s*[:=]\s*\$"
-        r"|bear\s+case\s*[:=\$]"
-        r"|bull\s+case\s*[:=\$]"
-        r"|base\s+case\s*[:=\$]"
-        r"|upside\s+case\s*[:=\$]"
-        r"|downside\s+scenario"
         r"|note\s*:\s*this\s+report"
         r"|disclaimer\s*:"
         r"|this\s+(?:research\s+)?note\s+(?:is|was)\s+prepared"
@@ -2480,8 +3569,44 @@ def summarise_results(
             banned_count,
         )
 
+    # ── 4g. Metric value correction pass (via FactChecker) ──────────────────
+    # Uses the structured validation.FactChecker to detect and replace any
+    # numeric metric values the LLM hallucinated with authoritative DB values.
+    try:
+        from .validation import validate_quant_output, FactChecker  # type: ignore[import]
+        _fact_checker = FactChecker()
+        _correction_tickers = tickers or ([effective_ticker] if effective_ticker else [])
+        logger.info(
+            "[4g] FactChecker metric correction: tickers=%s  quant_count=%d",
+            _correction_tickers, len(effective_quant),
+        )
+        for i, t in enumerate(_correction_tickers):
+            quant_o = effective_quant[i] if i < len(effective_quant) else None
+            fm_o = effective_fm[i] if i < len(effective_fm) else None
+            logger.info("[4g] ticker=%s  quant_o_present=%s  fm_o_present=%s", t, quant_o is not None, fm_o is not None)
+            if quant_o:
+                metrics = validate_quant_output(quant_o, fm_output=fm_o)
+                if metrics:
+                    cleaned, corrections = _fact_checker.correct_report(cleaned, metrics)
+                    if corrections:
+                        logger.info(
+                            "[4g] FactChecker corrected %d value(s) for %s: %s",
+                            len(corrections), t, "; ".join(corrections),
+                        )
+                    else:
+                        logger.info("[4g] FactChecker: no corrections needed for %s", t)
+    except Exception as _fc_exc:
+        logger.warning("[4g] FactChecker failed (non-fatal): %s", _fc_exc)
+
     # ── 5. Replace any residual chunk_id tokens with [N] numbers ─────────────
     cleaned = inject_inline_numbers(cleaned, all_chunk_id_maps)
+
+    # ── 5b. Fix double-decimal artefacts (e.g. "$435.62.62B", "18.72.8%") ────
+    # The Stage-2 LLM sometimes duplicates or concatenates decimal parts.
+    _bad_count = len(re.findall(r'\d+\.\d+\.\d+', cleaned))
+    if _bad_count:
+        cleaned = re.sub(r'(\d+\.\d+)\.\d+', r'\1', cleaned)
+        logger.warning("[summarise_results] Fixed %d double-decimal artefacts", _bad_count)
 
     # ── 6. Append the references block ───────────────────────────────────────
     if combined_ref_block:

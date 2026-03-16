@@ -44,7 +44,7 @@ from agents.business_analyst.agent import (
     _node_fetch_sentiment,
     _node_format_json_output,
     _node_generate_analysis,
-    _node_hybrid_retrieval,
+    _node_complex_retrieval,
     _node_rewrite_query,
     _node_web_search_fallback,
     _route_after_crag,
@@ -57,6 +57,7 @@ from agents.business_analyst.schema import (
     Chunk,
     CRAGStatus,
     RetrievalResult,
+    MetadataProfile,
     SentimentSnapshot,
 )
 from agents.business_analyst.tools import (
@@ -87,47 +88,81 @@ def _make_retrieval(score: float = 0.85) -> RetrievalResult:
     )
 
 
+def _make_metadata_profile(ticker: str = "AAPL") -> MetadataProfile:
+    import time as _time
+    return MetadataProfile(
+        ticker=ticker,
+        neo4j_chunk_count=100,
+        neo4j_chunk_index_ready=True,
+        pgvector_chunk_count=50,
+        pgvector_table_ready=True,
+        pgvector_embedding_index=True,
+        has_sentiment=True,
+        sentiment_last_updated="2026-03-10",
+        last_checked=_time.time(),
+        has_neo4j_chunks=True,
+        has_pg_fundamentals=True,
+        has_pg_timeseries=True,
+    )
+
+
 def _minimal_config() -> BusinessAnalystConfig:
     """Config with safe defaults — no real env vars required."""
     cfg = BusinessAnalystConfig.__new__(BusinessAnalystConfig)
-    # Manually set all slots to avoid env-var reads in tests
+    # Manually set all slots to match current config.py fields (slots=True dataclass)
+    # Neo4j
     cfg.neo4j_uri = "bolt://localhost:7687"
     cfg.neo4j_user = "neo4j"
     cfg.neo4j_password = "test"
     cfg.neo4j_chunk_index = "chunk_embedding"
+    # Postgres
     cfg.postgres_host = "localhost"
     cfg.postgres_port = 5432
     cfg.postgres_db = "airflow"
     cfg.postgres_user = "airflow"
     cfg.postgres_password = "airflow"
-    cfg.qdrant_host = "localhost"
-    cfg.qdrant_port = 6333
-    cfg.qdrant_collection = "financial_documents"
-    cfg.llm_provider = "ollama"
-    cfg.llm_model = "deepseek-v3.2-exp"
+    # LLM
+    cfg.llm_provider = "deepseek"
+    cfg.llm_model = "deepseek-reasoner"
     cfg.llm_temperature = 0.2
-    cfg.llm_max_tokens = 1500
+    cfg.llm_max_tokens = 12000
+    cfg.deepseek_api_key = "test-key"
     cfg.ollama_base_url = "http://localhost:11434"
-    cfg.embedding_model = "all-MiniLM-L6-v2"
-    cfg.embedding_dimension = 384
-    cfg.qdrant_embedding_model = "nomic-embed-text"
-    cfg.qdrant_embedding_dimension = 768
+    # Embedding
+    cfg.embedding_model = "nomic-embed-text:v1.5"
+    cfg.embedding_dimension = 768
+    cfg.embedding_model_version = "1.0"
     cfg.reranker_model = "cross-encoder/ms-marco-MiniLM-L-6-v2"
-    cfg.top_k = 8
+    # Retrieval
+    cfg.top_k = 15
     cfg.rag_score_threshold = 0.6
     cfg.business_analyst_max_chunks = 500
     cfg.business_analyst_chunk_size = 512
     cfg.business_analyst_overlap = 50
-    cfg.crag_correct_threshold = 0.7
-    cfg.crag_ambiguous_threshold = 0.5
+    # CRAG thresholds (match production defaults in config.py)
+    cfg.crag_correct_threshold = 0.6
+    cfg.crag_ambiguous_threshold = 0.4
+    # Paths
     from pathlib import Path
     cfg.repo_root = Path(".")
     cfg.agent_data_dir = Path("ingestion/etl/agent_data/business_analyst")
-    cfg.request_timeout = None
+    # Networking
+    cfg.request_timeout = 120
     cfg.neo4j_verify = False
+    # Feature flags
     cfg.enable_web_fallback = True
+    cfg.metadata_cache_ttl = 60.0
+    cfg.semantic_cache_ttl = 300.0
+    cfg.semantic_cache_max_entries = 128
+    # Adaptive routing
+    cfg.fast_path_top_k = 15
+    cfg.multi_stage_recall_k = 100
+    cfg.min_chunks_per_section = 3
+    cfg.max_rewrite_loops = 1  # Keep at 1 so rewrite_count=1 triggers exhaustion path
+    cfg.time_decay_lambda = 0.5
+    cfg.mmr_lambda = 0.6
+    cfg.query_classifier_model = "rule-based"
     return cfg
-
 
 # ---------------------------------------------------------------------------
 # 1. CRAG routing — threshold logic
@@ -186,7 +221,7 @@ class TestCRAGRouting:
 
     def test_rewrite_always_returns_to_retrieval(self):
         state: AgentState = {"task": "moat?", "ticker": "AAPL", "rewrite_count": 1}
-        assert _route_after_rewrite(state) == "hybrid_retrieval"
+        assert _route_after_rewrite(state) == "complex_retrieval"
 
 
 # ---------------------------------------------------------------------------
@@ -205,12 +240,12 @@ class TestCRAGEvaluator:
         assert result.confidence == pytest.approx(0.75)
 
     def test_ambiguous_threshold(self):
-        chunks = [_make_chunk(score=0.60)]
+        chunks = [_make_chunk(score=0.50)]
         result = self.evaluator.evaluate(chunks)
         assert result.status == CRAGStatus.AMBIGUOUS
 
     def test_incorrect_threshold(self):
-        chunks = [_make_chunk(score=0.40)]
+        chunks = [_make_chunk(score=0.30)]
         result = self.evaluator.evaluate(chunks)
         assert result.status == CRAGStatus.INCORRECT
 
@@ -256,13 +291,13 @@ class TestNodes:
         result: Any = _node_fetch_sentiment(state, self.toolkit)
         assert result["sentiment"] is None
 
-    def test_hybrid_retrieval_node(self):
+    def test_complex_retrieval_node(self):
         retrieval = _make_retrieval(0.85)
-        self.toolkit.retrieve.return_value = retrieval
+        self.toolkit.retrieve_multi_stage.return_value = retrieval
         state: AgentState = {"task": "moat?", "ticker": "AAPL"}
-        result: Any = _node_hybrid_retrieval(state, self.toolkit)
+        result: Any = _node_complex_retrieval(state, self.toolkit)
         assert result["retrieval"] is retrieval
-        self.toolkit.retrieve.assert_called_once_with("AAPL: moat?", "AAPL")
+        self.toolkit.retrieve_multi_stage.assert_called_once_with("AAPL: moat?", "AAPL")
 
     def test_crag_evaluate_node(self):
         retrieval = _make_retrieval(0.85)
@@ -438,8 +473,11 @@ class TestFullPipelineIntegration:
 
         mock_toolkit = MagicMock(spec=BusinessAnalystToolkit)
         mock_toolkit.config = cfg
+        mock_toolkit.get_metadata_profile.return_value = _make_metadata_profile()
+        mock_toolkit.fetch_company_overview.return_value = None
+        mock_toolkit.fetch_community_summary.return_value = None
         mock_toolkit.fetch_sentiment.return_value = SentimentSnapshot(65, 20, 15, "improving")
-        mock_toolkit.retrieve.return_value = _make_retrieval(crag_score)
+        mock_toolkit.retrieve_multi_stage.return_value = _make_retrieval(crag_score)
         mock_toolkit.evaluate.return_value = CRAGEvaluation(
             CRAGStatus.CORRECT if crag_score >= 0.7 else (
                 CRAGStatus.AMBIGUOUS if crag_score >= 0.5 else CRAGStatus.INCORRECT
@@ -477,8 +515,11 @@ class TestFullPipelineIntegration:
         cfg = _minimal_config()
         mock_toolkit = MagicMock(spec=BusinessAnalystToolkit)
         mock_toolkit.config = cfg
+        mock_toolkit.get_metadata_profile.return_value = _make_metadata_profile()
+        mock_toolkit.fetch_company_overview.return_value = None
+        mock_toolkit.fetch_community_summary.return_value = None
         mock_toolkit.fetch_sentiment.return_value = None
-        mock_toolkit.retrieve.return_value = _make_retrieval(0.6)
+        mock_toolkit.retrieve_multi_stage.return_value = _make_retrieval(0.6)
 
         call_count = {"n": 0}
 
@@ -514,8 +555,11 @@ class TestFullPipelineIntegration:
             cfg = _minimal_config()
             mock_toolkit = MagicMock(spec=BusinessAnalystToolkit)
             mock_toolkit.config = cfg
+            mock_toolkit.get_metadata_profile.return_value = _make_metadata_profile()
+            mock_toolkit.fetch_company_overview.return_value = None
+            mock_toolkit.fetch_community_summary.return_value = None
             mock_toolkit.fetch_sentiment.return_value = None  # no sentiment
-            mock_toolkit.retrieve.return_value = RetrievalResult(chunks=[], graph_facts=[])  # no local data
+            mock_toolkit.retrieve_multi_stage.return_value = RetrievalResult(chunks=[], graph_facts=[])  # no local data
             mock_toolkit.evaluate.return_value = CRAGEvaluation(CRAGStatus.INCORRECT, 0.35)
             mock_llm = MagicMock()
             compiled = build_graph(mock_toolkit, mock_llm)
@@ -529,8 +573,11 @@ class TestFullPipelineIntegration:
         cfg = _minimal_config()
         mock_toolkit = MagicMock(spec=BusinessAnalystToolkit)
         mock_toolkit.config = cfg
+        mock_toolkit.get_metadata_profile.return_value = _make_metadata_profile()
+        mock_toolkit.fetch_company_overview.return_value = None
+        mock_toolkit.fetch_community_summary.return_value = None
         mock_toolkit.fetch_sentiment.return_value = None  # no sentiment
-        mock_toolkit.retrieve.return_value = RetrievalResult(chunks=[], graph_facts=[])  # no local data
+        mock_toolkit.retrieve_multi_stage.return_value = RetrievalResult(chunks=[], graph_facts=[])  # no local data
         mock_toolkit.evaluate.return_value = CRAGEvaluation(CRAGStatus.AMBIGUOUS, 0.6)
 
         mock_llm = MagicMock()
