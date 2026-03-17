@@ -391,22 +391,58 @@ Return ONLY a valid JSON object (no markdown, no commentary outside the JSON):
             messages=messages,
             model=model,
             recency_filter=recency,
-            temperature=0.1,
+            temperature=0.0,
             max_tokens=4096,
         )
-        content   = resp.get("content", "")
+        content = resp.get("content", "")
         citations = resp.get("citations", [])
     except Exception as e:
         logger.error(f"[WebSearchAgent] Perplexity API failed: {e}")
         return _build_error_output(ticker, str(e))
 
-    # ── Step 4: Parse structured JSON ─────────────────────────────────────────
+    # ── Step 4: Parse structured JSON (with one strict-reformat retry) ───────
     structured = extract_json_from_response(content)
     if structured is None:
-        logger.error("[WebSearchAgent] JSON parse failure.")
+        logger.warning("[WebSearchAgent] JSON parse failure on first response; retrying strict JSON reformat.")
+        try:
+            retry_messages = [
+                {
+                    "role": "system",
+                    "content": "You are a strict JSON formatter. Return only valid JSON.",
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        "Reformat the following content into ONE valid JSON object that strictly follows this schema. "
+                        "Do not add commentary, markdown, or code fences.\n\n"
+                        f"SCHEMA:\n{schema_instruction}\n\n"
+                        f"CONTENT TO REFORMAT:\n{content}"
+                    ),
+                },
+            ]
+            retry_resp = perplexity_chat_completions(
+                messages=retry_messages,
+                model=model,
+                recency_filter=recency,
+                temperature=0.0,
+                max_tokens=4096,
+            )
+            retry_content = retry_resp.get("content", "")
+            retry_citations = retry_resp.get("citations", [])
+            structured = extract_json_from_response(retry_content)
+            if retry_citations:
+                citations = retry_citations
+        except Exception as exc:
+            logger.warning("[WebSearchAgent] JSON reformat retry failed: %s", exc)
+
+    if structured is None:
+        logger.error("[WebSearchAgent] JSON parse failure after retry.")
         return _build_error_output(
-            ticker, "JSON parse failure",
-            citations=citations, confidence=0.3, parse_failure=True
+            ticker,
+            "JSON parse failure",
+            citations=citations,
+            confidence=0.3,
+            parse_failure=True,
         )
 
     # ── Step 5: Iterative fact-check (5B) ─────────────────────────────────────

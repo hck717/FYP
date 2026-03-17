@@ -2681,7 +2681,7 @@ CRITICAL RULES:
 
     # ── Stage 2: JSON → prose ─────────────────────────────────────────────────
     # Build citation index from web outputs for [N] references
-    citation_index = _build_citation_index(effective_web, effective_sr)
+    citation_index = _build_citation_index(effective_web, effective_sr, effective_ba)
     citation_str = "\n".join(f"[{i+1}] {src}" for i, src in enumerate(citation_index[:20]))
 
     t = primary_ticker.upper()
@@ -2843,12 +2843,40 @@ RULES:
         logger.warning("[structured] Stage3.5: fixed %d double-decimal artefacts after audit (%d remain)",
                        _dd_before - _dd_after, _dd_after)
 
-    # ── Inject citation reference block ───────────────────────────────────────
-    if citation_index:
-        ref_lines = ["\n\n---\n**References**"]
-        for i, src in enumerate(citation_index[:20]):
-            ref_lines.append(f"[{i+1}] {src}")
-        prose = prose.rstrip() + "\n".join(ref_lines)
+    # ── Inject full combined citation block (BA + SR + Web + Quant + FM) ─────
+    # Keep numbering consistent with build_citation_block ordering.
+    from .citations import build_citation_block, inject_inline_numbers  # type: ignore[import]
+
+    all_chunk_id_maps: Dict[str, Any] = {}
+    ref_blocks: List[str] = []
+    offset = 0
+    for i, t in enumerate(effective_tickers or [primary_ticker]):
+        ba_o = effective_ba[i] if i < len(effective_ba) else None
+        quant_o = effective_quant[i] if i < len(effective_quant) else None
+        web_o = effective_web[i] if i < len(effective_web) else None
+        fm_o = effective_fm[i] if i < len(effective_fm) else None
+        sr_o = effective_sr[i] if i < len(effective_sr) else None
+
+        ref_block, chunk_id_map = build_citation_block(
+            ba_output=ba_o,
+            quant_output=quant_o,
+            web_output=web_o,
+            fm_output=fm_o,
+            sr_output=sr_o,
+            ticker=t,
+            index_offset=offset,
+        )
+        if ref_block:
+            ref_blocks.append(ref_block)
+        all_chunk_id_maps.update(chunk_id_map)
+        offset += len(chunk_id_map)
+
+    prose = inject_inline_numbers(prose, all_chunk_id_maps)
+    combined_ref_block = "\n".join(ref_blocks) if ref_blocks else ""
+    if combined_ref_block:
+        prose = prose.rstrip() + "\n" + combined_ref_block
+    else:
+        prose = prose.rstrip() + "\n\n---\n### References\n*No external citations available — analysis based on internal data sources.*"
 
     # ── Inject subtitle ───────────────────────────────────────────────────────
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -2908,9 +2936,19 @@ def _fix_anchor_violations(data: Dict[str, Any], anchor: Dict[str, Any], ticker:
 def _build_citation_index(
     web_outputs: List[Dict[str, Any]],
     sr_outputs: List[Dict[str, Any]],
+    ba_outputs: List[Dict[str, Any]],
 ) -> List[str]:
     """Extract a flat list of citation source strings for [1], [2], ... references."""
     sources: List[str] = []
+    for ba_o in ba_outputs:
+        if not ba_o:
+            continue
+        for c in (ba_o.get("citations") or []):
+            if not isinstance(c, dict):
+                continue
+            src = c.get("doc_name") or c.get("chunk_id")
+            if src and src not in sources:
+                sources.append(str(src)[:120])
     for web_o in web_outputs:
         if not web_o:
             continue
@@ -3044,12 +3082,14 @@ def summarise_results(
         quant_o  = effective_quant[i]  if i < len(effective_quant) else None
         web_o    = effective_web[i]    if i < len(effective_web)   else None
         fm_o     = effective_fm[i]     if i < len(effective_fm)    else None
+        sr_o     = effective_sr[i]     if i < len(effective_sr)    else None
 
         ref_block, chunk_id_map = build_citation_block(
             ba_output=ba_o,
             quant_output=quant_o,
             web_output=web_o,
             fm_output=fm_o,
+            sr_output=sr_o,
             ticker=t,
             index_offset=offset,
         )

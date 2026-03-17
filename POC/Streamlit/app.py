@@ -135,6 +135,122 @@ def _clean_text_for_display(text: str) -> str:
     return text
 
 
+def _collect_ba_references(output: Dict[str, Any]) -> List[str]:
+    """Best-effort extraction of BA reference identifiers/URLs for display."""
+    refs: List[str] = []
+
+    def _add(val: Any) -> None:
+        if isinstance(val, str):
+            s = val.strip()
+            if s and s not in refs:
+                refs.append(s)
+
+    moat = output.get("competitive_moat") or {}
+    if isinstance(moat, dict):
+        for s in (moat.get("sources") or []):
+            _add(s)
+
+    mgmt = output.get("management_guidance") or {}
+    if isinstance(mgmt, dict):
+        for s in (mgmt.get("sources") or []):
+            _add(s)
+
+    val_ctx = output.get("valuation_context") or {}
+    if isinstance(val_ctx, dict):
+        for s in (val_ctx.get("sources") or []):
+            _add(s)
+
+    for r in (output.get("key_risks") or []):
+        if isinstance(r, dict):
+            _add(r.get("source"))
+
+    for s in (output.get("sources") or []):
+        _add(s)
+
+    # New BA-level structured citations (stock-research style)
+    for c in (output.get("citations") or []):
+        if isinstance(c, dict):
+            doc = str(c.get("doc_name") or "").strip()
+            page = c.get("page")
+            if doc:
+                if page is not None:
+                    _add(f"{doc} (p. {page})")
+                else:
+                    _add(doc)
+
+    return refs
+
+
+def _render_ba_references(output: Dict[str, Any]) -> None:
+    """Render Business Analyst citation diagnostics and source list."""
+    citation_report = output.get("citation_report") or {}
+    refs = _collect_ba_references(output)
+
+    ba_citations = output.get("citations") or []
+
+    if not citation_report and not refs and not ba_citations:
+        return
+
+    with st.expander("References & citations", expanded=False):
+        if citation_report:
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Cited", _fmt(citation_report.get("total_cited")))
+            c2.metric("Grounded", _fmt(citation_report.get("grounded")))
+            c3.metric("Ungrounded", _fmt(citation_report.get("ungrounded")))
+            c4.metric("Grounding %", f"{_fmt(citation_report.get('grounding_rate_pct'))}%")
+
+        if ba_citations:
+            st.caption(f"Total citations: {len(ba_citations)}")
+
+            grouped: Dict[str, set] = {}
+            for c in ba_citations:
+                if not isinstance(c, dict):
+                    continue
+                doc = str(c.get("doc_name") or "unknown")
+                page = c.get("page")
+                grouped.setdefault(doc, set())
+                if page is not None:
+                    grouped[doc].add(page)
+
+            for doc, pages in list(grouped.items())[:20]:
+                if pages:
+                    page_list = ", ".join(str(p) for p in sorted(pages))
+                    st.markdown(f"- **{doc}** (p. {page_list})")
+                else:
+                    st.markdown(f"- **{doc}**")
+
+        if refs and not ba_citations:
+            st.caption("Evidence sources")
+            for src in refs[:20]:
+                st.markdown(f"- `{src}`")
+
+
+def _render_stock_research_references(output: Dict[str, Any]) -> None:
+    """Render stock-research document/page citations in a compact grouped form."""
+    citations = output.get("citations") or []
+    if not citations:
+        return
+
+    grouped: Dict[str, set] = {}
+    for c in citations:
+        if not isinstance(c, dict):
+            continue
+        doc = str(c.get("doc_name") or "unknown")
+        page = c.get("page")
+        grouped.setdefault(doc, set())
+        if page is not None:
+            grouped[doc].add(page)
+
+    with st.expander("References & citations", expanded=False):
+        st.caption(f"Total citations: {len(citations)}")
+        for doc, pages in list(grouped.items())[:20]:
+            if pages:
+                page_list = ", ".join(str(p) for p in sorted(pages))
+                st.markdown(f"- **{doc}** (p. {page_list})")
+            else:
+                st.markdown(f"- **{doc}**")
+
+
 def _render_data_tables(state: Dict[str, Any]) -> None:
     """Render financial data tables from quant and fm outputs."""
     import pandas as pd
@@ -173,9 +289,8 @@ def _render_data_tables(state: Dict[str, Any]) -> None:
         with st.expander(f"📊 Financial Data Tables — {ticker}", expanded=True):
             # Quarterly Revenue
             if qt:
-                qt_sorted = sorted(qt, key=lambda r: str(r.get("period", "")))
                 rev_rows = []
-                for row in qt_sorted[-4:]:
+                for row in sorted(qt, key=lambda r: str(r.get("period", "")))[-4:]:
                     period = str(row.get("period", ""))
                     revenue = row.get("revenue")
                     if revenue is not None:
@@ -192,14 +307,13 @@ def _render_data_tables(state: Dict[str, Any]) -> None:
 
             # Annual Revenue — aggregate from quarterly_trends grouped by year
             if qt:
-                from collections import defaultdict
-                annual_rev_map: dict = defaultdict(float)
-                for row in qt_sorted:
+                annual_rev_map: Dict[str, float] = {}
+                for row in sorted(qt, key=lambda r: str(r.get("period", ""))):
                     year = str(row.get("period", ""))[:4]
                     revenue = row.get("revenue")
                     if year.isdigit() and revenue is not None:
                         try:
-                            annual_rev_map[year] += float(revenue)
+                            annual_rev_map[year] = annual_rev_map.get(year, 0.0) + float(revenue)
                         except (TypeError, ValueError):
                             pass
                 if annual_rev_map:
@@ -212,9 +326,8 @@ def _render_data_tables(state: Dict[str, Any]) -> None:
 
             # Quarterly Operating Earnings (EPS)
             if qt:
-                qt_sorted = sorted(qt, key=lambda r: str(r.get("period", "")))
                 eps_rows = []
-                for row in qt_sorted[-4:]:
+                for row in sorted(qt, key=lambda r: str(r.get("period", "")))[-4:]:
                     period = str(row.get("period", ""))
                     eps = row.get("eps_diluted") or row.get("operating_earnings_per_share")
                     if eps is not None:
@@ -231,15 +344,13 @@ def _render_data_tables(state: Dict[str, Any]) -> None:
 
             # Annual EPS — sum diluted EPS per year from quarterly_trends
             if qt:
-                annual_eps_map: dict = defaultdict(float)
-                annual_eps_count: dict = defaultdict(int)
-                for row in qt_sorted:
+                annual_eps_map: Dict[str, float] = {}
+                for row in sorted(qt, key=lambda r: str(r.get("period", ""))):
                     year = str(row.get("period", ""))[:4]
                     eps = row.get("eps_diluted") or row.get("operating_earnings_per_share")
                     if year.isdigit() and eps is not None:
                         try:
-                            annual_eps_map[year] += float(eps)
-                            annual_eps_count[year] += 1
+                            annual_eps_map[year] = annual_eps_map.get(year, 0.0) + float(eps)
                         except (TypeError, ValueError):
                             pass
                 if annual_eps_map:
@@ -462,6 +573,9 @@ def _render_business_analyst(output: Dict[str, Any], ticker: str) -> None:
 
         # Thinking trace
         _render_thinking_trace(output.get("thinking_trace") or [])
+
+        # References / citation diagnostics
+        _render_ba_references(output)
 
 
 def _render_quant_fundamental(output: Dict[str, Any], ticker: str) -> None:
@@ -813,6 +927,9 @@ def _render_stock_research(output: Dict[str, Any], ticker: str) -> None:
 
         # Thinking trace
         _render_thinking_trace(output.get("thinking_trace") or [])
+
+        # References / document citations
+        _render_stock_research_references(output)
 
 
 def _render_visualisations(state: Dict[str, Any]) -> None:
@@ -1630,7 +1747,7 @@ def main() -> None:
                     import sys
                     from pathlib import Path
                     sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "ingestion" / "etl"))
-                    from inspect_db import check_postgres, check_neo4j
+                    from ingestion.etl.inspect_db import check_postgres, check_neo4j
                     
                     import io
                     from contextlib import redirect_stdout, redirect_stderr
@@ -1867,7 +1984,11 @@ def main() -> None:
                 mermaid_str = _compiled.get_graph().draw_mermaid()
                 # Try using st.mermaid if available (Streamlit 1.28+)
                 try:
-                    st.mermaid(mermaid_str)
+                    _mermaid_fn = getattr(st, "mermaid", None)
+                    if callable(_mermaid_fn):
+                        _mermaid_fn(mermaid_str)
+                    else:
+                        raise AttributeError("st.mermaid unavailable")
                 except (AttributeError, Exception):
                     # Fallback: show as code with link to render
                     st.code(mermaid_str, language="mermaid")

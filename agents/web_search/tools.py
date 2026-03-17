@@ -163,24 +163,87 @@ def perplexity_chat_completions(
 
 
 
+def _strip_markdown_fences(text: str) -> str:
+    text = re.sub(r"^```(?:json)?\s*\n?", "", text.strip(), flags=re.IGNORECASE)
+    text = re.sub(r"\n?```\s*$", "", text.strip())
+    return text.strip()
+
+
+def _sanitise_json_string_newlines(text: str) -> str:
+    result: list[str] = []
+    in_str = False
+    escape = False
+    for ch in text:
+        if escape:
+            escape = False
+            result.append(ch)
+            continue
+        if ch == "\\" and in_str:
+            escape = True
+            result.append(ch)
+            continue
+        if ch == '"':
+            in_str = not in_str
+            result.append(ch)
+            continue
+        if in_str and ch == "\n":
+            result.append("\\n")
+            continue
+        if in_str and ch == "\r":
+            result.append("\\r")
+            continue
+        result.append(ch)
+    return "".join(result)
+
+
+def _extract_balanced_json_object(text: str) -> Optional[dict]:
+    start = text.find("{")
+    if start == -1:
+        return None
+    depth = 0
+    in_str = False
+    escape = False
+    for i, ch in enumerate(text[start:], start=start):
+        if escape:
+            escape = False
+            continue
+        if ch == "\\" and in_str:
+            escape = True
+            continue
+        if ch == '"':
+            in_str = not in_str
+            continue
+        if in_str:
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                candidate = text[start : i + 1]
+                try:
+                    return json.loads(candidate)
+                except json.JSONDecodeError:
+                    return None
+    return None
+
+
 def extract_json_from_response(content: str) -> Optional[dict]:
-    """
-    Safely extract and parse JSON from the model's text response.
-    Handles both raw JSON and markdown-fenced ```json ... ``` blocks.
-    """
-    # Try markdown fenced block first: ```json ... ```
-    match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", content, re.DOTALL)
-    if match:
+    """Extract structured JSON from model output robustly."""
+    cleaned = _strip_markdown_fences(content)
+
+    for candidate in (cleaned, _sanitise_json_string_newlines(cleaned)):
         try:
-            return json.loads(match.group(1))
+            parsed = json.loads(candidate)
+            if isinstance(parsed, dict):
+                return parsed
         except json.JSONDecodeError:
             pass
 
-    # Try raw JSON (entire response is a JSON object)
-    try:
-        return json.loads(content.strip())
-    except json.JSONDecodeError:
-        pass
+    for candidate in (cleaned, _sanitise_json_string_newlines(cleaned)):
+        parsed = _extract_balanced_json_object(candidate)
+        if isinstance(parsed, dict):
+            return parsed
 
     logger.warning("[tools] Could not extract structured JSON from agent response.")
     return None

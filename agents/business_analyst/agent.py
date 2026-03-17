@@ -500,6 +500,7 @@ def _node_complex_retrieval(state: AgentState, toolkit: BusinessAnalystToolkit) 
     _print_progress("COMPLEX RETRIEVAL (multi-stage)", f"ticker={ticker}")
     t0 = time.monotonic()
     retrieval = toolkit.retrieve_multi_stage(query, ticker)
+    crag_eval = toolkit.evaluate(retrieval.chunks if retrieval else [], ticker=ticker)
     elapsed = time.monotonic() - t0
     n_chunks = len(retrieval.chunks) if retrieval else 0
     n_facts = len(retrieval.graph_facts) if retrieval else 0
@@ -509,7 +510,12 @@ def _node_complex_retrieval(state: AgentState, toolkit: BusinessAnalystToolkit) 
         f"chunks={n_chunks}  graph_facts={n_facts}  top_score={top_score:.3f}  ({elapsed:.2f}s)",
         symbol="  OK",
     )
-    return {**state, "retrieval": retrieval}
+    return {
+        **state,
+        "retrieval": retrieval,
+        "crag_status": crag_eval.status,
+        "confidence": float(crag_eval.confidence),
+    }
 
 
 def _node_generate_analysis(state: AgentState, llm: LLMClient) -> AgentState:
@@ -696,6 +702,11 @@ def _node_web_search_fallback(state: AgentState, toolkit: BusinessAnalystToolkit
     result = _call_web_search(query=query, ticker=ticker, config=toolkit.config)
     elapsed = time.monotonic() - t0
     _print_progress("WEB SEARCH FALLBACK done", f"({elapsed:.2f}s)", symbol="  OK")
+    if not result or not isinstance(result, dict):
+        raise RuntimeError("Web search escalation returned empty/invalid payload")
+    # Hard guard: this escalation must use real web data; stub style responses are disallowed.
+    if result.get("fallback_stub"):
+        raise RuntimeError("Web search returned stub output; direct Perplexity agent is required")
     return {**state, "web_search_result": result, "fallback_triggered": True}
 
 
@@ -1093,6 +1104,26 @@ def _node_format_json_output(state: AgentState) -> AgentState:
                 }
             ]
 
+    # Do not inject a synthetic "Local graph context insufficient" risk when fallback
+    # was not actually triggered. This avoids false-negative UX in healthy local runs.
+    if not fallback_triggered:
+        missing_context = [
+            m
+            for m in missing_context
+            if not (
+                isinstance(m, dict)
+                and str(m.get("gap", "")).lower().startswith("local graph context insufficient")
+            )
+        ]
+        key_risks = [
+            r
+            for r in key_risks
+            if not (
+                isinstance(r, dict)
+                and str(r.get("risk", "")).lower().startswith("local graph context insufficient")
+            )
+        ]
+
     # Coerce missing_context entries: LLM sometimes returns flat strings instead
     # of {"gap": ..., "severity": ...} objects.  Normalise to schema.
     missing_context = [
@@ -1355,6 +1386,56 @@ def _node_format_json_output(state: AgentState) -> AgentState:
         + (f"  hallucinated={citation_report['ungrounded_ids']}" if citation_report["ungrounded_ids"] else ""),
         symbol="  OK" if citation_report["ungrounded"] == 0 else " !?",
     )
+
+    # Build a display-friendly citation/provenance list for UI rendering.
+    # This mirrors stock_research style output so Streamlit can show
+    # "Total citations" + per-document entries.
+    display_citations: List[Dict[str, Any]] = []
+    if retrieval and retrieval.chunks:
+        seen_docs: set[str] = set()
+        for ch in retrieval.chunks[:20]:
+            md = ch.metadata or {}
+            doc_name = str(md.get("source_name") or "").strip()
+            if not doc_name:
+                source_file = str(md.get("source_file") or "").strip()
+                if source_file:
+                    stem = source_file
+                    for _ in range(2):
+                        if stem.lower().endswith(".pdf"):
+                            stem = stem[:-4]
+                    doc_name = stem.strip()
+
+            # Final fallback: derive a readable label from chunk_id instead of exposing raw hashes.
+            if not doc_name:
+                parts = ch.chunk_id.split("::")
+                if len(parts) >= 2:
+                    tk = parts[0].upper()
+                    sec = parts[1].replace("_", " ").title()
+                    doc_name = f"{tk} {sec}"
+                else:
+                    doc_name = "Business Analyst Evidence"
+
+            if doc_name in seen_docs:
+                continue
+            seen_docs.add(doc_name)
+            page = md.get("page_number")
+            display_citations.append(
+                {
+                    "doc_name": doc_name,
+                    "page": page if isinstance(page, int) else None,
+                    "chunk_id": ch.chunk_id,
+                    "relevance": round(float(ch.score), 4),
+                    "section": md.get("section"),
+                }
+            )
+
+    # Include web fallback URLs when fallback is actually used.
+    if fallback_triggered and isinstance(web_result, dict):
+        for url in (web_result.get("sources") or []):
+            if isinstance(url, str) and url.strip():
+                display_citations.append({"doc_name": url.strip(), "page": None, "chunk_id": url.strip()})
+
+    output["citations"] = display_citations
     _print_progress("FORMAT JSON OUTPUT done", "", symbol="  OK")
 
     return {**state, "output": output}
@@ -1451,7 +1532,25 @@ def _route_after_generation(state: AgentState) -> str:
     llm_output = state.get("llm_output") or {}
     summary = llm_output.get("qualitative_summary", "") or ""
     if summary.startswith("INSUFFICIENT_DATA"):
-        logger.warning("LLM returned INSUFFICIENT_DATA — triggering web fallback.")
+        # Only escalate to web search when retrieval context is genuinely weak.
+        # If retrieval is strong (many chunks and high confidence), keep local path
+        # and allow format_json_output fallbacks to recover from LLM phrasing issues.
+        retrieval: Optional[RetrievalResult] = state.get("retrieval")
+        n_chunks = len(retrieval.chunks) if retrieval else 0
+        conf = float(state.get("confidence", 0.0) or 0.0)
+        if n_chunks >= 5 and conf >= 0.6:
+            logger.warning(
+                "LLM returned INSUFFICIENT_DATA despite strong retrieval (chunks=%d, conf=%.3f) — "
+                "skipping web fallback and continuing local formatting path.",
+                n_chunks,
+                conf,
+            )
+            return "semantic_cache_check"
+        logger.warning(
+            "LLM returned INSUFFICIENT_DATA with weak retrieval (chunks=%d, conf=%.3f) — triggering web fallback.",
+            n_chunks,
+            conf,
+        )
         return "web_search_fallback"
     return "semantic_cache_check"
 

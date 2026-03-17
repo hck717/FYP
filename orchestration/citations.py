@@ -143,7 +143,10 @@ def _chunk_id_to_label(
             display = display.replace('_', ' ').strip()
             label   = f"{tk} — Earnings Call: {display}"
         else:
-            label = f"{tk} — Earnings Call Transcript"
+            # Fallback label with chunk hint so reference list remains human-readable,
+            # but never shows only raw hashes.
+            hint = parts[2][:8] if len(parts) > 2 else "unknown"
+            label = f"{tk} — Earnings Call Transcript ({hint})"
         return "neo4j", label, "Neo4j knowledge graph · earnings_call"
 
     # Other ticker-prefixed sections (annual_report, 10-K, press_release, etc.)
@@ -196,6 +199,7 @@ def build_citation_block(
     quant_output: Optional[Dict[str, Any]],
     web_output: Optional[Dict[str, Any]],
     fm_output: Optional[Dict[str, Any]] = None,
+    sr_output: Optional[Dict[str, Any]] = None,
     ticker: Optional[str] = None,
     index_offset: int = 0,
 ) -> Tuple[str, Dict[str, Citation]]:
@@ -206,6 +210,7 @@ def build_citation_block(
         quant_output:  Quant Fundamental agent output dict (or None).
         web_output:    Web Search agent output dict (or None).
         fm_output:     Financial Modelling agent output dict (or None).
+        sr_output:     Stock Research agent output dict (or None).
         ticker:        Primary ticker symbol for label generation.
         index_offset:  Starting index offset — used when building multi-ticker
                        citation blocks so each call produces globally-unique [N]
@@ -481,6 +486,24 @@ def build_citation_block(
                 chunk_id="postgresql:fm:factor_scores",
             )
 
+    # ── 5. Stock Research citations ───────────────────────────────────────────
+    if sr_output:
+        # From explicit per-task citations: [{'doc_name': ..., 'page': ...}, ...]
+        for c in (sr_output.get("citations") or []):
+            if not isinstance(c, dict):
+                continue
+            doc = str(c.get("doc_name") or "Stock Research Document").strip()
+            page = c.get("page")
+            detail = f"page {page}" if page is not None else ""
+            chunk_id = str(c.get("chunk_id") or f"stock_research::{doc}::{page}")
+            _add(
+                "stock_research",
+                "neo4j",
+                doc,
+                detail,
+                chunk_id=chunk_id,
+            )
+
     # ── Format the reference block ────────────────────────────────────────────
     if not citations:
         return "", {}
@@ -488,9 +511,17 @@ def build_citation_block(
     lines = ["", "---", "### References"]
 
     # Group by agent
-    agent_order = ["business_analyst", "quant_fundamental", "web_search", "financial_modelling", "web_fallback"]
+    agent_order = [
+        "business_analyst",
+        "stock_research",
+        "quant_fundamental",
+        "web_search",
+        "financial_modelling",
+        "web_fallback",
+    ]
     agent_labels = {
         "business_analyst":   "Business Analyst (qualitative research)",
+        "stock_research":     "Stock Research (earnings calls & broker reports)",
         "quant_fundamental":  "Quant Fundamental (financial data)",
         "web_search":         "Web Search (live sources)",
         "financial_modelling": "Financial Modelling (DCF, WACC, Comps, Technicals)",
