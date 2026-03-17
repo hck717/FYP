@@ -98,7 +98,7 @@ def ensure_neo4j_schema() -> None:
                         `vector.similarity_function`: '{CHUNK_EMBED_SIMILARITY}'
                     }}
                 }}
-                """
+                """  # type: ignore[arg-type]
             )
         print(
             f"[Neo4j Schema] vector index '{CHUNK_INDEX_NAME}' "
@@ -506,6 +506,43 @@ def _load_generic_record(tx, ticker_symbol: str, data_name: str, row_index: int,
     )
 
 
+def _load_news_article(tx, ticker_symbol: str, row: dict):
+    """Store per-ticker financial news in Neo4j and link to :Company."""
+    link = str(row.get("link") or "").strip()
+    if not link:
+        return
+
+    article_date = str(row.get("date") or row.get("publishedDate") or "")[:25]
+    title = str(row.get("title") or "")
+    content = str(row.get("content") or "")
+    source_name = str(row.get("source") or row.get("source_name") or "eodhd")
+    tags = row.get("tags")
+    sentiment = row.get("sentiment")
+
+    tx.run(
+        """
+        MERGE (c:Company {ticker: $ticker})
+        MERGE (n:NewsArticle {ticker: $ticker, link: $link})
+        SET n.article_date = $article_date,
+            n.title = $title,
+            n.content = $content,
+            n.source = $source_name,
+            n.tags = $tags,
+            n.sentiment = $sentiment,
+            n.updated_at = datetime()
+        MERGE (c)-[:HAS_NEWS]->(n)
+        """,
+        ticker=ticker_symbol,
+        link=link,
+        article_date=article_date,
+        title=title,
+        content=content,
+        source_name=source_name,
+        tags=json.dumps(tags, default=str) if tags is not None else None,
+        sentiment=json.dumps(sentiment, default=str) if sentiment is not None else None,
+    )
+
+
 # ── Per-ticker loader ─────────────────────────────────────────────────────────
 
 def load_neo4j_for_ticker(ticker_symbol: str) -> int:
@@ -582,6 +619,27 @@ def load_neo4j_for_ticker(ticker_symbol: str) -> int:
                         count += 1
                     except Exception as exc:
                         print(f"[Neo4j Loader] {data_name} row {row_idx} error: {exc}")
+
+        # Ensure financial news is also loaded to Neo4j (in addition to PostgreSQL).
+        news_json = ticker_dir / "financial_news.json"
+        if news_json.exists():
+            try:
+                with open(news_json) as jf:
+                    news_rows = json.load(jf)
+                if isinstance(news_rows, list):
+                    loaded_news = 0
+                    for row in news_rows:
+                        if not isinstance(row, dict):
+                            continue
+                        try:
+                            session.execute_write(_load_news_article, ticker_symbol, row)
+                            loaded_news += 1
+                        except Exception as exc:
+                            print(f"[Neo4j Loader] financial_news row error: {exc}")
+                    count += loaded_news
+                    print(f"[Neo4j Loader] {ticker_symbol}/financial_news: {loaded_news} rows loaded")
+            except Exception as exc:
+                print(f"[Neo4j Loader] {ticker_symbol}/financial_news: ERROR — {exc}")
 
     driver.close()
     print(f"[Neo4j Loader] {ticker_symbol}: {count} total writes")

@@ -51,6 +51,12 @@ NEO4J_URI = os.getenv("NEO4J_URI", "bolt://neo4j:7687")
 NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
 NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "SecureNeo4jPass2025!")
 
+POSTGRES_HOST = os.getenv("POSTGRES_HOST", "postgres")
+POSTGRES_PORT = int(os.getenv("POSTGRES_PORT", "5432"))
+POSTGRES_DB = os.getenv("POSTGRES_DB", "airflow")
+POSTGRES_USER = os.getenv("POSTGRES_USER", "airflow")
+POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD", "airflow")
+
 # Determine if we're running inside Docker by checking for /.dockerenv
 IN_DOCKER = Path("/.dockerenv").exists()
 if IN_DOCKER:
@@ -82,6 +88,8 @@ except ImportError:
 
 import requests
 from neo4j import GraphDatabase
+import psycopg2
+from psycopg2.extras import execute_values
 
 # Tenacity for retry logic (pip install tenacity)
 try:
@@ -242,6 +250,130 @@ def get_driver():
     return GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
 
 
+def _pg_connect():
+    return psycopg2.connect(
+        host=POSTGRES_HOST,
+        port=POSTGRES_PORT,
+        dbname=POSTGRES_DB,
+        user=POSTGRES_USER,
+        password=POSTGRES_PASSWORD,
+    )
+
+
+def _upsert_postgres_textual(
+    ticker: str,
+    doc_type: str,
+    docs: list[dict],
+    chunks: list[dict],
+) -> int:
+    if not docs and not chunks:
+        return 0
+
+    conn = _pg_connect()
+    try:
+        with conn, conn.cursor() as cur:
+            if docs:
+                doc_rows = [
+                    (
+                        ticker,
+                        doc_type,
+                        d.get("filename", ""),
+                        d.get("filepath", ""),
+                        d.get("institution", ""),
+                        d.get("date_approx"),
+                        d.get("file_size_bytes"),
+                        d.get("md5_hash"),
+                        True,
+                    )
+                    for d in docs
+                ]
+                doc_rows = list({row[2]: row for row in doc_rows}.values())
+                execute_values(
+                    cur,
+                    """
+                    INSERT INTO textual_documents
+                        (ticker, doc_type, filename, filepath, institution,
+                         date_approx, file_size_bytes, md5_hash, ingested_into_qdrant)
+                    VALUES %s
+                    ON CONFLICT (ticker, filename) DO UPDATE SET
+                        filepath = EXCLUDED.filepath,
+                        institution = EXCLUDED.institution,
+                        date_approx = EXCLUDED.date_approx,
+                        file_size_bytes = EXCLUDED.file_size_bytes,
+                        md5_hash = EXCLUDED.md5_hash,
+                        ingested_into_qdrant = EXCLUDED.ingested_into_qdrant,
+                        ingested_at = NOW()
+                    """,
+                    doc_rows,
+                )
+
+            if chunks:
+                chunk_rows = []
+                for c in chunks:
+                    emb = c.get("embedding") or []
+                    emb_str = "[" + ",".join(f"{float(x):.8f}" for x in emb) + "]"
+                    chunk_rows.append(
+                        (
+                            ticker,
+                            c["chunk_id"],
+                            c["text"],
+                            c.get("section"),
+                            c.get("filing_date"),
+                            emb_str,
+                            "textual_pdf",
+                        )
+                    )
+                chunk_rows = list({row[1]: row for row in chunk_rows}.values())
+                execute_values(
+                    cur,
+                    """
+                    INSERT INTO text_chunks (ticker, chunk_id, text, section, filing_date, embedding, source)
+                    VALUES %s
+                    ON CONFLICT (chunk_id) DO UPDATE SET
+                        text = EXCLUDED.text,
+                        section = EXCLUDED.section,
+                        filing_date = EXCLUDED.filing_date,
+                        embedding = EXCLUDED.embedding,
+                        source = EXCLUDED.source,
+                        ingested_at = NOW()
+                    """,
+                    chunk_rows,
+                    template="(%s, %s, %s, %s, %s, %s::vector, %s)",
+                )
+        return len(chunks)
+    finally:
+        conn.close()
+
+
+def _existing_source_files(ticker: str, section: str) -> set[str]:
+    """Return source_file names already ingested for ticker+section in Neo4j."""
+    cypher = """
+    MATCH (c:Company {ticker: $ticker})-[:HAS_CHUNK]->(ch:Chunk {section: $section})
+    WHERE ch.source_file IS NOT NULL
+    RETURN DISTINCT ch.source_file AS source_file
+    """
+    driver = get_driver()
+    try:
+        with driver.session() as session:
+            rows = session.run(cypher, ticker=ticker, section=section).data()
+            return {str(r["source_file"]) for r in rows if r.get("source_file")}
+    finally:
+        driver.close()
+
+
+def _existing_postgres_doc_files(ticker: str, doc_type: str) -> set[str]:
+    conn = _pg_connect()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT filename FROM textual_documents WHERE ticker = %s AND doc_type = %s",
+                (ticker, doc_type),
+            )
+            return {str(r[0]) for r in cur.fetchall() if r and r[0]}
+    finally:
+        conn.close()
+
+
 def extract_text_from_pdf(pdf_path: Path) -> str:
     """
     Extract text from a PDF file.
@@ -258,7 +390,7 @@ def extract_text_from_pdf(pdf_path: Path) -> str:
         text_parts = []
         for page in doc:
             text = page.get_text()
-            if text and text.strip():
+            if isinstance(text, str) and text.strip():
                 text_parts.append(text)
         doc.close()
         full_text = "\n\n".join(text_parts)
@@ -276,7 +408,7 @@ def extract_text_from_pdf(pdf_path: Path) -> str:
         text_parts = []
         for page in reader.pages:
             text = page.extract_text()
-            if text:
+            if isinstance(text, str) and text.strip():
                 text_parts.append(text)
         full_text = "\n\n".join(text_parts)
         full_text = re.sub(r'\n{3,}', '\n\n', full_text)
@@ -341,6 +473,8 @@ def _embed_with_retry(texts: list[str], model: str, base_url: str) -> list[list[
         return batch_embeddings
 
     if _TENACITY_AVAILABLE:
+        from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+
         @retry(
             stop=stop_after_attempt(3),
             wait=wait_exponential(multiplier=1, min=2, max=30),
@@ -400,18 +534,32 @@ def load_earnings_call_chunks(ticker: str, only_new: bool = False) -> int:
         logger.info("[%s] No earning_call directory found", ticker)
         return 0
 
-    if only_new:
-        pdf_files = scan_new_pdfs(ticker, "earning_call")
-    else:
-        pdf_files = list(earnings_dir.glob("*.pdf")) + list(earnings_dir.glob("*.pdf.pdf"))
+    # Build full file list; incremental filtering is decided against DB state below.
+    pdf_files = sorted({*earnings_dir.glob("*.pdf"), *earnings_dir.glob("*.pdf.pdf")})
 
     if not pdf_files:
         logger.info("[%s] No PDF files found in %s", ticker, earnings_dir)
         return 0
 
+    # Real incremental ingestion: only process files not yet loaded into Neo4j.
+    existing_neo4j = _existing_source_files(ticker, "earnings_call")
+    existing_pg = _existing_postgres_doc_files(ticker, "earnings_call")
+    existing_files = existing_neo4j.intersection(existing_pg)
+    if existing_files:
+        before = len(pdf_files)
+        pdf_files = [p for p in pdf_files if p.name not in existing_files]
+        skipped = before - len(pdf_files)
+        if skipped:
+            logger.info("[%s] Skipping %d already-ingested PDFs (Neo4j+PostgreSQL)", ticker, skipped)
+
+    if not pdf_files:
+        logger.info("[%s] No new earnings call PDFs to ingest", ticker)
+        return 0
+
     logger.info("[%s] Found %d earnings call PDFs", ticker, len(pdf_files))
 
     all_chunks = []
+    all_docs = []
 
     for pdf_file in pdf_files:
         logger.info("  Processing: %s", pdf_file.name)
@@ -434,6 +582,17 @@ def load_earnings_call_chunks(ticker: str, only_new: bool = False) -> int:
 
         # Split into chunks
         chunks = split_text(text, CHUNK_SIZE, OVERLAP)
+
+        all_docs.append(
+            {
+                "filename": pdf_file.name,
+                "filepath": str(pdf_file),
+                "institution": "",
+                "date_approx": filing_date,
+                "file_size_bytes": int(pdf_file.stat().st_size),
+                "md5_hash": hashlib.md5(pdf_file.read_bytes()).hexdigest(),
+            }
+        )
 
         # Create chunk dicts — include content_hash for Neo4j MERGE dedup
         for i, chunk_text in enumerate(chunks):
@@ -508,6 +667,11 @@ def load_earnings_call_chunks(ticker: str, only_new: bool = False) -> int:
         driver.close()
 
     logger.info("[%s] Wrote %d earnings call chunks to Neo4j", ticker, written)
+    try:
+        pg_written = _upsert_postgres_textual(ticker, "earnings_call", all_docs, all_chunks)
+        logger.info("[%s] Upserted %d earnings call chunks to PostgreSQL", ticker, pg_written)
+    except Exception as exc:
+        logger.error("[%s] PostgreSQL upsert failed: %s", ticker, exc)
     return written
 
 

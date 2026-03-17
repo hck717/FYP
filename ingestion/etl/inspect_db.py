@@ -18,6 +18,7 @@ import json
 import os
 import sys
 from pathlib import Path
+from typing import Any
 
 # ── Load .env for local runs ──────────────────────────────────────────────────
 _env_path = Path(__file__).resolve().parents[2] / ".env"
@@ -47,7 +48,7 @@ def _resolve_env_for_context(
     key: str,
     host_default: str,
     docker_default: str,
-    docker_aliases: tuple[str, ...] = (",")
+    docker_aliases: tuple[str, ...] = (",",)
 ) -> str:
     value = os.getenv(key)
     if IN_DOCKER:
@@ -103,6 +104,16 @@ def _pg_ticker_counts(cur, table: str, ticker_col: str = "ticker") -> dict[str, 
         f"SELECT {ticker_col}, COUNT(*) FROM {table} GROUP BY {ticker_col} ORDER BY {ticker_col}"
     )
     return {row[0]: row[1] for row in cur.fetchall()}
+
+
+def _pg_column_exists(cur, table: str, column: str) -> bool:
+    cur.execute(
+        "SELECT EXISTS (SELECT 1 FROM information_schema.columns "
+        "WHERE table_name = %s AND column_name = %s)",
+        (table, column),
+    )
+    row = cur.fetchone()
+    return bool(row[0]) if row else False
 
 
 def _pg_sample_rows(cur, table: str, where: str = "", limit: int = 2) -> list[tuple]:
@@ -170,6 +181,7 @@ def check_postgres() -> bool:
                     print(_fail(f"{table}: only {total} rows (expected >= {min_rows})"))
                     all_pass = False
             except Exception as exc:
+                conn.rollback()
                 print(_fail(f"{table}: query error — {exc}"))
                 all_pass = False
 
@@ -188,6 +200,7 @@ def check_postgres() -> bool:
             else:
                 print(_warn(f"dividends_history: only {total} rows"))
         except Exception as exc:
+            conn.rollback()
             print(_warn(f"dividends_history: {exc}"))
 
         # ── market_eod_us (global table, no per-ticker) ──────────────────────
@@ -200,6 +213,7 @@ def check_postgres() -> bool:
                 print(_warn(f"market_eod_us: only {n} rows (expected >= 100)"))
                 all_pass = False
         except Exception as exc:
+            conn.rollback()
             print(_fail(f"market_eod_us: {exc}"))
             all_pass = False
 
@@ -214,6 +228,7 @@ def check_postgres() -> bool:
                 else:
                     print(_warn(f"{table}: 0 rows (optional — may be empty if not scraped)"))
             except Exception as exc:
+                conn.rollback()
                 print(_warn(f"{table}: {exc}"))
 
         # ── raw_fundamentals (FMP-sourced, may be empty) ─────────────────────
@@ -225,6 +240,7 @@ def check_postgres() -> bool:
             else:
                 print(_warn("raw_fundamentals: 0 rows (FMP DAG not ingested — acceptable)"))
         except Exception as exc:
+            conn.rollback()
             print(_warn(f"raw_fundamentals: {exc}"))
 
         # ── news_articles (EODHD /api/news, full content + pgvector embedding) ──────
@@ -233,15 +249,19 @@ def check_postgres() -> bool:
             counts = _pg_ticker_counts(cur, "news_articles", "ticker")
             covered = [t for t in TRACKED_TICKERS if counts.get(t, 0) > 0]
             missing = [t for t in TRACKED_TICKERS if t not in covered]
-            # Check embedding coverage
-            cur.execute(
-                "SELECT COUNT(*) FROM news_articles WHERE embedding IS NOT NULL"
-            )
-            _emb_row = cur.fetchone()
-            embedded_count = _emb_row[0] if _emb_row else 0
+            embedded_count = None
+            if _pg_column_exists(cur, "news_articles", "embedding"):
+                # Check embedding coverage only when the schema has this column.
+                cur.execute(
+                    "SELECT COUNT(*) FROM news_articles WHERE embedding IS NOT NULL"
+                )
+                _emb_row = cur.fetchone()
+                embedded_count = _emb_row[0] if _emb_row else 0
             if total > 0 and not missing:
-                embed_pct = round(100 * embedded_count / total) if total else 0
-                embed_note = f", {embedded_count}/{total} embedded ({embed_pct}%)"
+                embed_note = ""
+                if embedded_count is not None:
+                    embed_pct = round(100 * embedded_count / total) if total else 0
+                    embed_note = f", {embedded_count}/{total} embedded ({embed_pct}%)"
                 print(_ok(f"news_articles: {total} total rows, all {len(TRACKED_TICKERS)} tickers covered{embed_note}"))
                 _print_sample_rows(cur, "news_articles")
             elif total > 0:
@@ -252,6 +272,7 @@ def check_postgres() -> bool:
                 print(_fail("news_articles: 0 rows (expected >= 1 per ticker)"))
                 all_pass = False
         except Exception as exc:
+            conn.rollback()
             print(_fail(f"news_articles: query error — {exc}"))
             all_pass = False
 
@@ -271,10 +292,56 @@ def check_postgres() -> bool:
             else:
                 print(_warn("news_word_weights: 0 rows (DAG scrape not yet run for this endpoint)"))
         except Exception as exc:
+            conn.rollback()
             print(_warn(f"news_word_weights: query error — {exc}"))
 
         # ── text_chunks (pgvector) ────────────────────────────────────────────
         check_pgvector(cur)
+
+        # ── Macro tables coverage ──────────────────────────────────────────────
+        print("\n--- Macro Data ---")
+        macro_tables = [
+            ("treasury_rates", 1),
+            ("global_macro_indicators", 1),
+            ("economic_events", 1),
+            ("market_screener", 1),
+            ("forex_rates", 1),
+            ("market_eod_us", 1),
+        ]
+        for table, min_rows in macro_tables:
+            try:
+                n = _pg_count(cur, table)
+                if n >= min_rows:
+                    print(_ok(f"{table}: {n} rows"))
+                    _print_sample_rows(cur, table)
+                else:
+                    print(_warn(f"{table}: {n} rows (expected >= {min_rows})"))
+                    all_pass = False
+            except Exception as exc:
+                conn.rollback()
+                print(_warn(f"{table}: {exc}"))
+                all_pass = False
+
+        # ── Textual document metadata coverage ─────────────────────────────────
+        print("\n--- Textual Documents ---")
+        textual_doc_types = ["earnings_call", "broker_report", "macro_report"]
+        for doc_type in textual_doc_types:
+            try:
+                cur.execute(
+                    "SELECT COUNT(*) FROM textual_documents WHERE doc_type = %s",
+                    (doc_type,),
+                )
+                row = cur.fetchone()
+                count = int(row[0]) if row else 0
+                if count > 0:
+                    print(_ok(f"textual_documents[{doc_type}]: {count} rows"))
+                else:
+                    print(_warn(f"textual_documents[{doc_type}]: 0 rows"))
+                    all_pass = False
+            except Exception as exc:
+                conn.rollback()
+                print(_warn(f"textual_documents[{doc_type}]: {exc}"))
+                all_pass = False
 
         # ── Feedback tables (RLAIF + User Feedback) ─────────────────────────
         check_feedback_tables(cur)
@@ -528,17 +595,26 @@ def check_neo4j() -> bool:
 
             # Check for textual document types specifically
             print("\n--- Textual Document Coverage ---")
-            for section in ['earnings_call', 'broker_report']:
-                result = session.run(
+            for section in ['earnings_call', 'broker_report', 'macro_report']:
+                query: Any = (
                     f"MATCH (c:Company)-[:HAS_CHUNK]->(ch:Chunk {{section: '{section}'}}) "
                     "RETURN c.ticker AS ticker, count(ch) AS n ORDER BY ticker"
-                ).data()
+                )
+                result = session.run(query).data()
                 if result and sum(r['n'] for r in result) > 0:
                     total = sum(r['n'] for r in result)
                     tickers_covered = [r['ticker'] for r in result if r['n'] > 0]
                     print(_ok(f"{section}: {total} chunks across {len(tickers_covered)} tickers ({', '.join(tickers_covered)})"))
                 else:
-                    print(_warn(f"{section}: 0 chunks (run ingest_earnings_calls.py or ingest_broker_reports.py)"))
+                    print(_warn(f"{section}: 0 chunks (run textual ingestion scripts)"))
+
+            print("\n--- Neo4j News Coverage ---")
+            result = session.run("MATCH (n:NewsArticle) RETURN count(n) AS n").single()
+            n_news = result["n"] if result else 0
+            if n_news > 0:
+                print(_ok(f"NewsArticle nodes: {n_news}"))
+            else:
+                print(_warn("NewsArticle nodes: 0 (run load_neo4j_for_ticker with financial_news.json present)"))
 
     except Exception as exc:
         print(_fail(f"Neo4j query failed: {exc}"))

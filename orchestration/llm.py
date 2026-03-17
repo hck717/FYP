@@ -840,6 +840,10 @@ price objective, fair value estimate, upside to $X, downside to $X, "we recommen
 "recommended as a", any disclaimer or "prepared by" block.
 The ## Analyst Verdict must express directional views WITHOUT any of the above.
 
+RULE 0b — ALWAYS INCLUDE REFERENCES. A numbered reference list will be automatically appended after your report.
+Do NOT write, truncate, or omit the references section. Ensure your report flows naturally into the
+references that follow. The reference list is mandatory — your report is incomplete without it.
+
 RULE 1 — NO BULLET POINTS. No "•", "-", "*", or numbered lists (1. 2. 3.) in any section body.
 Every fact, risk, and metric must be flowing multi-sentence prose.
 
@@ -3609,8 +3613,12 @@ def summarise_results(
         logger.warning("[summarise_results] Fixed %d double-decimal artefacts", _bad_count)
 
     # ── 6. Append the references block ───────────────────────────────────────
+    # Always include a references section - even if empty, to ensure completeness
     if combined_ref_block:
         cleaned = cleaned + "\n" + combined_ref_block
+    else:
+        # Fallback: include at least a placeholder references section
+        cleaned = cleaned + "\n\n---\n### References\n*No external citations available — analysis based on internal data sources.*"
 
     return cleaned
 

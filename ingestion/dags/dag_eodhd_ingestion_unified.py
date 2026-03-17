@@ -931,7 +931,7 @@ def load_textual_earnings_calls(ticker_symbol: str):
     from ingest_earnings_calls import load_earnings_call_chunks
     ticker = ticker_symbol.replace(".US", "")
     # Use only_new=True so Airflow only processes new/modified PDFs each run
-    return load_earnings_call_chunks(ticker, only_new=False)
+    return load_earnings_call_chunks(ticker, only_new=True)
 
 
 def load_textual_broker_reports(ticker_symbol: str):
@@ -945,7 +945,20 @@ def load_textual_broker_reports(ticker_symbol: str):
     
     from ingest_broker_reports import load_broker_report_chunks
     ticker = ticker_symbol.replace(".US", "")
-    return load_broker_report_chunks(ticker, only_new=False)
+    return load_broker_report_chunks(ticker, only_new=True)
+
+
+def load_textual_macro_reports():
+    """Wrapper to call macro report ingestion (new files only)."""
+    import sys
+    import os
+
+    sys.path.insert(0, "/opt/airflow/ingestion/etl")
+    os.environ["TEXTUAL_DATA_DIR"] = "/opt/airflow/data/textual data"
+
+    from ingest_macro_reports import load_macro_report_chunks
+
+    return load_macro_report_chunks(only_new=True)
 
 
 # ── DAG definition ────────────────────────────────────────────────────────────────
@@ -1016,6 +1029,12 @@ with DAG(
     earnings_call_tasks: dict[str, PythonOperator] = {}
     broker_report_tasks: dict[str, PythonOperator] = {}
 
+    macro_report_task = PythonOperator(
+        task_id="textual_load_macro_reports",
+        python_callable=load_textual_macro_reports,
+        execution_timeout=timedelta(hours=6),
+    )
+
     for _symbol in TICKER_SYMBOLS:
         earnings_call_tasks[_symbol] = PythonOperator(
             task_id=f"textual_load_earnings_calls_{_symbol}",
@@ -1044,7 +1063,9 @@ with DAG(
 
     scrape_tasks[TICKER_SYMBOLS[0]] >> load_macro_task
     scrape_tasks[TICKER_SYMBOLS[0]] >> load_neo4j_macro_task
+    load_neo4j_macro_task >> macro_report_task
     load_macro_task >> summary_task
+    macro_report_task >> summary_task
     load_neo4j_macro_task >> summary_task
     # Validate after macro load too
     load_macro_task >> validate_task

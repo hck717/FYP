@@ -8,7 +8,7 @@ This document lists all data types, their sources, and destinations in the FYP p
 
 | # | Data Type | Source API Endpoint | Destination | Destination Type | Table/Node |
 |---|-----------|---------------------|-------------|------------------|-------------|
-| 1 | Company Profiles | `/api/profile/{ticker}` | PostgreSQL | Table | `textual_documents` |
+| 1 | Company Profiles | `/api/profile/{ticker}` | PostgreSQL + Neo4j | Table + Nodes | `raw_fundamentals`, `valuation_metrics`, `text_chunks`, `:Company` |
 | 2 | Financial News | `/api/news` | PostgreSQL | Table + pgvector | `news_articles` |
 | 3 | Insider Transactions | `/api/insider-transactions` | PostgreSQL | Table | `insider_transactions` |
 | 4 | Institutional Holders | `/api/institutional-holder` | PostgreSQL | Table | `institutional_holders` |
@@ -39,10 +39,10 @@ This document lists all data types, their sources, and destinations in the FYP p
 
 | # | Data Type | Source | Destination | Destination Type | Table/Node |
 |---|-----------|--------|-------------|------------------|-------------|
-| 25 | Earnings Call Transcripts | PDF files in `/data/textual data/{TICKER}/earning_call/` | Neo4j | Nodes | `:Chunk` (section: earnings_call) |
-| 26 | Broker Reports | PDF files in `/data/textual data/{TICKER}/broker/` | Neo4j | Nodes | `:Chunk` (section: broker_report) |
-| 27 | Text Chunks (Company Profile) | Extracted from PDF + EODHD | PostgreSQL | pgvector | `text_chunks` |
-| 28 | Textual Documents Metadata | Ingestion script | PostgreSQL | Table | `textual_documents` |
+| 25 | Earnings Call Transcripts | PDF files in `/data/textual data/{TICKER}/earning_call/` | PostgreSQL + Neo4j | pgvector + Nodes | `text_chunks` + `:Chunk` (section: earnings_call) |
+| 26 | Broker Reports | PDF files in `/data/textual data/{TICKER}/broker/` | PostgreSQL + Neo4j | pgvector + Nodes | `text_chunks` + `:Chunk` (section: broker_report) |
+| 27 | Macro Reports | PDF files in `/data/textual data/MACRO/` | PostgreSQL + Neo4j | pgvector + Nodes | `text_chunks` + `:Chunk` (section: macro_report) |
+| 28 | Textual Documents Metadata | Textual ingestion scripts | PostgreSQL | Table | `textual_documents` |
 
 ---
 
@@ -105,8 +105,8 @@ This document lists all data types, their sources, and destinations in the FYP p
 | `global_macro_indicators` | GDP, CPI, unemployment | EODHD API |
 | `market_eod_us` | S&P 500 benchmark | EODHD API |
 | `market_screener` | Cross-sectional snapshot | EODHD API |
-| `text_chunks` | Company profile chunks + embeddings | EODHD API + Ollama |
-| `textual_documents` | PDF metadata | Ingestion script |
+| `text_chunks` | Company profile + earnings + broker + macro chunks + embeddings | EODHD API + PDF + Ollama |
+| `textual_documents` | Textual PDF metadata (earnings/broker/macro) | Textual ingestion scripts |
 | `agent_run_telemetry` | Agent execution logs | Orchestration |
 | `agent_episodic_memory` | Query failure patterns | Orchestration |
 | `query_logs` | Query history | Orchestration |
@@ -122,7 +122,10 @@ This document lists all data types, their sources, and destinations in the FYP p
 | `:Company` | Company profiles | EODHD API |
 | `:Chunk` (section: earnings_call) | Earnings call transcripts | PDF files |
 | `:Chunk` (section: broker_report) | Broker reports | PDF files |
+| `:Chunk` (section: macro_report) | Macro reports | PDF files |
+| `:NewsArticle` | Financial news articles | EODHD API |
 | `:HAS_CHUNK` | Company → Chunk relationship | Ingestion |
+| `:HAS_NEWS` | Company → NewsArticle relationship | Ingestion |
 
 ### Vector Stores
 
@@ -130,7 +133,7 @@ This document lists all data types, their sources, and destinations in the FYP p
 |-------|-----------|----------|--------|
 | PostgreSQL `text_chunks.embedding` | Company profile text | 768 | Ollama (nomic-embed-text) |
 | PostgreSQL `news_articles.embedding` | News articles | 768 | Ollama (nomic-embed-text) |
-| Neo4j `:Chunk.embedding` | Earnings calls + broker reports | 768 | Ollama (nomic-embed-text) |
+| Neo4j `:Chunk.embedding` | Earnings calls + broker reports + macro reports | 768 | Ollama (nomic-embed-text) |
 
 ---
 
@@ -164,9 +167,10 @@ This document lists all data types, their sources, and destinations in the FYP p
 │  Airflow DAG (dag_eodhd_ingestion_unified.py)                              │
 │  ├── scrape_ticker() → etl/agent_data/{TICKER}/                           │
 │  ├── load_postgres_for_ticker() → PostgreSQL                              │
-│  ├── load_neo4j_for_ticker() → Neo4j                                      │
-│  ├── ingest_earnings_calls.py → Neo4j (Chunk nodes)                       │
-│  └── ingest_broker_reports.py → Neo4j (Chunk nodes)                       │
+│  ├── load_neo4j_for_ticker() → Neo4j (`:Company`, `:NewsArticle`)         │
+│  ├── ingest_earnings_calls.py → Neo4j + PostgreSQL (chunks + metadata)    │
+│  ├── ingest_broker_reports.py → Neo4j + PostgreSQL (chunks + metadata)     │
+│  └── ingest_macro_reports.py → Neo4j + PostgreSQL (chunks + metadata)      │
 └─────────────────────────────────────────────────────────────────────────────┘
                                       │
                     ┌─────────────────┼─────────────────┐
@@ -178,8 +182,8 @@ This document lists all data types, their sources, and destinations in the FYP p
 │ • raw_timeseries         │ │  :Chunk nodes    │ │                          │
 │ • financial_statements   │ │  (earnings_call)│ │                          │
 │ • valuation_metrics      │ │  (broker_report)│ │                          │
-│ • news_articles (+emb)  │ │                  │ │                          │
-│ • text_chunks (+emb)    │ │  HAS_CHUNK       │ │                          │
+│ • news_articles (+emb)  │ │  :NewsArticle    │ │                          │
+│ • text_chunks (+emb)    │ │  HAS_CHUNK/NEWS  │ │                          │
 │ • rl_feedback ← NEW     │ │  relationships   │ │                          │
 │ • user_feedback ← NEW   │ │                  │ │                          │
 │ • prompt_versions ← NEW │ │                  │ │                          │

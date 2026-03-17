@@ -26,7 +26,9 @@ tiktoken>=0.12.0
 tenacity>=9.1.0
 
 # --- Data / ML ---
-numpy>=2.4.0
+# Keep NumPy <2 in Airflow image to avoid pyarrow ABI mismatch
+# (neo4j imports pandas/pyarrow optional deps at import time).
+numpy<2
 pandas>=2.3.0
 sentence-transformers>=5.2.0
 yfinance>=1.1.0

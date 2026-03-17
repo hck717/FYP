@@ -188,7 +188,7 @@ docker exec fyp-postgres psql -U airflow -d airflow -c "
 ### Textual Data Tables
 
 ```bash
-# 23. Text Chunks (Company profile with embeddings)
+# 23. Text Chunks (company profile + textual PDFs with embeddings)
 docker exec fyp-postgres psql -U airflow -d airflow -c "
   SELECT ticker, COUNT(*) as chunks,
          SUM(CASE WHEN embedding IS NOT NULL THEN 1 ELSE 0 END) as embedded
@@ -196,11 +196,20 @@ docker exec fyp-postgres psql -U airflow -d airflow -c "
   GROUP BY ticker ORDER BY ticker;
 "
 
-# 24. Textual Documents Metadata (PDF earnings calls, broker reports)
+# 24. Textual Documents Metadata (PDF earnings calls, broker reports, macro reports)
 docker exec fyp-postgres psql -U airflow -d airflow -c "
   SELECT ticker, doc_type, COUNT(*) as docs
   FROM textual_documents
   GROUP BY ticker, doc_type ORDER BY ticker, doc_type;
+"
+
+# 24a. Textual metadata coverage by doc_type (must all be > 0)
+docker exec fyp-postgres psql -U airflow -d airflow -c "
+  SELECT doc_type, COUNT(*) as docs
+  FROM textual_documents
+  WHERE doc_type IN ('earnings_call', 'broker_report', 'macro_report')
+  GROUP BY doc_type
+  ORDER BY doc_type;
 "
 ```
 
@@ -331,6 +340,18 @@ docker exec fyp-neo4j cypher-shell -u neo4j -p SecureNeo4jPass2025! "
   ORDER BY ticker, section;
 "
 
+# Check financial news mirrored into Neo4j
+docker exec fyp-neo4j cypher-shell -u neo4j -p SecureNeo4jPass2025! "
+  MATCH (n:NewsArticle)
+  RETURN count(n) as news_nodes;
+"
+
+# Check HAS_NEWS relationships
+docker exec fyp-neo4j cypher-shell -u neo4j -p SecureNeo4jPass2025! "
+  MATCH (:Company)-[r:HAS_NEWS]->(:NewsArticle)
+  RETURN count(r) as has_news_rels;
+"
+
 # Check vector index status
 docker exec fyp-neo4j cypher-shell -u neo4j -p SecureNeo4jPass2025! "
   SHOW INDEXES YIELD name, state, type, labelsOrTypes, properties, options
@@ -355,8 +376,10 @@ python ingestion/etl/inspect_db.py
 This command checks:
 - All PostgreSQL tables (row counts, coverage)
 - pgvector extension and text_chunks
+- Macro data tables (`treasury_rates`, `global_macro_indicators`, `economic_events`, `market_screener`, `forex_rates`, `market_eod_us`)
+- `textual_documents` coverage by `doc_type` (`earnings_call`, `broker_report`, `macro_report`)
 - All feedback tables (rl_feedback, user_feedback, prompt_versions)
-- Neo4j nodes and embeddings
+- Neo4j nodes and embeddings (`:Chunk`, `:NewsArticle`)
 - Vector index status
 
 ---
@@ -444,8 +467,9 @@ docker exec fyp-postgres psql -U airflow -d airflow -c "
 | 20 | Earnings Surprises | earnings_surprises | EODHD |
 | 21 | Outstanding Shares | outstanding_shares | EODHD |
 | 22 | Analyst Ratings | textual_documents | EODHD |
-| 23 | Broker Reports | Neo4j Chunks | PDF |
-| 24 | Earnings Call Transcripts | Neo4j Chunks | PDF |
+| 23 | Broker Reports | text_chunks + textual_documents + Neo4j Chunks | PDF |
+| 24 | Earnings Call Transcripts | text_chunks + textual_documents + Neo4j Chunks | PDF |
+| 25 | Macro Reports | text_chunks + textual_documents + Neo4j Chunks | PDF |
 | 25 | **RLAIF Feedback** | rl_feedback | AI Judge |
 | 26 | **User Feedback** | user_feedback | UI |
 | 27 | **Prompt Versions** | prompt_versions | A/B Testing |
