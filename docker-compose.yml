@@ -128,6 +128,25 @@ services:
       retries: 5
     restart: "no"
 
+  # One-off maintenance helper for collation/version refresh.
+  # Run manually when needed:
+  #   docker compose run --rm postgres-maintenance
+  postgres-maintenance:
+    image: pgvector/pgvector:pg15
+    container_name: fyp-postgres-maintenance
+    profiles: ["maintenance"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGPASSWORD: airflow
+    entrypoint: ["/bin/sh", "-c"]
+    command: >
+      "psql -h postgres -U airflow -d airflow -c \"REINDEX DATABASE airflow;\" &&
+       psql -h postgres -U airflow -d postgres -c \"ALTER DATABASE airflow REFRESH COLLATION VERSION;\" &&
+       psql -h postgres -U airflow -d airflow -c \"SELECT datname, datcollversion FROM pg_database WHERE datname='airflow';\""
+    restart: "no"
+
   neo4j:
     image: neo4j:5.15-community
     container_name: fyp-neo4j
