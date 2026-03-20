@@ -546,6 +546,8 @@ def ensure_tables() -> None:
         section     TEXT,
         filing_date TEXT,
         source      TEXT DEFAULT 'eodhd',
+        source_file TEXT,
+        source_name TEXT,
         ingested_at TIMESTAMP DEFAULT NOW()
     );
     CREATE INDEX IF NOT EXISTS idx_text_chunks_ticker
@@ -726,6 +728,9 @@ def _run_migrations() -> None:
         # (will silently fail if vector extension is not installed yet)
         "ALTER TABLE text_chunks ADD COLUMN IF NOT EXISTS embedding vector(768)",
         "CREATE INDEX IF NOT EXISTS text_chunks_embedding_idx ON text_chunks USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 64)",
+        # 2026-03: text_chunks - add source_file and source_name for enrichment
+        "ALTER TABLE text_chunks ADD COLUMN IF NOT EXISTS source_file TEXT",
+        "ALTER TABLE text_chunks ADD COLUMN IF NOT EXISTS source_name TEXT",
         # 2026-03: news_articles - add embedding column for semantic search
         "ALTER TABLE news_articles ADD COLUMN IF NOT EXISTS embedding vector(768)",
         "CREATE INDEX IF NOT EXISTS news_articles_embedding_idx ON news_articles USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 64)",

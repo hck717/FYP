@@ -14,6 +14,7 @@ Architecture:
 from __future__ import annotations
 
 import os
+import json
 import queue
 import sys
 import threading
@@ -823,12 +824,12 @@ def _render_web_search(output: Dict[str, Any], ticker: str) -> None:
 
 def _render_stock_research(output: Dict[str, Any], ticker: str) -> None:
     """Render Stock Research agent card (broker reports + earnings call analysis)."""
-    data_source = output.get("data_source", "neo4j")
-    source_badge = "Neo4j" if data_source == "neo4j" else "PDF"
+    data_source = str(output.get("data_source", "pdf")).lower()
+    source_badge = "PostgreSQL/pgvector" if data_source == "pg" else "PDF"
     with st.expander(f"Stock Research — {ticker}", expanded=True):
 
         # Data source badge
-        badge_color = "status-ok" if data_source == "neo4j" else "status-warn"
+        badge_color = "status-ok" if data_source == "pg" else "status-warn"
         st.markdown(
             f"Data source: <span class='{badge_color}'>{source_badge}</span>",
             unsafe_allow_html=True,
@@ -1287,6 +1288,74 @@ def _render_plan_info(plan: Optional[Dict[str, Any]], state: Dict[str, Any]) -> 
         f"**Agents:** {', '.join(agents_run) or '—'} | "
         f"**ReAct passes:** {react_iter}/{react_max}"
     )
+
+
+def _render_planner_feedback_learning(state: Dict[str, Any]) -> None:
+    """Show how planner learns from worst historical feedback runs."""
+    try:
+        from orchestration import feedback
+    except Exception as exc:
+        with st.expander("Planner feedback learning", expanded=False):
+            st.caption(f"Unavailable: {exc}")
+        return
+
+    with st.expander("Planner feedback learning", expanded=False):
+        user_query = str(state.get("user_query") or "")
+        st.caption("This panel previews the worst-case context block injected into planner routing.")
+
+        try:
+            worst_cases = feedback.get_worst_cases(limit=5)
+        except Exception as exc:
+            st.warning(f"Could not fetch worst cases: {exc}")
+            return
+
+        if not worst_cases:
+            st.info("No worst-case context injected (cold start or feedback DB unavailable).")
+            return
+
+        lines = ["PAST FAILURES TO AVOID (worst scored runs - learn from these):"]
+        for i, w in enumerate(worst_cases, 1):
+            tags = w.get("issue_tags") or []
+            if isinstance(tags, str):
+                try:
+                    tags = json.loads(tags)
+                except Exception:
+                    tags = []
+            weaknesses = w.get("weaknesses") or []
+            if isinstance(weaknesses, str):
+                try:
+                    weaknesses = json.loads(weaknesses)
+                except Exception:
+                    weaknesses = [weaknesses]
+
+            comment = str(w.get("comment") or "")
+            human_signal = ""
+            if w.get("helpful") is False:
+                human_signal = f" | USER DOWNVOTE: {', '.join(str(t) for t in tags)}"
+                if comment:
+                    human_signal += f" - '{comment}'"
+
+            lines.append(
+                f"  [{i}] Query: \"{str(w.get('user_query') or '')[:80]}\" | "
+                f"Ticker: {w.get('ticker', 'N/A')} | "
+                f"Score: {float(w.get('overall_score') or 0):.1f}/10 | "
+                f"Blamed: {w.get('agent_blamed', 'unknown')} | "
+                f"Weaknesses: {'; '.join(str(x) for x in weaknesses[:2])}"
+                f"{human_signal}"
+            )
+
+        lines.append(
+            "ACTION: Adjust your routing to avoid repeating these failure patterns. "
+            "If a similar query + ticker combination appears, increase react_max_iterations "
+            "or force run_web_search=true as a fallback."
+        )
+
+        worst_case_context = "\n".join(lines)
+
+        st.markdown("**How prompt is improved (planner user-message augmentation):**")
+        preview = f"{user_query}\n\n---\n{worst_case_context}\n---"
+        st.code(preview, language="text")
+        st.caption(f"Injected examples: {len(worst_cases)}")
 
 
 # ── Feedback Widget ───────────────────────────────────────────────────────────
@@ -1893,6 +1962,9 @@ def main() -> None:
 
         # Plan info bar
         _render_plan_info(state.get("plan"), state)
+
+        # Planner learning from prior worst feedback
+        _render_planner_feedback_learning(state)
 
         # Agent errors
         errors: Dict[str, str] = state.get("agent_errors") or {}

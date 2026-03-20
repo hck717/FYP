@@ -1,6 +1,6 @@
 # Orchestration Layer
 
-The orchestration layer coordinates the four specialised agents (Business Analyst, Quantitative Fundamental, Financial Modelling, Web Search) via a LangGraph `StateGraph`. It implements a **Global Plan-and-Execute / Local ReAct** architecture with **RLAIF feedback loop** for continuous improvement.
+The orchestration layer coordinates five specialised agents (Business Analyst, Quantitative Fundamental, Financial Modelling, Web Search, Stock Research) via a LangGraph `StateGraph`. It implements a planner-driven architecture with native parallel fan-out, post-processing feedback loops, and planner in-context learning from historical worst cases.
 
 ---
 
@@ -11,67 +11,36 @@ user_query
     │
     ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│  node_planner  (deepseek-chat)                                      │
-│  ├── classify query intent + complexity (1/2/3)                     │
-│  ├── resolve ticker symbol(s) from natural-language input           │
-│  ├── select which agents to invoke (run_* flags)                    │
-│  └── run data_availability.check_all() — ping all backends once    │
+│  node_planner (deepseek-chat)                                       │
+│  ├── classify intent + complexity (1/2/3)                           │
+│  ├── resolve ticker(s)                                               │
+│  ├── select run_* agent flags                                       │
+│  ├── query data_availability once                                   │
+│  ├── query episodic memory hints                                    │
+│  └── inject worst-case feedback context into planner prompt         │
 └──────────────────────────────┬──────────────────────────────────────┘
                                │
                                ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│  node_parallel_agents  (ThreadPoolExecutor)                          │
-│  ├── Business Analyst  ─── run_full_analysis(ticker)                │
-│  ├── Quant Fundamental ─── run_full_analysis(ticker)                │
-│  ├── Financial Modelling── run_full_analysis(ticker)                │
-│  └── Web Search        ─── run_web_search_agent({...})            │
-│                                                                      │
-│  Wall-clock time = max(T_BA, T_QF, T_FM, T_WS)                   │
+│ LangGraph native parallel fan-out                                    │
+│   BA | QF | FM | WS | Stock Research                                │
+│ (each with per-agent retry edge using agent_react_iterations)        │
 └──────────────────────────────┬──────────────────────────────────────┘
                                │
                                ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│  node_react_check                                                   │
-│  ├── if gaps (enabled agents with no output) AND iterations left    │
-│  │       → loop back to node_parallel_agents (retry gap agents)     │
-│  └── if no gaps OR iteration cap reached → proceed to summarizer   │
-└──────────────────────────────┬──────────────────────────────────────┘
-                ┌──────────────┴──────────────┐
-                │ loop if gaps remain          │
-                ▼                             ▼
-       [parallel_agents]────────────────┘
-                │ all done
-                ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│  node_summarizer  (deepseek-r1:8b)                                  │
-│  ├── receives all 4 agent outputs                                   │
-│  ├── writes 11-section buy-side research note                       │
-│  └── injects [N] inline citation numbers                            │
+│ node_summarizer (deepseek-chat)                                      │
+│  └── synthesises final structured report                             │
 └──────────────────────────────┬──────────────────────────────────────┘
                                │
                                ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│  node_rlaif_scorer  (deepseek-chat as judge)                       │
-│  ├── scores report on 5 dimensions (factual accuracy, citations,    │
-│  │   analysis depth, structure compliance, language quality)        │
-│  ├── identifies which agent caused any issues                       │
-│  └── stores scores in rl_feedback table for learning               │
-└──────────────────────────────┬──────────────────────────────────────┘
-                               │
-                               ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│  node_translator                                                    │
-│  └── translates to user's preferred language (if not English)       │
-└──────────────────────────────┬──────────────────────────────────────┘
-                               │
-                               ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│  node_memory_update                                                 │
-│  └── records query for semantic router + episodic memory           │
+│ node_post_processing                                                  │
+│  ├── RLAIF scoring + persistence                                     │
+│  └── episodic failure memory persistence                             │
 └──────────────────────────────┬──────────────────────────────────────┘
                                │
                               END
-                     final_summary + citations + rl_feedback_scores
 ```
 
 ---
@@ -81,38 +50,40 @@ user_query
 | File | Description |
 |---|---|
 | `graph.py` | Builds and compiles the LangGraph `StateGraph`. Exposes `run()` and `stream()` as the public API. |
-| `nodes.py` | All 9 LangGraph node functions: `node_planner`, `node_parallel_agents`, `node_business_analyst`, `node_quant_fundamental`, `node_financial_modelling`, `node_web_search`, `node_react_check`, `node_summarizer`, `node_rlaif_scorer`. |
+| `nodes.py` | Core graph nodes: `node_planner`, five agent nodes, `node_summarizer`, `node_post_processing`, plus progress queue helpers. |
 | `state.py` | `OrchestrationState` TypedDict — the shared state schema flowing between all nodes. |
-| `llm.py` | `plan_query()` (deepseek-chat) and `summarise_results()` (deepseek-r1:8b) plus the massive system prompts for both. |
+| `llm.py` | `plan_query()` and `summarise_results_structured()` prompt logic, semantic router, and dynamic few-shot helpers. |
 | `citations.py` | `build_citation_block()` extracts all `qdrant::` tokens from agent outputs and builds a numbered `[N]` reference list. `inject_inline_numbers()` replaces tokens with `[N]` numbers in the final summary. |
 | `data_availability.py` | `check_all()` concurrently pings Neo4j, Qdrant, PostgreSQL, and Ollama once per request and returns a readiness report. Used by `node_planner` to detect backend outages before dispatching agents. |
-| `feedback.py` | RLAIF scoring using DeepSeek Chat API as judge. Stores scores in `rl_feedback`, `user_feedback`, and `prompt_versions` tables. |
+| `feedback.py` | RLAIF scoring + feedback analytics helpers, including `get_worst_cases()` for planner in-context anti-pattern learning. |
+| `test_graph_nodes.py` | Planner injection tests for worst-case context and cold-start gating of `get_worst_cases()`. |
 | `episodic_memory.py` | Records query failures for semantic similarity lookup to pre-empt known failure patterns. |
+
+---
+
+## Planner Worst-Case In-Context Learning
+
+`node_planner` now injects a compact anti-pattern block from historical worst runs:
+
+- Source: `feedback.get_worst_cases(limit=5, min_runs=3)`
+- Ranking: `overall_score - 1.5` penalty for explicit user thumbs-down
+- Context placement: appended to planner user content (not system prompt)
+- Goal: steer routing away from known failure patterns (e.g., force web fallback, raise iteration budget)
+- Safety: wrapped in non-fatal `try/except`; empty on cold start or DB issues
 
 ---
 
 ## Graph Variants
 
-### Default — Parallel Graph
+### Default — Native Parallel Graph
 
 ```
-planner → parallel_agents → react_check ──► (parallel_agents | summarizer) → rlaif_scorer → translator → memory_update → END
+planner → [BA|QF|FM|WS|SR] (parallel edges + per-agent retries) → summarizer → post_processing → END
 ```
 
-All enabled agents run **concurrently** in a `ThreadPoolExecutor` inside `node_parallel_agents`. This is the production default.
+Enabled agents run concurrently via LangGraph native fan-out. This is the production default.
 
-### Legacy Sequential Graph (debug)
-
-```
-planner → react_dispatch → [BA | QF | WS | FM] (one at a time) → react_check → (react_dispatch | summarizer) → END
-```
-
-Enable with:
-```bash
-ORCHESTRATION_SEQUENTIAL=1
-```
-
-Useful for debugging individual agent failures without parallelism noise.
+Legacy sequential/react-dispatch path has been removed from production flow.
 
 ---
 
@@ -121,8 +92,8 @@ Useful for debugging individual agent failures without parallelism noise.
 | Node | Model | Why |
 |---|---|---|
 | `node_planner` | `deepseek-chat` (API) | Fast; reliable structured JSON routing output |
-| `node_summarizer` | `deepseek-r1:8b` (local Ollama) | Deep analytical prose; handles 11-section research note at 8K+ tokens |
-| `node_rlaif_scorer` | `deepseek-chat` (API) | Acts as judge to score report quality |
+| `node_summarizer` | `deepseek-chat` (API) | Structured report synthesis |
+| `node_post_processing` | `deepseek-chat` (API) | RLAIF scoring + persistence |
 
 ---
 
@@ -256,17 +227,9 @@ class OrchestrationState(TypedDict, total=False):
 
 ---
 
-## ReAct Loop Behaviour
+## Retry Behaviour
 
-The `node_react_check` + `_should_loop` conditional edge implement the ReAct pattern:
-
-| Complexity | `react_max_iterations` | Behaviour |
-|---|---|---|
-| 1 (simple) | 1 | Single pass — no retry regardless of gaps |
-| 2 (moderate) | 2 | One retry if any enabled agent failed |
-| 3 (full report) | 3 | Up to two retries on gaps or errors |
-
-**Key rule:** On each retry pass, only agents with **no output yet** or an **error** are re-run. Agents that already produced a successful result are never re-executed.
+Retries are now per-agent via LangGraph conditional edges and `agent_react_iterations` state. Complexity still sets `react_max_iterations`, but retries are handled at each agent node rather than a global `react_check` loop.
 
 ---
 
@@ -316,8 +279,7 @@ for node_name, node_output in stream("Compare MSFT vs AAPL"):
         print("RLAIF scores:", node_output.get("rl_feedback_scores"))
 ```
 
-For a **complexity-1** query the UI receives events: `planner → parallel_agents → react_check → summarizer → rlaif_scorer → translator → memory_update`.
-For **complexity-3** the events may repeat the parallel_agents loop.
+For a typical query the UI receives: `planner → agent events (parallel) → summarizer → post_processing`.
 
 ---
 
@@ -459,4 +421,4 @@ low_scores = get_recent_rl_feedback(days=7, min_score=7.0)
 
 ---
 
-*Last updated: 2026-03-14 | Author: hck717*
+*Last updated: 2026-03-20 | Author: orchestration updates*

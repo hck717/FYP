@@ -694,7 +694,10 @@ def _infer_chart_hints(query_lower: str, plan: Dict[str, Any]) -> List[str]:
     return list(dict.fromkeys(hints))  # deduplicate, preserve order
 
 
-def plan_query(user_query: str) -> Dict[str, Any]:
+def plan_query(
+    user_query: str,
+    worst_case_context: str = "",
+) -> Dict[str, Any]:
     """Call DeepSeek planner and return the structured plan dict.
 
     Before invoking the LLM, a semantic router checks cosine similarity
@@ -734,10 +737,19 @@ def plan_query(user_query: str) -> Dict[str, Any]:
         logger.debug("[planner/c2] Injecting %d few-shot example(s) into planner prompt.",
                      len(few_shot_examples))
 
+    user_content = user_query
+    if worst_case_context:
+        user_content = (
+            f"{user_query}\n\n"
+            f"---\n"
+            f"{worst_case_context}\n"
+            f"---"
+        )
+
     prompt = (
         f"{planner_prompt_with_date}"
         f"{few_shot_block}"
-        f"\n\nUser question: {user_query}\n\nJSON plan:"
+        f"\n\nUser question: {user_content}\n\nJSON plan:"
     )
 
     _query_lower = user_query.lower()
@@ -2351,9 +2363,10 @@ def _build_anchor_dict(
 
 _JSON_STAGE1_SYSTEM = """You are a financial data extraction assistant.
 Your ONLY job is to output a JSON object using EXCLUSIVELY the numbers provided in the ANCHOR DATA below.
-DO NOT invent, estimate, or recall any numbers from your training data.
+DO NOT invent, estimate, interpolate, infer, or recall any numbers from your training data.
 If a field's value is not in the ANCHOR DATA, set it to null.
-Output ONLY valid JSON — no prose, no markdown, no explanation."""
+For prose fields, do not introduce any new numeric literals beyond values already present in JSON numeric fields.
+Output ONLY valid JSON — no prose outside schema fields, no markdown, no explanation."""
 
 
 def _build_json_schema(anchor: Dict[str, Any], ticker: str) -> Dict[str, Any]:
@@ -2517,6 +2530,7 @@ CRITICAL RULES:
 1. Use the EXACT numbers from the JSON — do NOT change, round, or substitute any figure.
 2. Every sentence containing a number must end with a citation marker like [1], [2] etc.
 3. Use only numbers that appear in the JSON data object. Do NOT add any extra numbers from memory.
+3b. If a value is missing/null, explicitly state data is unavailable instead of inventing a proxy number.
 4. Write in flowing multi-sentence paragraphs — NO bullet points, NO lists.
 5. Use professional financial terminology throughout.
 6. BALANCE SHEET: total_assets, total_liabilities, and total_equity are THREE DISTINCT values. Never confuse them.
@@ -2632,8 +2646,8 @@ CRITICAL RULES:
 1. Every numeric field in financial_performance and key_financial_ratios_and_valuation must be
    copied VERBATIM from the ANCHOR DATA above. Do NOT modify, round, or estimate any number.
 2. If a field's value does not appear in the ANCHOR DATA, set it to null.
-3. All prose fields (executive_summary, company_overview, financial_performance.prose, etc.)
-   must reference numbers by their anchor key names, e.g. "revenue of ${anchor.get(f'{primary_ticker.upper()}_revenue_ttm_b', 'N/A')}B".
+3. All prose fields must remain consistent with numeric fields in the same JSON object.
+   Do not invent extra numeric literals in prose. If required data is unavailable, write "data unavailable".
 4. NO extra fields — the schema uses additionalProperties: false.
 5. Return ONLY the JSON object. No markdown fences, no explanation, no preamble."""
 
@@ -2736,6 +2750,7 @@ ANALYSIS DEPTH REQUIREMENTS:
 RULES:
 - Every number you write MUST appear in the JSON data above. NO other numbers.
 - Do NOT introduce numbers not present in the JSON (no RSI, no current ratio, no market capitalisation unless it's in the JSON).
+- If a number is not present in JSON, write a qualitative sentence without a numeric literal.
 - Every sentence with a number must end with [N] citation.
 - Flowing prose paragraphs only — NO bullet points, NO lists.
 - 6-10 sentences per section minimum to ensure depth.
@@ -3002,8 +3017,8 @@ def _audit_and_replace_numbers(
             num_val = float(num_str)
         except ValueError:
             return num_str
-        # Skip very small numbers (0-9) and years — likely structural
-        if num_val < 10 or (1900 <= num_val <= 2100):
+        # Skip years — likely structural rather than financial claims
+        if 1900 <= num_val <= 2100:
             return num_str
         # Find closest anchor value
         t = ticker.upper()
@@ -3020,10 +3035,9 @@ def _audit_and_replace_numbers(
             replacement = str(anchor[best_key])
             logger.info("[audit] Replacing stray number %s with anchor %s=%s", num_str, best_key, replacement)
             return replacement
-        # If far off and clearly financial-scale, log but leave (may be qualitative)
-        if num_val > 100:
-            logger.warning("[audit] Stray number %s not in anchor — leaving as-is", num_str)
-        return num_str
+        # No safe anchor match: redact numeric literal to prevent hallucinated figures
+        logger.warning("[audit] Stray number %s not in anchor — redacting", num_str)
+        return "N/A"
 
     # Match standalone numbers (not inside words or immediately followed by a decimal point,
     # which would indicate we're matching just the integer part of a larger decimal number

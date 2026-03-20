@@ -2,7 +2,7 @@
 Step 7: DeepSeek synthesis with mandatory citation prompts.
 
 For each analysis task, we:
-  1. Retrieve the most relevant chunks from the FAISS evidence index.
+  1. Retrieve the most relevant chunks from the evidence index.
   2. Build a focused prompt that includes deterministic features + raw evidence.
   3. Call DeepSeek (via ChatOpenAI wrapper) at temperature=0.
   4. Require EVERY claim to be cited as [doc_name p.N].
@@ -21,6 +21,7 @@ Run:
 from __future__ import annotations
 
 import os
+import warnings
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -29,6 +30,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langchain_core.documents import Document
+from pydantic import SecretStr
 
 from agent_step1_load import list_stock_files, load_pdf_pages
 from agent_step3_parse_quality import (
@@ -62,12 +64,17 @@ def _get_llm() -> "ChatOpenAI":
         api_key = os.environ.get("DEEPSEEK_API_KEY", "")
         if not api_key:
             raise EnvironmentError("DEEPSEEK_API_KEY not found in environment / .env")
+        warnings.filterwarnings(
+            "ignore",
+            message=r"Parameters \{'max_tokens'\} should be specified explicitly.*",
+            category=UserWarning,
+        )
         _llm = ChatOpenAI(
             model="deepseek-chat",
             base_url="https://api.deepseek.com",
-            api_key=api_key,
+            api_key=SecretStr(api_key),
             temperature=0,
-            max_tokens=500,
+            model_kwargs={"max_tokens": 500},
         )
     return _llm
 
@@ -193,13 +200,22 @@ def run_analysis_task(
     """
     from openai import APIConnectionError as _APIConnectionError
 
+    citation_appendix = (
+        "\n\nOutput format requirements:\n"
+        "- Include a final section header exactly: ### References\n"
+        "- Under it, list each citation used on its own line in this exact format: [doc_name p.N]\n"
+        "- Only include citations actually used in the body; no extra entries.\n"
+    )
+
+    effective_prompt = prompt + citation_appendix
+
     text = ""
     for attempt in range(1, max_retries + 2):
         print(f"\n  Calling DeepSeek for task: {task_name} (attempt {attempt}) ...")
         # Inner retry loop for transient connection errors
         for conn_try in range(1, max_conn_retries + 1):
             try:
-                response = _get_llm().invoke(prompt)
+                response = _get_llm().invoke(effective_prompt)
                 break
             except _APIConnectionError as e:
                 wait = 15 * conn_try  # 15s, 30s, 45s, 60s, 75s

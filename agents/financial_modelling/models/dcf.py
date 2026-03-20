@@ -1205,7 +1205,7 @@ def _compute_wacc(
         rd = _interest_best / total_debt
     else:
         return None, beta_used
-    logger.debug("WACC rd=%.3f%% (interest=\$%.2fB, debt=\$%.2fB)",
+    logger.debug("WACC rd=%.3f%% (interest=$%.2fB, debt=$%.2fB)",
                  rd * 100, _interest_best / 1e9, (total_debt or 0) / 1e9)
 
     # 7. Capital structure weights

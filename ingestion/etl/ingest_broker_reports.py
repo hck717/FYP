@@ -304,25 +304,27 @@ def _upsert_postgres_textual(
                             c.get("section"),
                             c.get("filing_date"),
                             emb_str,
-                            "textual_pdf",
+                            c.get("source_file", ""),
+                            c.get("source_name", ""),
                         )
                     )
                 chunk_rows = list({row[1]: row for row in chunk_rows}.values())
                 execute_values(
                     cur,
                     """
-                    INSERT INTO text_chunks (ticker, chunk_id, text, section, filing_date, embedding, source)
+                    INSERT INTO text_chunks (ticker, chunk_id, text, section, filing_date, embedding, source_file, source_name)
                     VALUES %s
                     ON CONFLICT (chunk_id) DO UPDATE SET
                         text = EXCLUDED.text,
                         section = EXCLUDED.section,
                         filing_date = EXCLUDED.filing_date,
                         embedding = EXCLUDED.embedding,
-                        source = EXCLUDED.source,
+                        source_file = EXCLUDED.source_file,
+                        source_name = EXCLUDED.source_name,
                         ingested_at = NOW()
                     """,
                     chunk_rows,
-                    template="(%s, %s, %s, %s, %s, %s::vector, %s)",
+                    template="(%s, %s, %s, %s, %s, %s::vector, %s, %s)",
                 )
         return len(chunks)
     finally:

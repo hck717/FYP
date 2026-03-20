@@ -1,23 +1,23 @@
 """
-Step 6: Chunking + FAISS vector embeddings + evidence pack retrieval.
+Step 6: Chunking + PGvector vector embeddings + evidence pack retrieval.
 
 Two index-building modes are supported:
 
-1. **FAISS mode** (original, default for local-PDF runs):
+1. **build_index (PDF mode)** (original, default for local-PDF runs):
    ``build_index(chunks)`` — embeds chunks in-process with HuggingFace
-   ``all-MiniLM-L6-v2`` and loads them into a FAISS IndexFlatIP.
+   ``all-MiniLM-L6-v2`` and loads them into an in-memory FAISS IndexFlatIP.
 
-2. **Neo4j mode** (DB run, preferred when ingestion pipeline has been run):
+2. **build_index_neo4j (PGvector mode)** (DB run, preferred when ingestion pipeline has been run):
    ``build_index_neo4j(ticker, transcript_pages, broker_pages)`` — fetches
-   pre-computed Ollama embeddings from Neo4j (dim=768) and loads them into
-   the same FAISS structure.  No local embedding model is needed.  Falls back
-   to FAISS mode automatically if Neo4j is unavailable or has no embeddings.
+   pre-computed Ollama embeddings from PostgreSQL text_chunks (dim=768) and loads them into
+   the EvidenceIndex.  No local embedding model or FAISS is needed.  Falls back to
+   ``build_index`` (PDF mode) automatically if PostgreSQL is unavailable or has no embeddings.
 
 Both modes return the same ``EvidenceIndex`` NamedTuple so all downstream
 ``retrieve`` / ``retrieve_broker_evidence`` calls are unchanged.
 
 Speed optimisation:
-  - retrieve_broker_evidence reuses the already-computed FAISS vectors stored in
+  - retrieve_broker_evidence reuses the already-computed PG vectors stored in
     EvidenceIndex.vectors instead of re-computing broker chunks.
 
 Run:
@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import logging
 import os
+import ast
 import numpy as np
 from collections import defaultdict
 from pathlib import Path
@@ -38,25 +39,17 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 logger = logging.getLogger(__name__)
 
-# Try importing FAISS — only required for FAISS mode
-try:
-    import faiss as _faiss
-    _FAISS_AVAILABLE = True
-except ImportError:
-    _faiss = None  # type: ignore[assignment]
-    _FAISS_AVAILABLE = False
-    logger.warning("[step6] faiss not installed — FAISS mode unavailable; Neo4j mode will be used.")
+_faiss = None
+_FAISS_AVAILABLE = False
 
-# Try importing HuggingFace embeddings — only required for FAISS mode
 try:
     from langchain_community.embeddings import HuggingFaceEmbeddings as _HuggingFaceEmbeddings
     _HF_AVAILABLE = True
 except ImportError:
     _HuggingFaceEmbeddings = None  # type: ignore[assignment,misc]
     _HF_AVAILABLE = False
-    logger.warning("[step6] langchain_community.embeddings not available — FAISS mode unavailable.")
+    logger.warning("[step6] langchain_community.embeddings not available — PDF mode unavailable.")
 
-# ── Neo4j config (mirrors agent_step1_neo4j.py) ───────────────────────────────
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _env_path = _REPO_ROOT / ".env"
 if _env_path.exists():
@@ -70,9 +63,21 @@ if _env_path.exists():
     except Exception:
         pass
 
-NEO4J_URI      = os.getenv("NEO4J_URI",      "bolt://localhost:7687")
-NEO4J_USER     = os.getenv("NEO4J_USER",     "neo4j")
-NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "SecureNeo4jPass2025!")
+try:
+    import psycopg2 as _psycopg2
+    _PSYCOPG_AVAILABLE = True
+except ImportError:
+    _psycopg2 = None  # type: ignore[assignment]
+    _PSYCOPG_AVAILABLE = False
+
+PG_HOST     = os.getenv("POSTGRES_HOST",     "postgres")
+PG_PORT     = int(os.getenv("POSTGRES_PORT", "5432"))
+PG_DB       = os.getenv("POSTGRES_DB",       "airflow")
+PG_USER     = os.getenv("POSTGRES_USER",     "airflow")
+PG_PASSWORD = os.getenv("POSTGRES_PASSWORD", "airflow")
+
+OLLAMA_BASE_URL    = os.getenv("OLLAMA_BASE_URL",    "http://localhost:11434")
+OLLAMA_EMBED_MODEL = os.getenv("EMBEDDING_MODEL",   "nomic-embed-text")
 
 from agent_step1_load import list_stock_files, load_pdf_pages
 from agent_step3_parse_quality import (
@@ -81,7 +86,6 @@ from agent_step3_parse_quality import (
     _normalize_spaced_text,
 )
 
-# ── Config ────────────────────────────────────────────────────────────────────
 TICKER               = "AAPL"
 BASE_DIR             = Path("data_reports")
 CHUNK_SIZE           = 500
@@ -97,7 +101,6 @@ BROKER_THESIS_QUERIES = [
     "catalysts upside bull case",
 ]
 
-# ── Chunking ──────────────────────────────────────────────────────────────────
 
 def chunk_documents(pages: list[Document]) -> list[Document]:
     splitter = RecursiveCharacterTextSplitter(
@@ -118,38 +121,127 @@ def chunk_documents(pages: list[Document]) -> list[Document]:
     return chunks
 
 
-# ── Embedding + FAISS index ───────────────────────────────────────────────────
-
 class EvidenceIndex(NamedTuple):
-    """FAISS index + model (optional) + chunks + pre-normalised vectors."""
-    faiss_index: object               # faiss.IndexFlatIP
-    model:       Optional[object]     # HuggingFaceEmbeddings, or None in Neo4j mode
+    faiss_index: object
+    model:       Optional[object]
     chunks:      list[Document]
-    vectors:     np.ndarray           # shape (N, dim), L2-normalised
+    vectors:     np.ndarray
+
+
+def _pg_connect():
+    return _psycopg2.connect(  # type: ignore[operator]
+        host=PG_HOST, port=PG_PORT,
+        dbname=PG_DB, user=PG_USER, password=PG_PASSWORD,
+    )
+
+
+def _coerce_embedding(embedding: object) -> list[float]:
+    """Normalize pgvector payload into a float list."""
+    if embedding is None:
+        return []
+    if isinstance(embedding, (list, tuple)):
+        return [float(x) for x in embedding]
+    if isinstance(embedding, np.ndarray):
+        return embedding.astype("float32").tolist()
+    if isinstance(embedding, str):
+        s = embedding.strip()
+        if not s:
+            return []
+        # pgvector text format: "[0.1,0.2,...]"
+        if s.startswith("[") and s.endswith("]"):
+            inner = s[1:-1].strip()
+            if not inner:
+                return []
+            return [float(x) for x in inner.split(",")]
+        # fallback if driver returns python-list repr
+        try:
+            parsed = ast.literal_eval(s)
+            if isinstance(parsed, (list, tuple)):
+                return [float(x) for x in parsed]
+        except Exception:
+            pass
+    raise ValueError(f"Unsupported embedding payload type: {type(embedding)!r}")
 
 
 def build_index(chunks: list[Document]) -> EvidenceIndex:
-    if not _FAISS_AVAILABLE or not _HF_AVAILABLE:
+    global _faiss, _FAISS_AVAILABLE
+    if not _FAISS_AVAILABLE:
+        try:
+            import faiss as _faiss_mod
+            _faiss = _faiss_mod
+            _FAISS_AVAILABLE = True
+        except ImportError as exc:
+            raise ImportError(
+                "PDF mode requires `faiss` to build local index. "
+                "Use PG mode (build_index_neo4j) or install faiss."
+            ) from exc
+
+    if not _HF_AVAILABLE:
         raise ImportError(
-            "FAISS mode requires both `faiss` and `langchain_community` packages. "
-            "Install them or use build_index_neo4j() instead."
+            "PDF mode requires `langchain_community` embeddings package. "
+            "Use PG mode (build_index_neo4j) or install langchain_community."
         )
     print(f"  Loading embedding model: {EMBED_MODEL} ...")
-    model  = _HuggingFaceEmbeddings(model_name=EMBED_MODEL)
+    model  = _HuggingFaceEmbeddings(model_name=EMBED_MODEL)  # type: ignore[operator]
     texts  = [c.page_content for c in chunks]
     print(f"  Embedding {len(texts)} chunks ...")
     vecs   = np.array(model.embed_documents(texts), dtype="float32")
 
     norms  = np.linalg.norm(vecs, axis=1, keepdims=True)
     norms  = np.where(norms == 0, 1.0, norms)
-    vecs  /= norms                   # L2-normalise in place
+    vecs  /= norms
 
     dim    = vecs.shape[1]
-    index  = _faiss.IndexFlatIP(dim)
-    index.add(vecs)
+    index  = _faiss.IndexFlatIP(dim)  # type: ignore[operator]
+    index.add(vecs)  # type: ignore[operator]
     print(f"  FAISS index built: {index.ntotal} vectors, dim={dim}")
 
     return EvidenceIndex(faiss_index=index, model=model, chunks=chunks, vectors=vecs)
+
+
+def _enrich_chunks_from_textual_documents(
+    ticker: str,
+    chunk_rows: list[dict],
+) -> dict[str, dict]:
+    """
+    Enrich chunk rows with doc_name, institution, doc_type from textual_documents.
+
+    Joins text_chunks (by source_file) with textual_documents (by filename).
+    Falls back to deriving doc_name from source_name if available, or chunk_id.
+    """
+    if not chunk_rows:
+        return {}
+
+    conn = _pg_connect()
+    enrichment: dict[str, dict] = {}
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT td.filename, td.institution, td.doc_type
+                FROM textual_documents td
+                WHERE td.ticker = %s
+                  AND td.doc_type IN ('earnings_call', 'broker_report')
+                """,
+                (ticker,),
+            )
+            rows = cur.fetchall()
+        for row in rows:
+            fname, institution, doc_type = row
+            if fname:
+                doc_name = fname
+                if doc_name.lower().endswith(".pdf"):
+                    doc_name = doc_name[:-4]
+            else:
+                doc_name = ""
+            enrichment[fname or ""] = {
+                "doc_name":    doc_name,
+                "institution": institution or "",
+                "doc_type":   doc_type or "",
+            }
+    finally:
+        conn.close()
+    return enrichment
 
 
 def build_index_neo4j(
@@ -158,149 +250,152 @@ def build_index_neo4j(
     broker_pages: list[Document],
 ) -> EvidenceIndex:
     """
-    Build an EvidenceIndex using pre-computed embeddings fetched from Neo4j.
+    Build an EvidenceIndex using pre-computed embeddings fetched from PostgreSQL.
 
-    Chunks that have no embedding in Neo4j (embedding IS NULL) are silently
-    skipped.  If no embeddings are available at all, falls back to
-    ``build_index`` (FAISS mode with local HuggingFace model).
+    Fetches all chunks for the ticker from the text_chunks table (via pgvector
+    HNSW index), enriches them with doc_name/institution from textual_documents,
+    and returns an EvidenceIndex with all vectors loaded for in-memory retrieval.
 
-    Parameters
-    ----------
-    ticker:
-        Ticker symbol, used to query Neo4j.
-    transcript_pages:
-        Document list from agent_step1_neo4j.load_neo4j_pages (transcript
-        docs); used to reconstruct the Document list in the same order as
-        the embeddings.
-    broker_pages:
-        Document list from agent_step1_neo4j.load_neo4j_pages (broker docs).
-
-    Returns
-    -------
-    EvidenceIndex
-        Compatible with all existing retrieve / retrieve_broker_evidence calls.
-        ``model`` is None (no local embedding model is loaded).
+    Falls back to ``build_index`` (FAISS mode with local HuggingFace model) if
+    PostgreSQL is unavailable or no embedded chunks are found.
     """
-    try:
-        from neo4j import GraphDatabase
-    except ImportError:
-        logger.warning("[step6] neo4j driver not available — falling back to FAISS mode.")
+    if not _PSYCOPG_AVAILABLE:
+        logger.warning("[step6] psycopg2 not available — falling back to FAISS mode.")
         all_pages = transcript_pages + broker_pages
         chunks    = chunk_documents(all_pages)
         return build_index(chunks)
 
-    logger.info("[step6] Building index from Neo4j embeddings for ticker=%s", ticker)
+    logger.info("[step6] Building index from PostgreSQL/pgvector for ticker=%s", ticker)
 
-    driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
+    conn = _pg_connect()
     try:
-        with driver.session() as session:
-            result = session.run(
+        with conn.cursor() as cur:
+            cur.execute(
                 """
-                MATCH (c:Company {ticker: $ticker})-[:HAS_CHUNK]->(ch:Chunk)
-                WHERE ch.embedding IS NOT NULL
-                RETURN ch.chunk_id   AS chunk_id,
-                       ch.text       AS text,
-                       ch.section    AS section,
-                       ch.source_name AS source_name,
-                       ch.filing_date AS filing_date,
-                       ch.institution AS institution,
-                       ch.embedding   AS embedding
-                ORDER BY ch.chunk_id
+                SELECT chunk_id, text, section, filing_date, embedding, source_file, source_name
+                FROM text_chunks
+                WHERE ticker = %s
+                  AND embedding IS NOT NULL
+                  AND section IN ('earnings_call', 'broker_report')
+                ORDER BY chunk_id
                 """,
-                ticker=ticker,
+                (ticker,),
             )
-            rows = [dict(r) for r in result]
+            rows = cur.fetchall()
     finally:
-        driver.close()
+        conn.close()
 
     if not rows:
         logger.warning(
-            "[step6] No embedded chunks found in Neo4j for ticker=%s — "
+            "[step6] No embedded chunks found in PostgreSQL for ticker=%s — "
             "falling back to FAISS mode.", ticker,
         )
         all_pages = transcript_pages + broker_pages
         chunks    = chunk_documents(all_pages)
         return build_index(chunks)
 
-    # Build Documents + embedding matrix from Neo4j rows
-    chunks: list[Document] = []
+    chunk_rows = []
     emb_list: list[list[float]] = []
-
-    for i, row in enumerate(rows):
-        text = row.get("text") or ""
-        if not text.strip():
+    expected_dim: int | None = None
+    skipped_bad_dim = 0
+    for row in rows:
+        chunk_id, text, section, filing_date, embedding, source_file, source_name = row
+        if not text or not text.strip():
             continue
-        # Map Neo4j section → doc_type used by downstream filters
-        section = row.get("section") or ""
-        doc_type = "transcript" if section == "earnings_call" else "broker"
+        emb = _coerce_embedding(embedding)
+        if not emb:
+            continue
+        if expected_dim is None:
+            expected_dim = len(emb)
+        if len(emb) != expected_dim:
+            skipped_bad_dim += 1
+            continue
+        chunk_rows.append({
+            "chunk_id":     chunk_id,
+            "text":         text,
+            "section":      section or "",
+            "filing_date":  filing_date or "",
+            "source_file":  source_file or "",
+            "source_name":  source_name or "",
+        })
+        emb_list.append(emb)
 
-        chunks.append(Document(
-            page_content=text,
-            metadata={
-                "ticker":       ticker,
-                "doc_type":     doc_type,
-                "doc_name":     row.get("source_name") or row.get("chunk_id", "unknown"),
-                "period":       "",          # period not stored in Neo4j; patched below
-                "page_number":  i + 1,
-                "section":      section,
-                "filing_date":  row.get("filing_date", ""),
-                "institution":  row.get("institution", ""),
-                "chunk_id":     row.get("chunk_id", ""),
-            },
-        ))
-        emb_list.append(row["embedding"])
-
-    if not chunks:
-        logger.warning("[step6] All Neo4j chunks were empty — falling back to FAISS mode.")
+    if not chunk_rows:
+        logger.warning("[step6] All PostgreSQL chunks were empty — falling back to FAISS mode.")
         all_pages = transcript_pages + broker_pages
         return build_index(chunk_documents(all_pages))
 
-    # Patch "period" metadata using the transcript_pages ordering:
-    # latest pages come first in transcript_pages, so chunks whose
-    # chunk_id appears in transcript_pages[0..n_latest-1] get "latest".
-    _latest_ids: set[str] = {
-        p.metadata.get("chunk_id", "") for p in transcript_pages
-        if p.metadata.get("period") == "latest"
-    }
-    _prev_ids: set[str] = {
-        p.metadata.get("chunk_id", "") for p in transcript_pages
-        if p.metadata.get("period") == "previous"
-    }
-    for chunk in chunks:
-        cid = chunk.metadata.get("chunk_id", "")
-        if cid in _latest_ids:
-            chunk.metadata["period"] = "latest"
-        elif cid in _prev_ids:
-            chunk.metadata["period"] = "previous"
+    if skipped_bad_dim:
+        logger.warning(
+            "[step6] Skipped %d chunks due to embedding dimension mismatch",
+            skipped_bad_dim,
+        )
+
+    enrichment = _enrich_chunks_from_textual_documents(ticker, chunk_rows)
+
+    transcript_map: dict[str, Document] = {p.metadata.get("chunk_id", ""): p for p in transcript_pages}
+    broker_map:     dict[str, Document] = {p.metadata.get("chunk_id", ""): p for p in broker_pages}
+
+    latest_ids: set[str] = {p.metadata.get("chunk_id", "") for p in transcript_pages if p.metadata.get("period") == "latest"}
+    prev_ids:   set[str] = {p.metadata.get("chunk_id", "") for p in transcript_pages if p.metadata.get("period") == "previous"}
+
+    docs: list[Document] = []
+    for row in chunk_rows:
+        cid  = row["chunk_id"]
+        text = row["text"]
+        section = row["section"]
+
+        pg_doc = transcript_map.get(cid) or broker_map.get(cid)
+
+        if pg_doc:
+            base_meta = dict(pg_doc.metadata)
+        else:
+            doc_type = "transcript" if section == "earnings_call" else "broker"
+            source_file = row.get("source_file") or ""
+            enrich = enrichment.get(source_file, {})
+
+            if section == "earnings_call":
+                period = "latest" if cid in latest_ids else ("previous" if cid in prev_ids else "")
+            else:
+                period = ""
+
+            base_meta = {
+                "ticker":      ticker,
+                "doc_type":    enrich.get("doc_type") or doc_type,
+                "doc_name":    enrich.get("doc_name") or source_file or cid,
+                "period":      period,
+                "page_number": 0,
+                "section":     section,
+                "filing_date": row["filing_date"],
+                "institution": enrich.get("institution") or "",
+                "chunk_id":    cid,
+            }
+
+        docs.append(Document(page_content=text, metadata=base_meta))
+
+    if not emb_list:
+        logger.warning("[step6] No valid embeddings after normalization — falling back to PDF mode.")
+        all_pages = transcript_pages + broker_pages
+        return build_index(chunk_documents(all_pages))
 
     vecs = np.array(emb_list, dtype="float32")
     norms = np.linalg.norm(vecs, axis=1, keepdims=True)
     norms = np.where(norms == 0, 1.0, norms)
     vecs /= norms
 
-    if not _FAISS_AVAILABLE:
-        raise ImportError(
-            "faiss is required for build_index_neo4j. "
-            "Install it with: pip install faiss-cpu"
-        )
+    dummy_index = None
+    logger.info("[step6] PGvector index built: %d vectors, dim=%d", len(docs), vecs.shape[1])
 
-    dim   = vecs.shape[1]
-    index = _faiss.IndexFlatIP(dim)
-    index.add(vecs)
-    logger.info("[step6] Neo4j index built: %d vectors, dim=%d", index.ntotal, dim)
+    return EvidenceIndex(faiss_index=dummy_index, model=None, chunks=docs, vectors=vecs)
 
-    return EvidenceIndex(faiss_index=index, model=None, chunks=chunks, vectors=vecs)
-
-
-# ── Ollama query embedder (used by retrieve in Neo4j mode) ────────────────────
 
 def _embed_query_ollama(query: str) -> np.ndarray:
     """Embed a single query string using Ollama (nomic-embed-text)."""
     import requests
-    ollama_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+    embed_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
     embed_model = os.getenv("EMBEDDING_MODEL", "nomic-embed-text")
     resp = requests.post(
-        f"{ollama_url.rstrip('/')}/api/embed",
+        f"{embed_url.rstrip('/')}/api/embed",
         json={"model": embed_model, "input": [query]},
         timeout=30,
     )
@@ -312,15 +407,11 @@ def _embed_query_ollama(query: str) -> np.ndarray:
     return np.array(embeddings[0], dtype="float32")
 
 
-# ── Retrieval ─────────────────────────────────────────────────────────────────
-
 def _embed_query(evidence: EvidenceIndex, query: str) -> np.ndarray:
     """Embed a query using whichever method is available."""
     if evidence.model is not None:
-        # FAISS mode — use HuggingFace model
-        return np.array(evidence.model.embed_query(query), dtype="float32")
+        return np.array(evidence.model.embed_query(query), dtype="float32")  # type: ignore[union-attr]
     else:
-        # Neo4j mode — use Ollama
         return _embed_query_ollama(query)
 
 
@@ -333,15 +424,15 @@ def retrieve(
 ) -> list[Document]:
     q_vec = _embed_query(evidence, query)
     q_vec /= max(np.linalg.norm(q_vec), 1e-9)
-    q_vec  = q_vec.reshape(1, -1)
 
     fetch_k = top_k * 5 if (filter_doc_type or filter_section) else top_k
-    fetch_k = min(fetch_k, evidence.faiss_index.ntotal)
+    fetch_k = min(fetch_k, len(evidence.chunks))
 
-    scores, indices = evidence.faiss_index.search(q_vec, fetch_k)
+    scores = evidence.vectors @ q_vec
+    top_indices = np.argsort(scores)[::-1][:fetch_k]
+
     results: list[Document] = []
-
-    for score, idx in zip(scores[0], indices[0]):
+    for idx in top_indices:
         if idx < 0:
             continue
         chunk = evidence.chunks[idx]
@@ -352,7 +443,7 @@ def retrieve(
             continue
         results.append(Document(
             page_content=chunk.page_content,
-            metadata={**meta, "retrieval_score": round(float(score), 4)},
+            metadata={**meta, "retrieval_score": round(float(scores[idx]), 4)},
         ))
         if len(results) >= top_k:
             break
@@ -365,22 +456,15 @@ def retrieve_broker_evidence(
     top_k_per_doc: int = BROKER_TOP_K_PER_DOC,
     queries: list[str] | None = None,
 ) -> list[Document]:
-    """
-    Reuse the pre-normalised vectors stored in EvidenceIndex.vectors
-    instead of re-embedding broker chunks from scratch.
-    Query embedding uses Ollama (Neo4j mode) or HuggingFace (FAISS mode).
-    """
     if queries is None:
         queries = BROKER_THESIS_QUERIES
 
-    # Embed queries
     q_vecs = []
     for q in queries:
         v = _embed_query(evidence, q)
         v /= max(np.linalg.norm(v), 1e-9)
         q_vecs.append(v)
 
-    # Build per-doc list of chunk indices (broker docs only)
     doc_chunk_indices: dict[str, list[int]] = defaultdict(list)
     for i, chunk in enumerate(evidence.chunks):
         if chunk.metadata.get("doc_type") == "broker":
@@ -394,16 +478,14 @@ def retrieve_broker_evidence(
     for doc_name, chunk_idxs in sorted(doc_chunk_indices.items()):
         if not chunk_idxs:
             continue
-        # Reuse already-computed normalised vectors
-        doc_vecs = evidence.vectors[chunk_idxs]          # shape (k, dim)
+        doc_vecs = evidence.vectors[chunk_idxs]
 
-        # Max-score across all queries
         scores = np.zeros(len(chunk_idxs))
         for q_vec in q_vecs:
             scores = np.maximum(scores, doc_vecs @ q_vec)
 
-        top_idxs = np.argsort(scores)[::-1][:top_k_per_doc]
-        for local_i in top_idxs:
+        top_local_idxs = np.argsort(scores)[::-1][:top_k_per_doc]
+        for local_i in top_local_idxs:
             global_i = chunk_idxs[local_i]
             chunk    = evidence.chunks[global_i]
             selected.append(Document(
@@ -422,8 +504,6 @@ def format_evidence_pack(chunks: list[Document]) -> str:
         parts.append(f"{label}\n{c.page_content.strip()}")
     return "\n\n---\n\n".join(parts)
 
-
-# ── Main ───────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     print(f"=== Steps 1-3: Load + quality + section tag for {TICKER} ===\n")

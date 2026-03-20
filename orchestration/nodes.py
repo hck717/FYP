@@ -30,6 +30,7 @@ import os
 import queue
 import time
 import uuid
+import json
 from typing import Any, Dict, List, Optional, cast
 
 from .llm import plan_query, summarise_results, summarise_results_structured
@@ -229,7 +230,50 @@ def node_planner(state: OrchestrationState) -> OrchestrationState:
             logger.info("[planner] Detected language requirement: %s", output_language)
             break
 
-    plan = plan_query(user_query)
+    # --- in-context learning: inject worst past cases into planner prompt ---
+    worst_case_context: str = ""
+    try:
+        worst_cases = feedback.get_worst_cases(limit=5)
+        if worst_cases:
+            lines = ["PAST FAILURES TO AVOID (worst scored runs - learn from these):"]
+            for i, w in enumerate(worst_cases, 1):
+                human_signal = ""
+                if w.get("helpful") is False:
+                    comment = w.get("comment") or ""
+                    tags = w.get("issue_tags") or []
+                    if isinstance(tags, str):
+                        try:
+                            tags = json.loads(tags)
+                        except Exception:
+                            tags = []
+                    human_signal = f" | USER DOWNVOTE: {', '.join(tags)}" + (f" - '{comment}'" if comment else "")
+
+                weaknesses = w.get("weaknesses") or []
+                if isinstance(weaknesses, str):
+                    try:
+                        weaknesses = json.loads(weaknesses)
+                    except Exception:
+                        weaknesses = [weaknesses]
+
+                lines.append(
+                    f"  [{i}] Query: \"{str(w.get('user_query', ''))[:80]}\" | "
+                    f"Ticker: {w.get('ticker', 'N/A')} | "
+                    f"Score: {float(w.get('overall_score') or 0):.1f}/10 | "
+                    f"Blamed: {w.get('agent_blamed', 'unknown')} | "
+                    f"Weaknesses: {'; '.join(str(x) for x in weaknesses[:2])}"
+                    f"{human_signal}"
+                )
+            lines.append(
+                "ACTION: Adjust your routing to avoid repeating these failure patterns. "
+                "If a similar query + ticker combination appears, increase react_max_iterations "
+                "or force run_web_search=true as a fallback."
+            )
+            worst_case_context = "\n".join(lines)
+            logger.info("[planner] Injecting %d worst-case examples into planner context.", len(worst_cases))
+    except Exception as exc:
+        logger.warning("[planner] Worst-case context injection failed (non-fatal): %s", exc)
+
+    plan = plan_query(user_query, worst_case_context=worst_case_context)
 
     # Extract and remove the thinking trace from the plan dict (it's metadata, not routing data)
     planner_trace: str = plan.pop("planner_trace", "") or ""
