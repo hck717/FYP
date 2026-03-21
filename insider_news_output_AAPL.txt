@@ -1,0 +1,58 @@
+{
+  "agent": "insider_news",
+  "ticker": "AAPL",
+  "insider_analysis": {
+    "activity_summary": "No insider trading transactions were reported for AAPL during the period analyzed. Therefore, no activity can be summarized [EVIDENCE p.1].",
+    "buy_sell_ratio": null,
+    "net_position": "neutral",
+    "conviction": "low",
+    "notable_insiders": [],
+    "insider_sentiment": "neutral",
+    "red_flags": [
+      "No insider data is available for analysis, which prevents the identification of trading patterns or signals [EVIDENCE p.1]."
+    ]
+  },
+  "news_analysis": {
+    "sentiment_summary": "No news data is available for AAPL, so sentiment analysis cannot be performed based on current evidence.",
+    "avg_sentiment_score": 0.0,
+    "sentiment_trend": "stable",
+    "positive_catalysts": [],
+    "negative_catalysts": [],
+    "key_themes": [],
+    "credibility": "No news sources provided, so credibility assessment is not possible."
+  },
+  "investment_thesis": {
+    "combined_thesis": "The investment thesis for AAPL is based on limited data, with insider trading analysis showing no transactions and neutral sentiment [EVIDENCE p.1], and news analysis indicating no available data for sentiment assessment [News Analysis Summary p.1]. This lack of information results in a neutral outlook with low conviction, suggesting a hold position until more data emerges to guide investment decisions.",
+    "signal_alignment": "aligned",
+    "bull_case": "No bullish evidence is present in the insider analysis, which reports no buying activity and neutral sentiment [EVIDENCE p.1], and the news analysis shows no positive catalysts [News Analysis Summary p.1].",
+    "bear_case": "No bearish evidence is present in the insider analysis, with no selling activity reported [EVIDENCE p.1], and the news analysis indicates no negative catalysts [News Analysis Summary p.1].",
+    "key_risks": [
+      "Lack of insider trading data prevents identification of trading patterns or signals, which could mask underlying issues [EVIDENCE p.1].",
+      "Absence of news data limits ability to assess market sentiment and potential catalysts, increasing uncertainty [News Analysis Summary p.1]."
+    ],
+    "key_opportunities": [
+      "The neutral sentiment from both analyses suggests no immediate downside, providing stability for holding [EVIDENCE p.1], [News Analysis Summary p.1].",
+      "Future data releases could reveal positive signals not currently captured, offering potential upside if monitored closely."
+    ],
+    "recommendation": "hold",
+    "conviction": "low"
+  },
+  "citations": [
+    {
+      "doc_name": "EVIDENCE",
+      "page": 1
+    },
+    {
+      "doc_name": "News Analysis Summary",
+      "page": 1
+    }
+  ],
+  "thinking_trace": [],
+  "error": null,
+  "data_source": "pg",
+  "data_coverage": {
+    "insider_transactions_count": 0,
+    "news_articles_count": 0,
+    "date_range": "No data"
+  }
+}

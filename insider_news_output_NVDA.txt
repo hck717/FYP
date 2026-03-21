@@ -1,0 +1,56 @@
+{
+  "agent": "insider_news",
+  "ticker": "NVDA",
+  "insider_analysis": {
+    "activity_summary": "No insider trading data is available for NVDA. Therefore, no analysis of buys, sells, dollar values, or transaction frequency can be conducted [No insider data available p.1].",
+    "buy_sell_ratio": null,
+    "net_position": "neutral",
+    "conviction": "low",
+    "notable_insiders": [],
+    "insider_sentiment": "neutral",
+    "red_flags": []
+  },
+  "news_analysis": {
+    "sentiment_summary": "No news data available for analysis. No sentiment, catalysts, or themes can be assessed without evidence.",
+    "avg_sentiment_score": 0.0,
+    "sentiment_trend": "stable",
+    "positive_catalysts": [],
+    "negative_catalysts": [],
+    "key_themes": [],
+    "credibility": "No news sources provided for assessment."
+  },
+  "investment_thesis": {
+    "combined_thesis": "Based on the provided analyses, there is no insider trading data available for NVDA, resulting in a neutral sentiment with low conviction [No insider data available p.1]. Similarly, no news data is available, leading to a neutral news sentiment with no catalysts [No news data available p.1]. Therefore, the investment thesis cannot be formed from these sources alone, indicating a need for additional information.",
+    "signal_alignment": "aligned",
+    "bull_case": "No bullish evidence is present in the insider analysis due to lack of data [No insider data available p.1], and no positive catalysts are identified in the news analysis [No news data available p.1].",
+    "bear_case": "No bearish evidence is present in the insider analysis due to lack of data [No insider data available p.1], and no negative catalysts are identified in the news analysis [No news data available p.1].",
+    "key_risks": [
+      "Lack of insider trading data may hide potential corporate issues or insider concerns [No insider data available p.1].",
+      "Absence of news analysis could mean unaccounted market risks or missing negative events [No news data available p.1]."
+    ],
+    "key_opportunities": [
+      "Neutral insider sentiment with no selling activity might indicate stability, but no buying signal exists [No insider data available p.1].",
+      "Stable news sentiment without negative catalysts could provide a neutral environment, but no positive drivers are evident [No news data available p.1]."
+    ],
+    "recommendation": "hold",
+    "conviction": "low"
+  },
+  "citations": [
+    {
+      "doc_name": "No insider data available",
+      "page": 1
+    },
+    {
+      "doc_name": "No news data available",
+      "page": 1
+    }
+  ],
+  "thinking_trace": [],
+  "error": null,
+  "data_source": "pg",
+  "data_coverage": {
+    "insider_transactions_count": 0,
+    "news_articles_count": 0,
+    "date_range": "No data"
+  }
+}

@@ -1,0 +1,58 @@
+{
+  "agent": "insider_news",
+  "ticker": "TSLA",
+  "insider_analysis": {
+    "activity_summary": "No insider trading data is available for TSLA, so no analysis of buys vs sells, dollar value, or frequency can be performed. [EVIDENCE p.1]",
+    "buy_sell_ratio": null,
+    "net_position": "neutral [EVIDENCE p.1]",
+    "conviction": "low [EVIDENCE p.1]",
+    "notable_insiders": [],
+    "insider_sentiment": "neutral [EVIDENCE p.1]",
+    "red_flags": [
+      "Absence of insider data may indicate reporting delays, lack of transactions, or transparency issues. [EVIDENCE p.1]"
+    ]
+  },
+  "news_analysis": {
+    "sentiment_summary": "No news data is available for analysis; therefore, a sentiment assessment cannot be performed.",
+    "avg_sentiment_score": 0.0,
+    "sentiment_trend": "stable",
+    "positive_catalysts": [],
+    "negative_catalysts": [],
+    "key_themes": [],
+    "credibility": "No news sources are available for a credibility assessment."
+  },
+  "investment_thesis": {
+    "combined_thesis": "The investment thesis for TSLA is characterized by a complete lack of actionable data from both insider trading and news analyses [EVIDENCE p.1][News Analysis Summary p.1]. Insider sentiment is neutral with low conviction, and no news sentiment can be assessed, indicating high uncertainty and no clear directional signals [EVIDENCE p.1][News Analysis Summary p.1]. Consequently, any investment decision must rely on external factors beyond the provided analyses.",
+    "signal_alignment": "aligned",
+    "bull_case": "No evidence supports a bullish case from insider or news analyses; the absence of insider selling and negative news could be interpreted as stability, but no positive catalysts are identified [EVIDENCE p.1][News Analysis Summary p.1].",
+    "bear_case": "No evidence supports a bearish case from news analysis, but the absence of insider data raises red flags such as potential reporting delays or transparency issues, which could indicate underlying problems [EVIDENCE p.1][News Analysis Summary p.1].",
+    "key_risks": [
+      "Lack of insider trading data may indicate transparency issues or reporting delays, hiding potential negative information [EVIDENCE p.1].",
+      "Absence of news analysis means market-moving events or catalysts are not captured, increasing investment uncertainty [News Analysis Summary p.1]."
+    ],
+    "key_opportunities": [
+      "Neutral insider sentiment with no selling pressure could imply stability if insiders are not divesting [EVIDENCE p.1].",
+      "Lack of negative news might suggest no adverse events have occurred recently, potentially a positive sign [News Analysis Summary p.1]."
+    ],
+    "recommendation": "hold",
+    "conviction": "low"
+  },
+  "citations": [
+    {
+      "doc_name": "EVIDENCE",
+      "page": 1
+    },
+    {
+      "doc_name": "News Analysis Summary",
+      "page": 1
+    }
+  ],
+  "thinking_trace": [],
+  "error": null,
+  "data_source": "pg",
+  "data_coverage": {
+    "insider_transactions_count": 0,
+    "news_articles_count": 0,
+    "date_range": "No data"
+  }
+}
