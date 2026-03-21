@@ -1,0 +1,141 @@
+{
+  "agent": "macro",
+  "ticker": "GOOGL",
+  "regime": "risk-off",
+  "macro_themes": [
+    {
+      "theme": "Geopolitical Escalation Driving Derisking",
+      "direction": "bearish",
+      "confidence": 0.85,
+      "transmission_channel": "Geopolitical risks increase equity risk premiums and lower valuations, while potentially disrupting global digital advertising and cloud services markets, as derisking advances due to escalation [20260312_JP_Morgan_Equity_Strategy-_The_geopolitics_driven_derisking_is_pro.pdf p.5].",
+      "impact_magnitude": "high",
+      "time_horizon": "immediate"
+    },
+    {
+      "theme": "Trade Uncertainty Abating",
+      "direction": "bullish",
+      "confidence": 0.7,
+      "transmission_channel": "Reduced trade uncertainty supports GOOGL's international revenue growth and cross-border operations, with the worst of trade uncertainty behind us [20260312_JP_Morgan_Equity_Strategy-_The_geopolitics_driven_derisking_is_pro.pdf p.2].",
+      "impact_magnitude": "medium",
+      "time_horizon": "medium-term"
+    },
+    {
+      "theme": "Investor De-risking in Flows and Positioning",
+      "direction": "bearish",
+      "confidence": 0.75,
+      "transmission_channel": "ETF and CTA selling pressure leads to downward momentum and reduced liquidity for large-cap growth stocks like GOOGL, as indicated by positioning flows [20260312_JP_Morgan_Delta_One_Flows_-_Positioning-_ETF_investors_and_CTAs_de.pdf p.3].",
+      "impact_magnitude": "high",
+      "time_horizon": "immediate"
+    },
+    {
+      "theme": "Corporate Pricing Power Resilience",
+      "direction": "neutral",
+      "confidence": 0.65,
+      "transmission_channel": "Elevated pricing discussions indicate margin resilience, but in a risk-off regime, overall demand weakness may offset benefits for GOOGL's revenue, based on earnings call analysis [20260313_Barclays_U.S._Equity_Strategy_-_Data_Science-_UPDATE-_4Q25_Earnin.pdf p.1].",
+      "impact_magnitude": "low",
+      "time_horizon": "medium-term"
+    }
+  ],
+  "per_report_summaries": [
+    {
+      "report_name": "20260313_Barclays_U.S._Equity_Strategy_-_Data_Science-_UPDATE-_4Q25_Earnin.pdf",
+      "summary": "The report analyzes corporate pricing discussions from earnings calls, noting that the share of executives talking about pricing remains elevated at ~75%, indicating sustained focus on pricing power and inflation context. [20260313_Barclays_U.S._Equity_Strategy_-_Data_Science-_UPDATE-_4Q25_Earnin.pdf p.1]",
+      "stock_relevance": "GOOGL's advertising and cloud services pricing could be influenced by broader corporate pricing trends, affecting its revenue growth and margin dynamics as companies adjust spending. [20260313_Barclays_U.S._Equity_Strategy_-_Data_Science-_UPDATE-_4Q25_Earnin.pdf p.1]",
+      "report_date": "2026-03-13"
+    },
+    {
+      "report_name": "20260312_JP_Morgan_Equity_Strategy-_The_geopolitics_driven_derisking_is_pro.pdf",
+      "summary": "The thesis highlights geopolitics-driven derisking advancing, with an underweight stance on US equities due to earnings risk and stretched investor positioning, suggesting using market weakness to step in. [20260312_JP_Morgan_Equity_Strategy-_The_geopolitics_driven_derisking_is_pro.pdf p.2 p.5]",
+      "stock_relevance": "As a major US tech stock, GOOGL could face selling pressure from derisking flows and geopolitical tensions that may disrupt global supply chains and demand for its services. [20260312_JP_Morgan_Equity_Strategy-_The_geopolitics_driven_derisking_is_pro.pdf p.2 p.5]",
+      "report_date": "2026-03-12"
+    },
+    {
+      "report_name": "20260312_JP_Morgan_Delta_One_Flows_-_Positioning-_ETF_investors_and_CTAs_de.pdf",
+      "summary": "The report details positioning of ETF investors and CTAs, with data on short-term interest rates like SOFR and Euribor, reflecting market flows and rate expectations. [20260312_JP_Morgan_Delta_One_Flows_-_Positioning-_ETF_investors_and_CTAs_de.pdf p.3]",
+      "stock_relevance": "Changes in interest rates and institutional flows can affect GOOGL's stock price through discount rate adjustments for future cash flows and liquidity conditions in equity markets. [20260312_JP_Morgan_Delta_One_Flows_-_Positioning-_ETF_investors_and_CTAs_de.pdf p.3]",
+      "report_date": "2026-03-12"
+    },
+    {
+      "report_name": "20260315_UBS_Global_Equity_Strategy_-Quantitative_Framework_and_Posit.pdf",
+      "summary": "The report uses a quantitative framework to analyze drivers of ACWI relative industry returns and narrative radar scorecards for tactical indicators in global equities. [20260315_UBS_Global_Equity_Strategy_-Quantitative_Framework_and_Posit.pdf p.4]",
+      "stock_relevance": "GOOGL's performance is influenced by global equity factor rotations and industry-level shifts, which quantitative models monitor, potentially driving investor allocations to or from tech stocks. [20260315_UBS_Global_Equity_Strategy_-Quantitative_Framework_and_Posit.pdf p.4]",
+      "report_date": "2026-03-15"
+    }
+  ],
+  "top_macro_drivers": [
+    "Fed Rate Path",
+    "Geopolitical Derisking",
+    "Corporate Pricing Power"
+  ],
+  "top_risk": "Unexpected inflation spike",
+  "risk_scenario": "If inflation surprises to the upside, the Fed could tighten monetary policy more aggressively, which would impact GOOGL via higher discount rates and reduced corporate advertising spend. [20260313_Barclays_U.S._Equity_Strategy_-_Data_Science-_UPDATE-_4Q25_Earnin.pdf p.1]",
+  "citations": [
+    {
+      "doc_name": "20260312_JP_Morgan_Equity_Strategy-_The_geopolitics_driven_derisking_is_pro.pdf",
+      "page": 5
+    },
+    {
+      "doc_name": "20260312_JP_Morgan_Equity_Strategy-_The_geopolitics_driven_derisking_is_pro.pdf",
+      "page": 2
+    },
+    {
+      "doc_name": "20260312_JP_Morgan_Delta_One_Flows_-_Positioning-_ETF_investors_and_CTAs_de.pdf",
+      "page": 3
+    },
+    {
+      "doc_name": "20260313_Barclays_U.S._Equity_Strategy_-_Data_Science-_UPDATE-_4Q25_Earnin.pdf",
+      "page": 1
+    },
+    {
+      "doc_name": "20260313_Barclays_U.S._Equity_Strategy_-_Data_Science-_UPDATE-_4Q25_Earnin.pdf",
+      "page": 1
+    },
+    {
+      "doc_name": "20260313_Barclays_U.S._Equity_Strategy_-_Data_Science-_UPDATE-_4Q25_Earnin.pdf",
+      "page": 1
+    },
+    {
+      "doc_name": "20260312_JP_Morgan_Equity_Strategy-_The_geopolitics_driven_derisking_is_pro.pdf p.2",
+      "page": 5
+    },
+    {
+      "doc_name": "20260312_JP_Morgan_Equity_Strategy-_The_geopolitics_driven_derisking_is_pro.pdf p.2",
+      "page": 5
+    },
+    {
+      "doc_name": "20260312_JP_Morgan_Delta_One_Flows_-_Positioning-_ETF_investors_and_CTAs_de.pdf",
+      "page": 3
+    },
+    {
+      "doc_name": "20260312_JP_Morgan_Delta_One_Flows_-_Positioning-_ETF_investors_and_CTAs_de.pdf",
+      "page": 3
+    },
+    {
+      "doc_name": "20260315_UBS_Global_Equity_Strategy_-Quantitative_Framework_and_Posit.pdf",
+      "page": 4
+    },
+    {
+      "doc_name": "20260315_UBS_Global_Equity_Strategy_-Quantitative_Framework_and_Posit.pdf",
+      "page": 4
+    },
+    {
+      "doc_name": "20260312_JP_Morgan_Delta_One_Flows_-_Positioning-_ETF_investors_and_CTAs_de.pdf",
+      "page": 3
+    },
+    {
+      "doc_name": "20260312_JP_Morgan_Equity_Strategy-_The_geopolitics_driven_derisking_is_pro.pdf",
+      "page": 2
+    },
+    {
+      "doc_name": "20260313_Barclays_U.S._Equity_Strategy_-_Data_Science-_UPDATE-_4Q25_Earnin.pdf",
+      "page": 1
+    },
+    {
+      "doc_name": "20260313_Barclays_U.S._Equity_Strategy_-_Data_Science-_UPDATE-_4Q25_Earnin.pdf",
+      "page": 1
+    }
+  ],
+  "thinking_trace": [],
+  "error": null,
+  "data_source": "neo4j"
+}

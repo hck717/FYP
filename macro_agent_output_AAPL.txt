@@ -1,0 +1,149 @@
+{
+  "agent": "macro",
+  "ticker": "AAPL",
+  "regime": "risk-off",
+  "macro_themes": [
+    {
+      "theme": "Geopolitical Derisking",
+      "direction": "bearish",
+      "confidence": 0.8,
+      "transmission_channel": "Geopolitical escalation reduces risk appetite, leading to sell-offs in growth stocks like AAPL as investors flee to safe havens.",
+      "impact_magnitude": "high",
+      "time_horizon": "immediate"
+    },
+    {
+      "theme": "US Earnings Risk",
+      "direction": "bearish",
+      "confidence": 0.75,
+      "transmission_channel": "Elevated earnings risk in the US market could result in disappointing quarterly results for AAPL, pressuring its stock price due to reduced investor confidence.",
+      "impact_magnitude": "high",
+      "time_horizon": "medium-term"
+    },
+    {
+      "theme": "Stretched Investor Positioning",
+      "direction": "bearish",
+      "confidence": 0.7,
+      "transmission_channel": "Overcrowded long positions in US equities, including AAPL, may unwind during derisking, causing selling pressure as investors rebalance portfolios.",
+      "impact_magnitude": "medium",
+      "time_horizon": "immediate"
+    },
+    {
+      "theme": "Corporate Pricing Pressure",
+      "direction": "neutral",
+      "confidence": 0.6,
+      "transmission_channel": "Elevated discussions on pricing plans among corporate executives may indicate cost pressures or demand elasticity, potentially affecting AAPL's revenue growth and margins.",
+      "impact_magnitude": "low",
+      "time_horizon": "medium-term"
+    }
+  ],
+  "per_report_summaries": [
+    {
+      "report_name": "20260313_Barclays_U.S._Equity_Strategy_-_Data_Science-_UPDATE-_4Q25_Earnin.pdf",
+      "summary": "This report analyzes corporate pricing plans from earnings calls, finding that the share of executives discussing 'pricing' or 'pushing through' prices remains elevated at ~75%, indicating sustained focus on price increases. It examines the evolving context of such discussions to assess corporate pricing behavior. [20260313_Barclays_U.S._Equity_Strategy_-_Data_Science-_UPDATE-_4Q25_Earnin.pdf p.1]",
+      "stock_relevance": "AAPL's ability to implement price hikes for its products, such as iPhones and services, is influenced by broader corporate pricing trends, affecting its revenue growth and profit margins. [20260313_Barclays_U.S._Equity_Strategy_-_Data_Science-_UPDATE-_4Q25_Earnin.pdf p.1]",
+      "report_date": "2026-03-13"
+    },
+    {
+      "report_name": "20260312_JP_Morgan_Equity_Strategy-_The_geopolitics_driven_derisking_is_pro.pdf",
+      "summary": "The report discusses geopolitical derisking, noting that bond yields help and the worst of trade uncertainty is behind, but US equities are expensive with earnings risk. It also suggests that derisking is advancing and weakness should be used to step in after position squaring. [20260312_JP_Morgan_Equity_Strategy-_The_geopolitics_driven_derisking_is_pro.pdf p.2] [20260312_JP_Morgan_Equity_Strategy-_The_geopolitics_driven_derisking_is_pro.pdf p.5]",
+      "stock_relevance": "AAPL, as a global company with extensive supply chains, is sensitive to trade policies and geopolitical risks; bond yields affect its valuation through discount rates and cost of capital. [20260312_JP_Morgan_Equity_Strategy-_The_geopolitics_driven_derisking_is_pro.pdf p.2]",
+      "report_date": "2026-03-12"
+    },
+    {
+      "report_name": "20260312_JP_Morgan_Delta_One_Flows_-_Positioning-_ETF_investors_and_CTAs_de.pdf",
+      "summary": "This report provides data on interest rate futures such as 3M SOFR, Euribor, and SONIA, indicating market positioning in rate derivatives and flows. It highlights activity in these benchmarks, reflecting expectations on short-term interest rates. [20260312_JP_Morgan_Delta_One_Flows_-_Positioning-_ETF_investors_and_CTAs_de.pdf p.3]",
+      "stock_relevance": "Interest rate movements impact AAPL's debt servicing costs for its corporate bonds and the discount rate used in its stock valuation, influencing investor appetite for growth stocks. [20260312_JP_Morgan_Delta_One_Flows_-_Positioning-_ETF_investors_and_CTAs_de.pdf p.3]",
+      "report_date": "2026-03-12"
+    },
+    {
+      "report_name": "20260315_UBS_Global_Equity_Strategy_-Quantitative_Framework_and_Posit.pdf",
+      "summary": "The report uses a quantitative framework to analyze drivers of global equity returns, such as ACWI relative industry returns, and compares investment grade (IG) performance to machine learning model expectations. It includes tactical indicators for regional narratives. [20260315_UBS_Global_Equity_Strategy_-Quantitative_Framework_and_Posit.pdf p.4]",
+      "stock_relevance": "AAPL's stock performance is influenced by global equity drivers and macro factors identified in the model, while its investment-grade credit rating affects its bond yields and cost of debt financing. [20260315_UBS_Global_Equity_Strategy_-Quantitative_Framework_and_Posit.pdf p.4]",
+      "report_date": "2026-03-15"
+    }
+  ],
+  "top_macro_drivers": [
+    "Fed Rate Path",
+    "USD Strength",
+    "Geopolitical Derisking"
+  ],
+  "top_risk": "Unexpected inflation spike",
+  "risk_scenario": "If inflation surprises to the upside, corporate executives may face reduced pricing power, as indicated by pricing discussions on earnings calls, prompting the Fed to tighten monetary policy. This would increase bond yields and strengthen USD, impacting AAPL via higher discount rates and negative currency translation effects. [20260313_Barclays_U.S._Equity_Strategy_-_Data_Science-_UPDATE-_4Q25_Earnin.pdf p.1] [20260312_JP_Morgan_Equity_Strategy-_The_geopolitics_driven_derisking_is_pro.pdf p.2]",
+  "citations": [
+    {
+      "doc_name": "20260312_JP_Morgan_Equity_Strategy-_The_geopolitics_driven_derisking_is_pro.pdf",
+      "page": 5
+    },
+    {
+      "doc_name": "20260312_JP_Morgan_Equity_Strategy-_The_geopolitics_driven_derisking_is_pro.pdf",
+      "page": 2
+    },
+    {
+      "doc_name": "20260312_JP_Morgan_Equity_Strategy-_The_geopolitics_driven_derisking_is_pro.pdf",
+      "page": 2
+    },
+    {
+      "doc_name": "20260313_Barclays_U.S._Equity_Strategy_-_Data_Science-_UPDATE-_4Q25_Earnin.pdf",
+      "page": 1
+    },
+    {
+      "doc_name": "20260313_Barclays_U.S._Equity_Strategy_-_Data_Science-_UPDATE-_4Q25_Earnin.pdf",
+      "page": 1
+    },
+    {
+      "doc_name": "20260313_Barclays_U.S._Equity_Strategy_-_Data_Science-_UPDATE-_4Q25_Earnin.pdf",
+      "page": 1
+    },
+    {
+      "doc_name": "20260312_JP_Morgan_Equity_Strategy-_The_geopolitics_driven_derisking_is_pro.pdf",
+      "page": 2
+    },
+    {
+      "doc_name": "20260312_JP_Morgan_Equity_Strategy-_The_geopolitics_driven_derisking_is_pro.pdf",
+      "page": 5
+    },
+    {
+      "doc_name": "20260312_JP_Morgan_Equity_Strategy-_The_geopolitics_driven_derisking_is_pro.pdf",
+      "page": 2
+    },
+    {
+      "doc_name": "20260312_JP_Morgan_Delta_One_Flows_-_Positioning-_ETF_investors_and_CTAs_de.pdf",
+      "page": 3
+    },
+    {
+      "doc_name": "20260312_JP_Morgan_Delta_One_Flows_-_Positioning-_ETF_investors_and_CTAs_de.pdf",
+      "page": 3
+    },
+    {
+      "doc_name": "20260315_UBS_Global_Equity_Strategy_-Quantitative_Framework_and_Posit.pdf",
+      "page": 4
+    },
+    {
+      "doc_name": "20260315_UBS_Global_Equity_Strategy_-Quantitative_Framework_and_Posit.pdf",
+      "page": 4
+    },
+    {
+      "doc_name": "20260312_JP_Morgan_Equity_Strategy-_The_geopolitics_driven_derisking_is_pro.pdf",
+      "page": 2
+    },
+    {
+      "doc_name": "20260312_JP_Morgan_Equity_Strategy-_The_geopolitics_driven_derisking_is_pro.pdf",
+      "page": 2
+    },
+    {
+      "doc_name": "20260312_JP_Morgan_Equity_Strategy-_The_geopolitics_driven_derisking_is_pro.pdf",
+      "page": 5
+    },
+    {
+      "doc_name": "20260313_Barclays_U.S._Equity_Strategy_-_Data_Science-_UPDATE-_4Q25_Earnin.pdf",
+      "page": 1
+    },
+    {
+      "doc_name": "20260312_JP_Morgan_Equity_Strategy-_The_geopolitics_driven_derisking_is_pro.pdf",
+      "page": 2
+    }
+  ],
+  "thinking_trace": [],
+  "error": null,
+  "data_source": "neo4j"
+}
