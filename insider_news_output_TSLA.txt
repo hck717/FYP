@@ -2,48 +2,92 @@
   "agent": "insider_news",
   "ticker": "TSLA",
   "insider_analysis": {
-    "activity_summary": "No insider trading data is available for TSLA, so no analysis of buys vs sells, dollar value, or frequency can be performed. [EVIDENCE p.1]",
-    "buy_sell_ratio": null,
-    "net_position": "neutral [EVIDENCE p.1]",
-    "conviction": "low [EVIDENCE p.1]",
-    "notable_insiders": [],
-    "insider_sentiment": "neutral [EVIDENCE p.1]",
+    "activity_summary": "Insider activity for TSLA consisted solely of sell transactions from December 2025 to February 2026, with four insiders selling a total of 145,188 shares for approximately $64.2 million and no buy transactions [Kathleen Wilson-Thompson 2026-02-25; James R Murdoch 2026-01-02; Kimbal Musk 2025-12-09; Vaibhav Taneja 2025-12-08]. The sales were frequent and involved substantial amounts from board members and executives.",
+    "buy_sell_ratio": 0.0,
+    "net_position": "net sellers",
+    "conviction": "high",
+    "notable_insiders": [
+      {
+        "name": "Kathleen Wilson-Thompson",
+        "title": "Board Member",
+        "recent_activity": "Sold 25,731 shares on 2026-02-25 [Kathleen Wilson-Thompson 2026-02-25]"
+      },
+      {
+        "name": "James R Murdoch",
+        "title": "Board Member",
+        "recent_activity": "Sold 60,000 shares on 2026-01-02 [James R Murdoch 2026-01-02]"
+      },
+      {
+        "name": "Kimbal Musk",
+        "title": "Board Member",
+        "recent_activity": "Sold 56,820 shares on 2025-12-09 [Kimbal Musk 2025-12-09]"
+      },
+      {
+        "name": "Vaibhav Taneja",
+        "title": "CFO",
+        "recent_activity": "Sold 2,637 shares on 2025-12-08 [Vaibhav Taneja 2025-12-08]"
+      }
+    ],
+    "insider_sentiment": "bearish",
     "red_flags": [
-      "Absence of insider data may indicate reporting delays, lack of transactions, or transparency issues. [EVIDENCE p.1]"
+      "All four insider transactions were sells, indicating unanimous selling pressure with no offsetting buys [Kathleen Wilson-Thompson 2026-02-25; James R Murdoch 2026-01-02; Kimbal Musk 2025-12-09; Vaibhav Taneja 2025-12-08]",
+      "High-value sales totaling over $64 million within a three-month period, suggesting significant insider distribution [Kathleen Wilson-Thompson 2026-02-25; James R Murdoch 2026-01-02; Kimbal Musk 2025-12-09; Vaibhav Taneja 2025-12-08]",
+      "Sales by key insiders including board members and the CFO, which may signal reduced confidence in the company's near-term prospects [Kathleen Wilson-Thompson 2026-02-25; James R Murdoch 2026-01-02; Kimbal Musk 2025-12-09; Vaibhav Taneja 2025-12-08]"
     ]
   },
   "news_analysis": {
-    "sentiment_summary": "No news data is available for analysis; therefore, a sentiment assessment cannot be performed.",
-    "avg_sentiment_score": 0.0,
+    "sentiment_summary": "Overall sentiment for TSLA is positive, driven by strong past performance and market dominance highlighted in The Motley Fool articles [The Motley Fool p.1]. However, this is tempered by concerns over rich valuation and external geopolitical risks from Dow Jones Futures [Dow Jones Futures p.1].",
+    "avg_sentiment_score": 0.458,
     "sentiment_trend": "stable",
-    "positive_catalysts": [],
-    "negative_catalysts": [],
-    "key_themes": [],
-    "credibility": "No news sources are available for a credibility assessment."
+    "positive_catalysts": [
+      "Strong revenue growth driven by EV production and deliveries [The Motley Fool p.1]",
+      "Commanding market position in U.S. EV market with Model Y dominance [The Motley Fool p.1]",
+      "Long-term investor rewards and market cap growth [The Motley Fool p.1]"
+    ],
+    "negative_catalysts": [
+      "Extremely rich valuation posing investment risk [The Motley Fool p.1]",
+      "Geopolitical tensions affecting oil prices and bond yields, impacting broader markets [Dow Jones Futures p.1]",
+      "Emerging competition from Rivian's R2 SUV [The Motley Fool p.1]"
+    ],
+    "key_themes": [
+      "Electric Vehicles",
+      "Competition",
+      "Markets",
+      "Autonomous-Driving",
+      "Geopolitics",
+      "Revenue Growth"
+    ],
+    "credibility": "Sources include The Motley Fool and Dow Jones Futures, which are reputable financial outlets, but the futuristic dates (2026) may limit real-world applicability."
   },
   "investment_thesis": {
-    "combined_thesis": "The investment thesis for TSLA is characterized by a complete lack of actionable data from both insider trading and news analyses [EVIDENCE p.1][News Analysis Summary p.1]. Insider sentiment is neutral with low conviction, and no news sentiment can be assessed, indicating high uncertainty and no clear directional signals [EVIDENCE p.1][News Analysis Summary p.1]. Consequently, any investment decision must rely on external factors beyond the provided analyses.",
-    "signal_alignment": "aligned",
-    "bull_case": "No evidence supports a bullish case from insider or news analyses; the absence of insider selling and negative news could be interpreted as stability, but no positive catalysts are identified [EVIDENCE p.1][News Analysis Summary p.1].",
-    "bear_case": "No evidence supports a bearish case from news analysis, but the absence of insider data raises red flags such as potential reporting delays or transparency issues, which could indicate underlying problems [EVIDENCE p.1][News Analysis Summary p.1].",
+    "combined_thesis": "Tesla demonstrates robust fundamental performance with strong revenue growth and market dominance in the EV sector, as per positive news sentiment [The Motley Fool p.1]. However, consistent and significant insider selling from board members and the CFO over a three-month period signals potential internal concerns about valuation or near-term prospects [Kathleen Wilson-Thompson 2026-02-25; James R Murdoch 2026-01-02; Kimbal Musk 2025-12-09; Vaibhav Taneja 2025-12-08]. Additional risks include an expensive stock valuation and external geopolitical factors that may affect overall market stability [The Motley Fool p.1; Dow Jones Futures p.1].",
+    "signal_alignment": "conflicting",
+    "bull_case": "The bull case for Tesla is supported by its strong revenue growth driven by EV production and deliveries, commanding market position in the U.S. EV market with Model Y dominance, and history of long-term investor rewards and market cap growth [The Motley Fool p.1].",
+    "bear_case": "The bear case for Tesla is highlighted by unanimous insider selling activity totaling over $64 million, indicating reduced confidence from key insiders including board members and the CFO [Kathleen Wilson-Thompson 2026-02-25; James R Murdoch 2026-01-02; Kimbal Musk 2025-12-09; Vaibhav Taneja 2025-12-08]. Furthermore, the stock's extremely rich valuation poses investment risk, and geopolitical tensions could adversely impact broader markets [The Motley Fool p.1; Dow Jones Futures p.1].",
     "key_risks": [
-      "Lack of insider trading data may indicate transparency issues or reporting delays, hiding potential negative information [EVIDENCE p.1].",
-      "Absence of news analysis means market-moving events or catalysts are not captured, increasing investment uncertainty [News Analysis Summary p.1]."
+      "Sustained and high-value insider selling by board members and the CFO, suggesting lack of confidence in the company's near-term outlook [Kathleen Wilson-Thompson 2026-02-25; James R Murdoch 2026-01-02; Kimbal Musk 2025-12-09; Vaibhav Taneja 2025-12-08]",
+      "Extremely rich valuation of Tesla stock, which increases investment risk and potential for correction [The Motley Fool p.1]",
+      "Geopolitical tensions affecting oil prices and bond yields, leading to broader market volatility that could impact Tesla's stock performance [Dow Jones Futures p.1]"
     ],
     "key_opportunities": [
-      "Neutral insider sentiment with no selling pressure could imply stability if insiders are not divesting [EVIDENCE p.1].",
-      "Lack of negative news might suggest no adverse events have occurred recently, potentially a positive sign [News Analysis Summary p.1]."
+      "Strong revenue growth driven by EV production and deliveries, indicating continued business expansion and market leadership [The Motley Fool p.1]",
+      "Commanding market position in the U.S. EV market, particularly with Model Y dominance, providing a competitive advantage [The Motley Fool p.1]",
+      "Potential for long-term investor rewards based on past market cap growth and future innovation prospects [The Motley Fool p.1]"
     ],
     "recommendation": "hold",
-    "conviction": "low"
+    "conviction": "medium"
   },
   "citations": [
     {
-      "doc_name": "EVIDENCE",
+      "doc_name": "The Motley Fool",
       "page": 1
     },
     {
-      "doc_name": "News Analysis Summary",
+      "doc_name": "Dow Jones Futures",
+      "page": 1
+    },
+    {
+      "doc_name": "The Motley Fool p.1; Dow Jones Futures",
       "page": 1
     }
   ],
@@ -51,8 +95,8 @@
   "error": null,
   "data_source": "pg",
   "data_coverage": {
-    "insider_transactions_count": 0,
-    "news_articles_count": 0,
-    "date_range": "No data"
+    "insider_transactions_count": 4,
+    "news_articles_count": 50,
+    "date_range": "2025-12-08 to 2026-03-22 01:58:00"
   }
 }
