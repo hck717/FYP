@@ -2,48 +2,51 @@
   "agent": "insider_news",
   "ticker": "AAPL",
   "insider_analysis": {
-    "activity_summary": "No insider trading transactions were reported for AAPL during the period analyzed. Therefore, no activity can be summarized [EVIDENCE p.1].",
+    "activity_summary": "No insider trading data is available for AAPL, so no transactions can be analyzed for buys vs sells, dollar value, or frequency. [EVIDENCE]",
     "buy_sell_ratio": null,
     "net_position": "neutral",
     "conviction": "low",
     "notable_insiders": [],
     "insider_sentiment": "neutral",
-    "red_flags": [
-      "No insider data is available for analysis, which prevents the identification of trading patterns or signals [EVIDENCE p.1]."
-    ]
+    "red_flags": []
   },
   "news_analysis": {
-    "sentiment_summary": "No news data is available for AAPL, so sentiment analysis cannot be performed based on current evidence.",
-    "avg_sentiment_score": 0.0,
-    "sentiment_trend": "stable",
-    "positive_catalysts": [],
+    "sentiment_summary": "AAPL sentiment is overwhelmingly positive, with The Motley Fool highlighting expected EPS growth acceleration to 11.4% and potential for the stock to reach $500. [The Motley Fool p.1]",
+    "avg_sentiment_score": 0.997,
+    "sentiment_trend": "improving",
+    "positive_catalysts": [
+      "EPS growth projected to accelerate to 11.4% annually",
+      "Share price target of $500 driven by earnings and market sentiment expansion"
+    ],
     "negative_catalysts": [],
-    "key_themes": [],
-    "credibility": "No news sources provided, so credibility assessment is not possible."
+    "key_themes": [
+      "Earnings",
+      "Price Targets",
+      "Market Sentiment",
+      "Tech",
+      "Investment Strategy"
+    ],
+    "credibility": "Primary source is The Motley Fool, a credible financial advice platform, though articles contain promotional elements. Other sources are not specified, limiting overall credibility assessment."
   },
   "investment_thesis": {
-    "combined_thesis": "The investment thesis for AAPL is based on limited data, with insider trading analysis showing no transactions and neutral sentiment [EVIDENCE p.1], and news analysis indicating no available data for sentiment assessment [News Analysis Summary p.1]. This lack of information results in a neutral outlook with low conviction, suggesting a hold position until more data emerges to guide investment decisions.",
-    "signal_alignment": "aligned",
-    "bull_case": "No bullish evidence is present in the insider analysis, which reports no buying activity and neutral sentiment [EVIDENCE p.1], and the news analysis shows no positive catalysts [News Analysis Summary p.1].",
-    "bear_case": "No bearish evidence is present in the insider analysis, with no selling activity reported [EVIDENCE p.1], and the news analysis indicates no negative catalysts [News Analysis Summary p.1].",
+    "combined_thesis": "AAPL's investment thesis is heavily influenced by overwhelmingly positive news sentiment, which projects an acceleration in EPS growth to 11.4% annually and a share price target of $500. [The Motley Fool p.1] However, insider trading data is unavailable, providing no confirmatory signal from company executives and resulting in a neutral insider sentiment. [EVIDENCE] This creates a mixed signal environment where strong external optimism is not mirrored internally, though the lack of negative catalysts supports a generally favorable outlook. [The Motley Fool p.1]",
+    "signal_alignment": "mixed",
+    "bull_case": "The bullish case is driven by projected EPS growth acceleration to 11.4% annually and a share price target of $500, both indicative of strong fundamental performance and positive market sentiment expansion. [The Motley Fool p.1]",
+    "bear_case": "No direct bearish evidence is presented in news analysis, but the absence of insider trading data prevents validation of positive sentiment and may indicate a lack of strong internal confidence. [EVIDENCE] Additionally, news sources contain promotional elements that could overstate optimism. [The Motley Fool p.1]",
     "key_risks": [
-      "Lack of insider trading data prevents identification of trading patterns or signals, which could mask underlying issues [EVIDENCE p.1].",
-      "Absence of news data limits ability to assess market sentiment and potential catalysts, increasing uncertainty [News Analysis Summary p.1]."
+      "Lack of insider trading data limits visibility into executive confidence and may obscure underlying company risks. [EVIDENCE]",
+      "News sources, while credible, have promotional elements that could bias positive sentiment and lead to overvaluation. [The Motley Fool p.1]"
     ],
     "key_opportunities": [
-      "The neutral sentiment from both analyses suggests no immediate downside, providing stability for holding [EVIDENCE p.1], [News Analysis Summary p.1].",
-      "Future data releases could reveal positive signals not currently captured, offering potential upside if monitored closely."
+      "Acceleration of EPS growth to 11.4% annually, enhancing fundamental earnings power. [The Motley Fool p.1]",
+      "Potential for significant share price appreciation to $500 driven by earnings expansion and market sentiment. [The Motley Fool p.1]"
     ],
     "recommendation": "hold",
-    "conviction": "low"
+    "conviction": "medium"
   },
   "citations": [
     {
-      "doc_name": "EVIDENCE",
-      "page": 1
-    },
-    {
-      "doc_name": "News Analysis Summary",
+      "doc_name": "The Motley Fool",
       "page": 1
     }
   ],
@@ -52,7 +55,7 @@
   "data_source": "pg",
   "data_coverage": {
     "insider_transactions_count": 0,
-    "news_articles_count": 0,
-    "date_range": "No data"
+    "news_articles_count": 50,
+    "date_range": "2026-03-20 14:31:03 to 2026-03-21 23:31:05"
   }
 }
