@@ -104,8 +104,8 @@ def _fetch_insider_transactions_pg(ticker: str) -> List[Document]:
 
         query = """
             SELECT 
-                ticker, insider_name, insider_title, transaction_type, 
-                shares, price, transaction_date, value
+                ticker, insider_name, transaction_type, 
+                shares, price, transaction_date
             FROM insider_transactions
             WHERE ticker = %s AND transaction_date >= %s
             ORDER BY transaction_date DESC
@@ -119,15 +119,25 @@ def _fetch_insider_transactions_pg(ticker: str) -> List[Document]:
 
         documents = []
         for row in rows:
-            (tick, insider_name, insider_title, trans_type, shares, price, trans_date, value) = row
+            (tick, insider_name, trans_type, shares, price, trans_date) = row
+            
+            # Skip if shares is NULL (no transaction data)
+            if shares is None:
+                continue
+            
+            # Calculate transaction value (handle None price)
+            try:
+                value = float(shares) * float(price) if price else 0
+            except (ValueError, TypeError):
+                value = 0
             
             # Build document text
+            price_str = f"${price:.2f}" if price else "N/A"
             text = (
                 f"Insider: {insider_name}\n"
-                f"Title: {insider_title}\n"
                 f"Transaction Type: {trans_type}\n"
                 f"Shares: {shares}\n"
-                f"Price: ${price:.2f}\n"
+                f"Price: {price_str}\n"
                 f"Value: ${value:,.0f}\n"
                 f"Date: {trans_date}"
             )
@@ -138,10 +148,9 @@ def _fetch_insider_transactions_pg(ticker: str) -> List[Document]:
                     "ticker": tick,
                     "source": "insider_transactions",
                     "insider_name": insider_name,
-                    "insider_title": insider_title,
                     "transaction_type": trans_type,
                     "shares": shares,
-                    "price": price,
+                    "price": float(price) if price else None,
                     "transaction_date": str(trans_date),
                     "value": value,
                     "doc_name": f"{insider_name} - {trans_type} {shares} shares",
@@ -171,7 +180,7 @@ def _fetch_news_articles_pg(ticker: str) -> List[Document]:
 
         query = """
             SELECT 
-                ticker, title, content, source, article_date, tags, sentiment
+                ticker, title, content, link, article_date, tags, sentiment_polarity
             FROM news_articles
             WHERE ticker = %s AND article_date >= %s
             ORDER BY article_date DESC
@@ -185,12 +194,11 @@ def _fetch_news_articles_pg(ticker: str) -> List[Document]:
 
         documents = []
         for row in rows:
-            (tick, title, content, source, article_date, tags, sentiment) = row
+            (tick, title, content, link, article_date, tags, sentiment) = row
 
             # Build document text
             text = (
                 f"Title: {title}\n"
-                f"Source: {source}\n"
                 f"Date: {article_date}\n"
                 f"Tags: {tags}\n"
                 f"Sentiment: {sentiment}\n\n"
@@ -201,12 +209,13 @@ def _fetch_news_articles_pg(ticker: str) -> List[Document]:
                 page_content=text,
                 metadata={
                     "ticker": tick,
-                    "source": source,
+                    "source": "news_articles",
                     "title": title,
                     "article_date": str(article_date),
-                    "tags": tags,
+                    "tags": str(tags),
                     "sentiment": sentiment,
-                    "doc_name": f"{source} - {article_date}",
+                    "link": link,
+                    "doc_name": f"News - {article_date.strftime('%Y-%m-%d')}",
                     "page": 0,
                 },
             )
