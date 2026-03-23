@@ -42,6 +42,12 @@ def test_summarizer_stage1_structure():
         "financial_modelling_outputs": [
             {"dcf_value": 195.0, "quantitative_summary": "Fair value $195"}
         ],
+        "macro_outputs": [
+            {"regime": "disinflation", "top_macro_drivers": ["rates"]}
+        ],
+        "insider_news_outputs": [
+            {"investment_thesis": {"combined_thesis": "Insider activity is net bullish"}}
+        ],
     }
     
     result = _mock_summarizer_stage1(mock_all_outputs)
@@ -58,19 +64,35 @@ def _mock_summarizer_stage1(outputs: Dict) -> Dict[str, Any]:
     thesis_parts = []
     
     # Extract from BA
-    ba = outputs.get("business_analyst_outputs", [{}])[0]
+    ba_list = outputs.get("business_analyst_outputs") or [{}]
+    ba = ba_list[0]
     if ba.get("qualitative_summary"):
         thesis_parts.append(ba["qualitative_summary"])
     
     # Extract from QF
-    qf = outputs.get("quant_fundamental_outputs", [{}])[0]
+    qf_list = outputs.get("quant_fundamental_outputs") or [{}]
+    qf = qf_list[0]
     if qf.get("quantitative_summary"):
         thesis_parts.append(qf["quantitative_summary"])
     
     # Extract from FM
-    fm = outputs.get("financial_modelling_outputs", [{}])[0]
+    fm_list = outputs.get("financial_modelling_outputs") or [{}]
+    fm = fm_list[0]
     if fm.get("quantitative_summary"):
         thesis_parts.append(fm["quantitative_summary"])
+
+    # Extract from Macro
+    macro_list = outputs.get("macro_outputs") or [{}]
+    macro = macro_list[0]
+    if macro.get("regime"):
+        thesis_parts.append(f"Macro regime: {macro['regime']}")
+
+    # Extract from Insider News
+    insider_news_list = outputs.get("insider_news_outputs") or [{}]
+    insider_news = insider_news_list[0]
+    combined_thesis = (insider_news.get("investment_thesis") or {}).get("combined_thesis")
+    if combined_thesis:
+        thesis_parts.append(str(combined_thesis))
     
     return {
         "investment_thesis": " ".join(thesis_parts) if thesis_parts else "Analysis complete.",
@@ -211,6 +233,12 @@ def test_summarizer_full_pipeline():
         "financial_modelling_outputs": [
             {"dcf_value": 195.0, "quantitative_summary": "Fair value $195"}
         ],
+        "macro_outputs": [
+            {"regime": "disinflation"}
+        ],
+        "insider_news_outputs": [
+            {"investment_thesis": {"combined_thesis": "Insider activity is net bullish"}}
+        ],
     }
     
     result = _run_full_summarizer(inputs)
@@ -231,8 +259,18 @@ def _run_full_summarizer(inputs: Dict) -> Dict[str, Any]:
     # Stage 3
     stage3 = _mock_summarizer_stage3(inputs)
     
+    if stage3.get("citations"):
+        final_summary = stage3.get("final_summary", "")
+    else:
+        final_summary = stage1.get("investment_thesis", "") or stage3.get("final_summary", "")
+
+    tickers = inputs.get("tickers") or []
+    if tickers and final_summary:
+        joined = " vs ".join(str(t) for t in tickers)
+        final_summary = f"{joined}: {final_summary}"
+
     return {
-        "final_summary": stage3.get("final_summary", ""),
+        "final_summary": final_summary,
         "sections": stage2.get("sections", []),
     }
 
@@ -370,8 +408,8 @@ def test_summarizer_state_integration():
         "output": summarizer_output["output"],
     }
     
-    assert state["final_summary"] == "Apple is a strong buy..."
-    assert state["output"]["ticker"] == "AAPL"
+    assert state.get("final_summary") == "Apple is a strong buy..."
+    assert (state.get("output") or {}).get("ticker") == "AAPL"
 
 
 # ---------------------------------------------------------------------------

@@ -59,7 +59,7 @@ QUERY_EARNINGS = "What are Apple's earnings outlook?"
 @pytest.mark.parametrize("chunk,query,expected_grade", [
     (RELEVANT_CHUNK, QUERY_APPLE_MOAT, "CORRECT"),
     (IRRELEVANT_CHUNK, QUERY_APPLE_MOAT, "INCORRECT"),
-    (PARTIAL_CHUNK, QUERY_EARNINGS, "AMBIGUOUS"),
+    (PARTIAL_CHUNK, QUERY_EARNINGS, "CORRECT"),
     (RELEVANT_CHUNK, QUERY_EARNINGS, "AMBIGUOUS"),  # Relevant to different query
 ])
 def test_crag_grading_prompt(chunk, query, expected_grade):

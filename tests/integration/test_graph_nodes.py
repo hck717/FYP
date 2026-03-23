@@ -4,6 +4,7 @@ These tests verify the graph topology and routing logic:
 - Planner fan-out populates correct run_* flags
 - ReAct retry routing works correctly
 - Fan-in: summarizer receives all outputs
+- New agents (macro, insider_news) are included in routing/fan-in
 
 Run with: pytest tests/integration/test_graph_nodes.py -v --timeout=60
 """
@@ -23,6 +24,8 @@ if str(_REPO_ROOT) not in sys.path:
 
 from orchestration.graph import (
     _route_after_ba,
+    _route_after_insider_news,
+    _route_after_macro,
     _route_after_qf,
     _route_after_ws,
     _route_after_fm,
@@ -47,6 +50,8 @@ def test_planner_output_for_valuation_query():
         "run_web_search": False,
         "run_financial_modelling": True,
         "run_stock_research": False,
+        "run_macro": False,
+        "run_insider_news": False,
         "react_max_iterations": 2,
         "agent_react_iterations": {},
     }
@@ -67,6 +72,8 @@ def test_planner_output_for_moat_query():
         "run_web_search": False,
         "run_financial_modelling": False,
         "run_stock_research": False,
+        "run_macro": False,
+        "run_insider_news": False,
         "react_max_iterations": 1,
     }
     
@@ -84,6 +91,8 @@ def test_planner_output_for_news_query():
         "run_web_search": True,
         "run_financial_modelling": False,
         "run_stock_research": False,
+        "run_macro": False,
+        "run_insider_news": False,
         "react_max_iterations": 1,
     }
     
@@ -98,6 +107,8 @@ def test_planner_routing_targets():
         "run_web_search": False,
         "run_financial_modelling": True,
         "run_stock_research": False,
+        "run_macro": True,
+        "run_insider_news": True,
     }
     
     targets = _route_after_planner(state)
@@ -105,6 +116,8 @@ def test_planner_routing_targets():
     assert "node_business_analyst" in targets
     assert "node_quant_fundamental" in targets
     assert "node_financial_modelling" in targets
+    assert "node_macro" in targets
+    assert "node_insider_news" in targets
     assert "node_web_search" not in targets
     assert "node_stock_research" not in targets
 
@@ -117,6 +130,8 @@ def test_planner_fallback_to_ba():
         "run_web_search": False,
         "run_financial_modelling": False,
         "run_stock_research": False,
+        "run_macro": False,
+        "run_insider_news": False,
     }
     
     targets = _route_after_planner(state)
@@ -207,6 +222,24 @@ def test_react_all_agents():
     }
     assert _route_after_sr(state_sr) == "node_stock_research"
 
+    # Macro
+    state_macro: OrchestrationState = {
+        "run_macro": True,
+        "macro_outputs": [],
+        "agent_react_iterations": {"macro": 0},
+        "react_max_iterations": 2,
+    }
+    assert _route_after_macro(state_macro) == "node_macro"
+
+    # Insider News
+    state_insider_news: OrchestrationState = {
+        "run_insider_news": True,
+        "insider_news_outputs": [],
+        "agent_react_iterations": {"insider_news": 0},
+        "react_max_iterations": 2,
+    }
+    assert _route_after_insider_news(state_insider_news) == "node_insider_news"
+
 
 def test_react_skips_disabled_agents():
     """Test ReAct skips routing for disabled agents."""
@@ -232,6 +265,8 @@ def test_summarizer_receives_all_outputs(mock_all_agent_outputs):
     assert "web_search_outputs" in mock_all_agent_outputs
     assert "financial_modelling_outputs" in mock_all_agent_outputs
     assert "stock_research_outputs" in mock_all_agent_outputs
+    assert "macro_outputs" in mock_all_agent_outputs
+    assert "insider_news_outputs" in mock_all_agent_outputs
     
     # Verify ticker info
     assert "ticker" in mock_all_agent_outputs
@@ -246,9 +281,13 @@ def test_summarizer_state_structure():
         "run_business_analyst": True,
         "run_quant_fundamental": True,
         "run_financial_modelling": True,
+        "run_macro": True,
+        "run_insider_news": True,
         "business_analyst_outputs": [{"output": "test"}],
         "quant_fundamental_outputs": [{"score": 8}],
         "financial_modelling_outputs": [{"dcf_value": 100}],
+        "macro_outputs": [{"regime": "risk-off"}],
+        "insider_news_outputs": [{"data_coverage": {"insider_transactions_count": 1}}],
     }
     
     # Summarizer should be able to process this
@@ -321,16 +360,17 @@ def test_complexity_2_one_retry():
 # Extensible Test Helper for New Nodes
 # ---------------------------------------------------------------------------
 
-def test_node_routing(node_name: str, agent_key: str, outputs_key: str):
+def helper_node_routing(node_name: str, agent_key: str, outputs_key: str):
     """Test helper for new node routing logic.
     
     Usage:
-        test_node_routing("node_new_agent", "run_new_agent", "new_agent_outputs")
+        helper_node_routing("node_new_agent", "run_new_agent", "new_agent_outputs")
     """
     def _route(state: OrchestrationState) -> str:
         if not state.get(agent_key):
             return "summarizer"
-        iters = state.get("agent_react_iterations", {}).get(node_name.replace("node_", ""), 0)
+        iters_map = state.get("agent_react_iterations") or {}
+        iters = iters_map.get(node_name.replace("node_", ""), 0)
         react_max = state.get("react_max_iterations", 1)
         if not state.get(outputs_key) and iters < react_max:
             return node_name
@@ -346,16 +386,16 @@ def create_node_wiring_test(node_name: str, output_key: str, agent_key: str):
         create_node_wiring_test("node_new_agent", "new_agent_outputs", "run_new_agent")
     """
     def test_new_node_wiring():
-        state: OrchestrationState = {
+        state: Dict[str, Any] = {
             agent_key: True,
             output_key: [],
-            "agent_react_iterations": {node_name.replace("node_"): 0},
+            "agent_react_iterations": {node_name.replace("node_", ""): 0},
             "react_max_iterations": 1,
         }
         
         # Test basic routing exists
         assert node_name in ["node_business_analyst", "node_quant_fundamental", 
                            "node_web_search", "node_financial_modelling", 
-                           "node_stock_research"] or True
+                           "node_stock_research", "node_macro", "node_insider_news"] or True
     
     return test_new_node_wiring

@@ -55,11 +55,21 @@ def test_multi_ticker_outputs_are_lists():
             {"ticker": "MSFT", "dcf_value": 420.0},
             {"ticker": "AAPL", "dcf_value": 195.0},
         ],
+        "macro_outputs": [
+            {"ticker": "MSFT", "regime": "risk-off"},
+            {"ticker": "AAPL", "regime": "disinflation"},
+        ],
+        "insider_news_outputs": [
+            {"ticker": "MSFT", "data_coverage": {"insider_transactions_count": 2}},
+            {"ticker": "AAPL", "data_coverage": {"insider_transactions_count": 1}},
+        ],
     }
     
     # Each output list should have same length as tickers
     assert len(state["business_analyst_outputs"]) == len(state["tickers"])
     assert len(state["financial_modelling_outputs"]) == len(state["tickers"])
+    assert len(state["macro_outputs"]) == len(state["tickers"])
+    assert len(state["insider_news_outputs"]) == len(state["tickers"])
 
 
 def test_single_ticker_backward_compat():
@@ -168,7 +178,7 @@ def test_summarizer_legacy_aliases():
     }
     
     # The legacy alias should match first ticker
-    assert state["business_analyst_output"]["ticker"] == state["tickers"][0]
+    assert (state.get("business_analyst_output") or {}).get("ticker") == state["tickers"][0]
 
 
 # ---------------------------------------------------------------------------
@@ -185,6 +195,8 @@ def test_comparison_query_structure():
         "run_business_analyst": True,
         "run_quant_fundamental": True,
         "run_financial_modelling": True,
+        "run_macro": True,
+        "run_insider_news": True,
         "react_max_iterations": 3,  # Comparison is complex
     }
     
@@ -249,6 +261,8 @@ def test_multi_ticker_full_flow():
         "run_business_analyst": True,
         "run_financial_modelling": True,
         "run_quant_fundamental": True,
+        "run_macro": True,
+        "run_insider_news": True,
     }
     
     # Process each agent
@@ -264,17 +278,29 @@ def test_multi_ticker_full_flow():
         {"ticker": "MSFT", "piotroski_score": 9},
         {"ticker": "AAPL", "piotroski_score": 8},
     ]
+    macro_outputs = [
+        {"ticker": "MSFT", "regime": "risk-off"},
+        {"ticker": "AAPL", "regime": "disinflation"},
+    ]
+    insider_outputs = [
+        {"ticker": "MSFT", "data_coverage": {"insider_transactions_count": 2}},
+        {"ticker": "AAPL", "data_coverage": {"insider_transactions_count": 1}},
+    ]
     
     # Verify all outputs have correct length
     assert len(ba_outputs) == len(input_state["tickers"])
     assert len(fm_outputs) == len(input_state["tickers"])
     assert len(qf_outputs) == len(input_state["tickers"])
+    assert len(macro_outputs) == len(input_state["tickers"])
+    assert len(insider_outputs) == len(input_state["tickers"])
     
     # Verify ticker mapping
     for i, ticker in enumerate(input_state["tickers"]):
         assert ba_outputs[i]["ticker"] == ticker
         assert fm_outputs[i]["ticker"] == ticker
         assert qf_outputs[i]["ticker"] == ticker
+        assert macro_outputs[i]["ticker"] == ticker
+        assert insider_outputs[i]["ticker"] == ticker
 
 
 # ---------------------------------------------------------------------------

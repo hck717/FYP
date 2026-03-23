@@ -10,7 +10,7 @@ This testing suite validates the complete system architecture:
 ┌─────────────────────────────────────────────────────────────┐
 │                    ORCHESTRATION GRAPH                      │
 ├─────────────────────────────────────────────────────────────┤
-│  planner → [BA, QF, WS, FM, SR] → summarizer → post_proc   │
+│  planner → [BA, QF, WS, FM, SR, MACRO, IN] → summarizer → post_proc │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -51,6 +51,14 @@ pytest tests/integration/ -v -m integration --timeout=120
 ### Prompt Tests Only
 ```bash
 pytest tests/prompts/ -v -m prompt --timeout=60
+```
+
+### Prompt + Metrics Telemetry
+```bash
+pytest tests/prompts/ -v -m prompt
+# Produces:
+# - tests/outputs/test_metrics.jsonl
+# - tests/outputs/test_metrics_summary.md
 ```
 
 ### Specific Test File
@@ -210,6 +218,8 @@ def test_graph_with_new_node():
 - QF ↔ PostgreSQL factors
 - FM ↔ PostgreSQL DCF inputs + Neo4j peers
 - SR ↔ Neo4j PDF chunks
+- Macro ↔ PostgreSQL/Neo4j macro + earnings data
+- Insider News ↔ PostgreSQL insider + news tables
 - WS ↔ Perplexity API
 
 ### Graph Node Tests (`test_graph_nodes.py`)
@@ -240,6 +250,34 @@ def test_graph_with_new_node():
 - CRAG grading (CORRECT/INCORRECT/AMBIGUOUS)
 - Moat analysis structured output
 - Sentiment analysis
+
+### Quant Fundamental Tests (`test_qf_prompts.py`)
+- Output schema checks
+- Metrics logging (latency, size, data type)
+
+### Financial Modelling Tests (`test_fm_prompts.py`)
+- Output schema checks
+- Metrics logging (latency, size, data amount)
+
+### Web Search Tests (`test_ws_prompts.py`)
+- Output schema checks
+- Metrics logging (latency, citations/news amount)
+
+### Stock Research Tests (`test_sr_prompts.py`)
+- Output schema checks
+- Metrics logging (broker-rating payload size/amount)
+
+### Macro Tests (`test_macro_prompts.py`)
+- Output schema checks
+- Metrics logging (driver count, output size)
+
+### Insider News Tests (`test_insider_news_prompts.py`)
+- Output schema checks
+- Metrics logging (coverage count, output size)
+
+### Orchestration Telemetry (`test_orchestration_prompt_telemetry.py`)
+- End-to-end prompt execution through orchestration graph
+- Logs full-system latency and aggregate output snapshot
 
 ### Summarizer Tests (`test_summarizer_prompts.py`)
 - Stage 1: Raw synthesis

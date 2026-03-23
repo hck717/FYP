@@ -8,6 +8,8 @@ Each test uses a real seeded ticker (AAPL) to verify end-to-end data flow:
 - test_qf_postgres_factors: Quant Fundamental reads financial factors from PostgreSQL
 - test_fm_dcf_inputs: Financial Modelling fetches DCF inputs from PostgreSQL
 - test_sr_chunk_search: Stock Research agent returns PDF chunks
+- test_macro_pg_neo4j_data: Macro agent loads macro + earnings chunks
+- test_insider_news_postgres_data: Insider News agent loads insider/news rows
 - test_ws_perplexity_response: Web Search agent gets results from Perplexity
 
 Run with: pytest tests/integration/test_agent_db.py -v -m integration --timeout=120
@@ -34,17 +36,15 @@ if str(_REPO_ROOT) not in sys.path:
 @pytest.mark.integration
 def test_ba_neo4j_retrieval():
     """Test Business Analyst's tools.py gets ≥1 chunk from Neo4j for AAPL."""
-    from agents.business_analyst import tools as ba_tools
+    from agents.business_analyst.tools import BusinessAnalystToolkit
     
     # Test Neo4j chunk retrieval
     ticker = "AAPL"
     
-    # Try to get chunks from Neo4j
-    chunks = ba_tools.fetch_chunks_from_neo4j(
-        ticker=ticker,
-        top_k=5,
-        use_hybrid=False,
-    )
+    toolkit = BusinessAnalystToolkit()
+    retrieval = toolkit.retrieve("AAPL latest business outlook", ticker)
+    chunks = retrieval.chunks if retrieval else []
+    toolkit.close()
     
     # Verify we got at least some chunks (may be empty if no data seeded)
     assert isinstance(chunks, list)
@@ -53,13 +53,15 @@ def test_ba_neo4j_retrieval():
 @pytest.mark.integration
 def test_ba_postgres_sentiment():
     """Test Business Analyst retrieves sentiment data from PostgreSQL."""
-    from agents.business_analyst import tools as ba_tools
+    from agents.business_analyst.tools import BusinessAnalystToolkit
     
     ticker = "AAPL"
     
     # Try to get sentiment snapshot
     try:
-        sentiment = ba_tools.get_sentiment_snapshot(ticker)
+        toolkit = BusinessAnalystToolkit()
+        sentiment = toolkit.get_sentiment_snapshot(ticker)
+        toolkit.close()
         # If data exists, verify structure
         if sentiment:
             assert hasattr(sentiment, "ticker") or "ticker" in sentiment
@@ -82,13 +84,13 @@ def test_qf_postgres_factors():
     # Try to get financial data
     try:
         # Create a connector to test PostgreSQL retrieval
-        connector = qf_tools.PostgresConnector()
+        connector = qf_tools.PostgresConnector(qf_tools.QuantFundamentalConfig())
         
         # Get financial statements
-        fs = connector.get_financial_data(
+        fs = connector.fetch_latest_fundamental(
             ticker=ticker,
             data_name="financial_statements",
-            period="2024-Q1",
+            limit=1,
         )
         
         # Verify structure if data exists
@@ -108,11 +110,11 @@ def test_qf_piotroski_inputs():
     
     # Test getting income statement for Piotroski calculations
     try:
-        connector = qf_tools.PostgresConnector()
-        income = connector.get_financial_data(
+        connector = qf_tools.PostgresConnector(qf_tools.QuantFundamentalConfig())
+        income = connector.fetch_latest_fundamental(
             ticker=ticker,
             data_name="income_statement",
-            period="2024-Q1",
+            limit=1,
         )
         
         if income:
@@ -140,21 +142,22 @@ def test_fm_dcf_inputs():
     ticker = "AAPL"
     
     try:
-        connector = fm_tools.PostgresConnector()
+        connector = fm_tools.PostgresConnector(fm_tools.FinancialModellingConfig())
         
         # Get cash flow data for DCF
-        cf = connector.get_financial_data(
+        cf = connector.fetch_latest_fundamental(
             ticker=ticker,
             data_name="cash_flow",
-            period="2024-Q1",
+            limit=1,
         )
         
         assert isinstance(cf, (list, dict, type(None)))
         
         # Get key metrics for WACC calculation
-        key_metrics = connector.get_financial_data(
+        key_metrics = connector.fetch_latest_fundamental(
             ticker=ticker,
             data_name="key_metrics_ttm",
+            limit=1,
         )
         
         assert isinstance(key_metrics, (list, dict, type(None)))
@@ -170,8 +173,8 @@ def test_fm_neo4j_peers():
     ticker = "AAPL"
     
     try:
-        peer_selector = fm_tools.Neo4jPeerSelector()
-        peers = peer_selector.get_peers(ticker, top_n=5)
+        peer_selector = fm_tools.Neo4jPeerSelector(fm_tools.FinancialModellingConfig())
+        peers = peer_selector.get_peers(ticker, limit=5)
         
         # Should return list (may be empty)
         assert isinstance(peers, list)
@@ -193,13 +196,8 @@ def test_sr_chunk_search():
     try:
         # Test loading data for the ticker
         # The agent has methods to load from Neo4j
-        from agents.stock_research_agent import agent_step1_neo4j
-        
-        # Test Neo4j data loading
-        result = agent_step1_neo4j.load_ticker_from_neo4j(ticker)
-        
-        # Should return some data structure or None
-        assert result is None or isinstance(result, dict)
+        result = sr_agent.run_full_analysis(ticker=ticker)
+        assert isinstance(result, dict)
     except Exception as e:
         print(f"Note: Stock research data lookup - {e}")
 
@@ -207,16 +205,61 @@ def test_sr_chunk_search():
 @pytest.mark.integration
 def test_sr_broker_data():
     """Test Stock Research can access broker report data."""
-    from agents.stock_research_agent import agent_step1_load
+    from agents.stock_research_agent import agent_step1_neo4j
     
     ticker = "AAPL"
     
     try:
-        # Test broker data loading
-        data = agent_step1_load.load_ticker_data(ticker)
-        assert data is None or isinstance(data, dict)
+        transcript_pages, broker_pages, latest_name, previous_name = agent_step1_neo4j.load_neo4j_pages(ticker)
+        assert isinstance(transcript_pages, list)
+        assert isinstance(broker_pages, list)
     except Exception:
         pass
+
+
+# ---------------------------------------------------------------------------
+# Test: Macro Agent ↔ PostgreSQL + Neo4j
+# ---------------------------------------------------------------------------
+
+@pytest.mark.integration
+def test_macro_pg_neo4j_data():
+    """Test Macro agent can load macro report and earnings chunks."""
+    from agents.macro_agent import agent as macro_agent
+
+    ticker = "AAPL"
+
+    try:
+        result = macro_agent.run_full_analysis(ticker=ticker)
+        assert isinstance(result, dict)
+        assert result.get("agent") == "macro"
+        assert result.get("ticker") == ticker
+        assert "macro_themes" in result
+        assert "per_report_summaries" in result
+    except Exception as e:
+        print(f"Note: Macro agent data lookup - {e}")
+
+
+# ---------------------------------------------------------------------------
+# Test: Insider News Agent ↔ PostgreSQL
+# ---------------------------------------------------------------------------
+
+@pytest.mark.integration
+def test_insider_news_postgres_data():
+    """Test Insider News agent can load insider/news data from PostgreSQL."""
+    from agents.insider_news_agent import agent as insider_news_agent
+
+    ticker = "AAPL"
+
+    try:
+        result = insider_news_agent.run_full_analysis(ticker=ticker)
+        assert isinstance(result, dict)
+        assert result.get("agent") == "insider_news"
+        assert result.get("ticker") == ticker
+        assert "insider_analysis" in result
+        assert "news_analysis" in result
+        assert "data_coverage" in result
+    except Exception as e:
+        print(f"Note: Insider news data lookup - {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -226,13 +269,17 @@ def test_sr_broker_data():
 @pytest.mark.integration
 def test_ws_perplexity_response():
     """Test Web Search agent gets non-empty result from Perplexity API."""
-    from agents.web_search import agent as ws_agent
+    from agents.web_search.agent import run_web_search_agent
     
     query = "Apple AAPL latest news 2024"
     
     try:
-        # Try to call web search (may require API key)
-        result = ws_agent.search_perplexity(query)
+        result = run_web_search_agent({
+            "query": query,
+            "ticker": "AAPL",
+            "recency_filter": "week",
+            "model": None,
+        })
         
         # If successful, verify structure
         if result:
@@ -247,13 +294,17 @@ def test_ws_perplexity_response():
 @pytest.mark.integration
 def test_ws_fallback():
     """Test Web Search has fallback mechanism."""
-    from agents.web_search import tools as ws_tools
+    from agents.web_search.agent import run_web_search_agent
     
     query = "AAPL stock analysis"
     
     try:
-        # Test fallback search
-        result = ws_tools.search_with_fallback(query)
+        result = run_web_search_agent({
+            "query": query,
+            "ticker": "AAPL",
+            "recency_filter": "week",
+            "model": None,
+        })
         
         # Should return something or empty list
         assert isinstance(result, (list, dict, type(None)))
@@ -268,21 +319,24 @@ def test_ws_fallback():
 @pytest.mark.integration
 def test_ba_full_pipeline():
     """Test Business Analyst can use both Neo4j and PostgreSQL."""
-    from agents.business_analyst import tools as ba_tools
+    from agents.business_analyst.tools import BusinessAnalystToolkit
     
     ticker = "AAPL"
     
-    # Test Neo4j retrieval
-    neo4j_chunks = ba_tools.fetch_chunks_from_neo4j(ticker, top_k=3)
+    toolkit = BusinessAnalystToolkit()
+    retrieval = toolkit.retrieve("AAPL qualitative analysis", ticker)
+    neo4j_chunks = retrieval.chunks if retrieval else []
     assert isinstance(neo4j_chunks, list)
     
     # Test PostgreSQL retrieval (may fail if no data)
     try:
-        pg_sentiment = ba_tools.get_sentiment_snapshot(ticker)
+        pg_sentiment = toolkit.get_sentiment_snapshot(ticker)
         # Either returns data or falls back gracefully
         assert pg_sentiment is not None or True  # Graceful fallback
     except Exception:
         pass
+    finally:
+        toolkit.close()
 
 
 @pytest.mark.integration
@@ -293,13 +347,14 @@ def test_fm_full_pipeline():
     ticker = "AAPL"
     
     # Test PostgreSQL data
-    connector = fm_tools.PostgresConnector()
-    fundamentals = connector.get_financial_data(ticker, "key_metrics_ttm")
+    cfg = fm_tools.FinancialModellingConfig()
+    connector = fm_tools.PostgresConnector(cfg)
+    fundamentals = connector.fetch_latest_fundamental(ticker, "key_metrics_ttm", limit=1)
     assert isinstance(fundamentals, (list, dict, type(None)))
     
     # Test Neo4j peers
     try:
-        peer_selector = fm_tools.Neo4jPeerSelector()
+        peer_selector = fm_tools.Neo4jPeerSelector(cfg)
         peers = peer_selector.get_peers(ticker)
         assert isinstance(peers, list)
     except Exception:
@@ -321,6 +376,7 @@ def create_agent_db_test(agent_name: str, ticker: str = "AAPL"):
     def test_agent_db():
         from agents import business_analyst, quant_fundamental, web_search
         from agents import financial_modelling, stock_research_agent
+        from agents import insider_news_agent, macro_agent
         
         agent_map = {
             "business_analyst": business_analyst,
@@ -328,6 +384,8 @@ def create_agent_db_test(agent_name: str, ticker: str = "AAPL"):
             "web_search": web_search,
             "financial_modelling": financial_modelling,
             "stock_research": stock_research_agent,
+            "macro": macro_agent,
+            "insider_news": insider_news_agent,
         }
         
         agent = agent_map.get(agent_name)

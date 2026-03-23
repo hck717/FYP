@@ -39,11 +39,13 @@ PLANNER_TEST_CASES = [
     ("Is AAPL a good buy?", "AAPL", ["business_analyst", "financial_modelling"], 2),
     ("What's Microsoft's competitive advantage?", "MSFT", ["business_analyst"], 1),
     ("Analyze NVDA stock", "NVDA", ["business_analyst", "quant_fundamental", "financial_modelling"], 3),
+    ("How do rate cuts affect AAPL?", "AAPL", ["macro"], 2),
+    ("Any insider buying for TSLA lately?", "TSLA", ["insider_news"], 2),
 ]
 
 # All agents constant for reference
 ALL_AGENTS = ["business_analyst", "quant_fundamental", "web_search", 
-              "financial_modelling", "stock_research"]
+              "financial_modelling", "stock_research", "macro", "insider_news"]
 
 
 # ---------------------------------------------------------------------------
@@ -60,6 +62,8 @@ def test_planner_output_structure():
         "run_web_search": False,
         "run_financial_modelling": True,
         "run_stock_research": False,
+        "run_macro": False,
+        "run_insider_news": False,
         "react_max_iterations": 2,
         "output_language": None,
     }
@@ -122,6 +126,8 @@ def _mock_planner_output(query: str) -> Dict[str, Any]:
         "run_web_search": False,
         "run_financial_modelling": False,
         "run_stock_research": False,
+        "run_macro": False,
+        "run_insider_news": False,
         "react_max_iterations": 1,
         "output_language": None,
     }
@@ -147,6 +153,7 @@ def _mock_planner_output(query: str) -> Dict[str, Any]:
     if "dcf" in query_lower or "valuation" in query_lower or "buy" in query_lower:
         output["run_financial_modelling"] = True
         output["run_quant_fundamental"] = True
+        output["run_business_analyst"] = True
         output["react_max_iterations"] = max(output["react_max_iterations"], 2)
     
     if "news" in query_lower or "latest" in query_lower:
@@ -158,6 +165,14 @@ def _mock_planner_output(query: str) -> Dict[str, Any]:
         output["run_financial_modelling"] = True
         output["run_stock_research"] = True
         output["react_max_iterations"] = 3
+
+    if "macro" in query_lower or "rate" in query_lower or "inflation" in query_lower:
+        output["run_macro"] = True
+        output["react_max_iterations"] = max(output["react_max_iterations"], 2)
+
+    if "insider" in query_lower or "insider trading" in query_lower:
+        output["run_insider_news"] = True
+        output["react_max_iterations"] = max(output["react_max_iterations"], 2)
     
     if "full analysis" in query_lower or "analyze" in query_lower:
         for key in output:
@@ -237,7 +252,8 @@ def test_planner_state_integration():
     """Test planner output integrates with OrchestrationState."""
     from orchestration.state import OrchestrationState
     
-    planner_output = {
+    state: OrchestrationState = {
+        "user_query": "Full analysis of AAPL",
         "ticker": "AAPL",
         "run_business_analyst": True,
         "run_quant_fundamental": True,
@@ -246,15 +262,9 @@ def test_planner_state_integration():
         "output_language": None,
     }
     
-    # Should be valid state
-    state: OrchestrationState = {
-        "user_query": "Full analysis of AAPL",
-        **planner_output,
-    }
-    
-    assert state["ticker"] == "AAPL"
-    assert state["run_business_analyst"] is True
-    assert state["react_max_iterations"] == 2
+    assert state.get("ticker") == "AAPL"
+    assert state.get("run_business_analyst") is True
+    assert state.get("react_max_iterations") == 2
 
 
 # ---------------------------------------------------------------------------

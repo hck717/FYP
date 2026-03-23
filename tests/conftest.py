@@ -14,11 +14,19 @@ The testing framework is designed to be easily extensible:
 
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from unittest.mock import MagicMock, patch
 
 import pytest
+
+from tests.metrics import (
+    clear_metrics_log,
+    output_snapshot,
+    record_metric,
+    write_metrics_summary_md,
+)
 
 # Ensure repo root is on sys.path
 _REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -64,6 +72,18 @@ AGENT_REGISTRY = {
         "node_name": "node_stock_research",
         "output_key": "stock_research_outputs",
         "requires_db": ["neo4j", "postgres"],
+    },
+    "macro": {
+        "module": "agents.macro_agent.agent",
+        "node_name": "node_macro",
+        "output_key": "macro_outputs",
+        "requires_db": ["neo4j", "postgres"],
+    },
+    "insider_news": {
+        "module": "agents.insider_news_agent.agent",
+        "node_name": "node_insider_news",
+        "output_key": "insider_news_outputs",
+        "requires_db": ["postgres"],
     },
 }
 
@@ -114,14 +134,14 @@ def test_env():
     os.environ.update({
         "POSTGRES_HOST": "localhost",
         "POSTGRES_PORT": "5432",
-        "POSTGRES_DB": "test_airflow",
-        "POSTGRES_USER": "test",
-        "POSTGRES_PASSWORD": "test",
+        "POSTGRES_DB": "airflow",
+        "POSTGRES_USER": "airflow",
+        "POSTGRES_PASSWORD": "airflow",
         "NEO4J_URI": "bolt://localhost:7687",
         "NEO4J_USER": "neo4j",
-        "NEO4J_PASSWORD": "test",
+        "NEO4J_PASSWORD": "SecureNeo4jPass2025!",
         "OLLAMA_BASE_URL": "http://localhost:11434",
-        "EMBEDDING_MODEL": "nomic-embed-text",
+        "EMBEDDING_MODEL": "nomic-embed-text:v1.5",
     })
     yield
     os.environ.clear()
@@ -267,6 +287,8 @@ def mock_all_agent_outputs():
         "web_search_outputs": [{}],
         "financial_modelling_outputs": [{}],
         "stock_research_outputs": [{}],
+        "macro_outputs": [{}],
+        "insider_news_outputs": [{}],
     }
 
 
@@ -300,6 +322,8 @@ def mock_planner_response():
         "run_web_search": False,
         "run_financial_modelling": True,
         "run_stock_research": True,
+        "run_macro": False,
+        "run_insider_news": False,
         "react_max_iterations": 2,
         "output_language": None,
     }
@@ -357,6 +381,87 @@ def pytest_configure(config):
     config.addinivalue_line(
         "markers", "unit: marks tests as unit tests (no external dependencies)"
     )
+
+
+def pytest_sessionstart(session):
+    """Start a fresh metrics log for each pytest session."""
+    clear_metrics_log()
+    session._metrics_session_start = time.perf_counter()
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_call(item):
+    """Record per-test duration and status for all test types."""
+    start = time.perf_counter()
+    outcome = yield
+    duration_ms = (time.perf_counter() - start) * 1000.0
+    exc = outcome.excinfo
+    status = "passed" if exc is None else "failed"
+
+    markers = []
+    for m in item.iter_markers():
+        markers.append(m.name)
+
+    record_metric(
+        {
+            "category": "pytest_case",
+            "test_nodeid": item.nodeid,
+            "status": status,
+            "markers": markers,
+            "duration_ms": round(duration_ms, 3),
+            "output_size_bytes": 0,
+        }
+    )
+
+
+def pytest_sessionfinish(session, exitstatus):
+    """Write markdown summary with quantified totals at session end."""
+    total_ms = (time.perf_counter() - getattr(session, "_metrics_session_start", time.perf_counter())) * 1000.0
+    tr = session.config.pluginmanager.get_plugin("terminalreporter")
+
+    passed = len(tr.stats.get("passed", [])) if tr else 0
+    failed = len(tr.stats.get("failed", [])) if tr else 0
+    skipped = len(tr.stats.get("skipped", [])) if tr else 0
+    errored = len(tr.stats.get("error", [])) if tr else 0
+
+    extra = [
+        f"Pytest exit status: {exitstatus}",
+        f"Session duration (wall time): {round(total_ms, 3)} ms",
+        f"Passed: {passed}",
+        f"Failed: {failed}",
+        f"Skipped: {skipped}",
+        f"Errors: {errored}",
+        "Metrics log: tests/outputs/test_metrics.jsonl",
+    ]
+    write_metrics_summary_md(extra_sections=extra)
+
+
+@pytest.fixture
+def record_observation():
+    """Record structured observation for prompt/integration tests."""
+
+    def _record(
+        category: str,
+        name: str,
+        outputs: Optional[Dict[str, Any]] = None,
+        metrics: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        snap = output_snapshot(outputs or {})
+        size_bytes = 0
+        for v in snap.values():
+            size_bytes += int(v.get("size_bytes", 0))
+
+        record_metric(
+            {
+                "category": category,
+                "name": name,
+                "output_snapshot": snap,
+                "output_size_bytes": size_bytes,
+                "metrics": metrics or {},
+            }
+        )
+
+    return _record
 
 
 # ---------------------------------------------------------------------------
