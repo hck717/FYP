@@ -1,0 +1,15 @@
+{"query": "What is AAPL moat?", "must_contain": ["brand", "ecosystem"], "must_not_contain": ["hallucination"]}
+{"query": "TSLA DCF valuation", "numeric_fields": ["dcf_value", "wacc", "terminal_growth"]}
+{"query": "Compare MSFT vs AAPL", "must_contain": ["valuation", "comparison"], "numeric_fields": ["dcf_value"]}
+{"query": "What is Apple earnings?", "must_contain": ["revenue", "income"], "numeric_fields": ["revenue", "net_income"]}
+{"query": "Latest news on AAPL", "must_contain": ["news", "recent"], "source_type": "web_search"}
+{"query": "Full analysis of NVDA", "must_contain": ["valuation", "moat", "fundamentals"], "numeric_fields": ["piotroski_score", "dcf_value"]}
+{"query": "AAPL competitive advantage", "must_contain": ["moat", "competitive"], "source_type": "business_analyst"}
+{"query": "Microsoft valuation", "numeric_fields": ["dcf_value", "pe_ratio"], "source_type": "financial_modelling"}
+{"query": "AAPL technical analysis", "must_contain": ["trend", "support", "resistance"], "numeric_fields": ["rsi", "macd"]}
+{"query": "What are AAPL risks?", "must_contain": ["risk", "China", "regulation"], "source_type": "business_analyst"}
+{"query": "NVDA fundamental analysis", "numeric_fields": ["piotroski_score", "beneish_m_score", "altman_z"], "source_type": "quant_fundamental"}
+{"query": "AAPL broker ratings", "must_contain": ["buy", "sell", "hold", "rating"], "source_type": "stock_research"}
+{"query": "Apple Q4 earnings call", "must_contain": ["transcript", "management", "guidance"], "source_type": "stock_research"}
+{"query": "Fed interest rate impact", "must_contain": ["macro", "fed", "rates"], "source_type": "web_search"}
+{"query": "AAPL vs MSFT which is better", "must_contain": ["comparison", "valuation"], "numeric_fields": ["dcf_value"]}
