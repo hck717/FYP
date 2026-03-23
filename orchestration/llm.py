@@ -29,13 +29,15 @@ _PLANNER_MODEL = os.getenv(
 )
 _SUMMARIZER_MODEL = os.getenv(
     "ORCHESTRATION_SUMMARIZER_MODEL",
-    "deepseek-chat",
+    "deepseek-reasoner",
 )
 _TRANSLATION_MODEL = os.getenv("ORCHESTRATION_TRANSLATION_MODEL", _SUMMARIZER_MODEL)
 _REQUEST_TIMEOUT_ENV = os.getenv("ORCHESTRATION_LLM_TIMEOUT", "").strip()
 _REQUEST_TIMEOUT: Optional[int] = int(_REQUEST_TIMEOUT_ENV) if _REQUEST_TIMEOUT_ENV else 60
 _SUMMARIZER_TIMEOUT_ENV = os.getenv("ORCHESTRATION_SUMMARIZER_TIMEOUT", "").strip()
 _SUMMARIZER_TIMEOUT: Optional[int] = int(_SUMMARIZER_TIMEOUT_ENV) if _SUMMARIZER_TIMEOUT_ENV else 1200
+_SUMMARIZER_MAX_OUTPUT_TOKENS_ENV = os.getenv("ORCHESTRATION_SUMMARIZER_MAX_OUTPUT_TOKENS", "").strip()
+_SUMMARIZER_MAX_OUTPUT_TOKENS: int = int(_SUMMARIZER_MAX_OUTPUT_TOKENS_ENV) if _SUMMARIZER_MAX_OUTPUT_TOKENS_ENV else 32000
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -173,6 +175,87 @@ def _deepseek_generate(
     except requests.exceptions.Timeout:
         logger.error("DeepSeek request timed out after %ss", _timeout)
         raise
+    except requests.exceptions.HTTPError as exc:
+        status = getattr(exc.response, "status_code", None)
+        body = ""
+        try:
+            body = (exc.response.text or "")[:500] if exc.response is not None else ""
+        except Exception:
+            body = ""
+        logger.error("DeepSeek HTTP error status=%s body=%r", status, body)
+        raise
+
+
+def _summarizer_model_max_output_tokens(model_name: str) -> int:
+    """Return known max output-token caps for DeepSeek models."""
+    m = (model_name or "").lower()
+    if "reasoner" in m:
+        return 64000
+    if "chat" in m:
+        return 8192
+    return 8192
+
+
+def _summarizer_max_token_candidates(requested: int) -> List[int]:
+    """Generate descending fallback token budgets for summarizer calls."""
+    cap = _summarizer_model_max_output_tokens(_SUMMARIZER_MODEL)
+    clamped = min(max(256, int(requested)), cap)
+    if clamped != requested:
+        logger.warning(
+            "[summarizer] Clamping max_tokens from %d to %d for model=%s",
+            requested,
+            clamped,
+            _SUMMARIZER_MODEL,
+        )
+
+    candidates = [clamped, min(32000, cap), min(16000, cap), min(8192, cap), 4096]
+    out: List[int] = []
+    seen: set[int] = set()
+    for c in candidates:
+        v = max(256, int(c))
+        if v in seen:
+            continue
+        out.append(v)
+        seen.add(v)
+    return out
+
+
+def _deepseek_generate_summarizer(
+    prompt: str,
+    temperature: float,
+    timeout: Optional[int],
+    system_prompt: Optional[str],
+    return_reasoning: bool = False,
+) -> Any:
+    """Call summarizer model with graceful max_tokens fallback on HTTP 400."""
+    candidates = _summarizer_max_token_candidates(_SUMMARIZER_MAX_OUTPUT_TOKENS)
+    last_http_400: Optional[requests.exceptions.HTTPError] = None
+
+    for max_t in candidates:
+        try:
+            return _deepseek_generate(
+                _SUMMARIZER_MODEL,
+                prompt,
+                max_tokens=max_t,
+                temperature=temperature,
+                timeout=timeout,
+                system_prompt=system_prompt,
+                return_reasoning=return_reasoning,
+            )
+        except requests.exceptions.HTTPError as exc:
+            status = getattr(exc.response, "status_code", None)
+            if status == 400 and max_t > 4096:
+                logger.warning(
+                    "[summarizer] HTTP 400 at max_tokens=%d, retrying with smaller limit",
+                    max_t,
+                )
+                last_http_400 = exc
+                continue
+            raise
+
+    if last_http_400 is not None:
+        raise last_http_400
+    raise RuntimeError("Summarizer request failed before model call")
 
 
 # ── Planner ───────────────────────────────────────────────────────────────────
@@ -804,6 +887,8 @@ def plan_query(
     # Determine complexity from keywords as a fallback/override baseline
     _is_comprehensive = any(kw in _query_lower for kw in [
         "fundamental analysis", "full analysis", "complete analysis",
+        "full fundamental analysis", "complete fundamental analysis",
+        "funamanetal analysis", "fundamanetal analysis", "fundemental analysis",
         "comprehensive analysis", "deep dive", "deep-dive",
         "dcf", "intrinsic value", "wacc", "fair value", "valuation",
         "technical analysis", "rsi", "macd", "overvalued", "undervalued",
@@ -812,7 +897,7 @@ def plan_query(
     
     # Keyword detection for new agents
     _needs_macro = any(kw in _query_lower for kw in [
-        "macro", "macroeconomic", "market environment", "fed", "federal reserve",
+        "macro", "marco", "macroeconomic", "market environment", "fed", "federal reserve",
         "interest rate", "inflation", "gdp", "economic outlook", "economy",
         "risk-off", "risk-on", "market regime", "trade war", "tariff",
     ])
@@ -825,6 +910,8 @@ def plan_query(
     # Keyword-based complexity baseline (used when LLM doesn't return a valid value)
     _complexity_keywords_3 = [
         "fundamental analysis", "complete analysis", "full analysis",
+        "full fundamental analysis", "complete fundamental analysis",
+        "funamanetal analysis", "fundamanetal analysis", "fundemental analysis",
         "comprehensive analysis", "deep dive", "deep-dive", "full report",
         "complete report",
     ]
@@ -2850,9 +2937,9 @@ CRITICAL RULES:
     stage1_result: Optional[Dict[str, Any]] = None
     for attempt in range(3):
         try:
-            raw = _deepseek_generate(
-                _SUMMARIZER_MODEL, stage1_prompt,
-                max_tokens=8000, temperature=0.1,
+            raw = _deepseek_generate_summarizer(
+                stage1_prompt,
+                temperature=0.1,
                 timeout=_SUMMARIZER_TIMEOUT,
                 system_prompt=_JSON_STAGE1_SYSTEM,
             )
@@ -2957,9 +3044,9 @@ RULES:
 - Start directly with ## Executive Summary."""
 
     try:
-        prose_raw = _deepseek_generate(
-            _SUMMARIZER_MODEL, stage2_prompt,
-            max_tokens=8000, temperature=0.1,
+        prose_raw = _deepseek_generate_summarizer(
+            stage2_prompt,
+            temperature=0.1,
             timeout=_SUMMARIZER_TIMEOUT,
             system_prompt=_JSON_STAGE2_SYSTEM,
         )
@@ -3605,14 +3692,10 @@ def summarise_results(
 
     prompt = _trim_prompt_to_window(prompt)
 
-    # deepseek-reasoner:
-    #   single:     3000 tok ≈ 200-300s + ~45s prefill ≈ 4-6 min  → target 8-12 min total
-    #   comparison: 3000 tok ≈ 200-300s + ~45s prefill ≈ 4-6 min
-    # Raised from 8000 → 12000 to increase depth/output length by ~50%.
-    max_tokens = 12000
     try:
-        raw, reasoning = _deepseek_generate(
-            _SUMMARIZER_MODEL, prompt, max_tokens=max_tokens, temperature=0.2,
+        raw, reasoning = _deepseek_generate_summarizer(
+            prompt,
+            temperature=0.2,
             timeout=_SUMMARIZER_TIMEOUT, system_prompt=_SUMMARIZER_SYSTEM,
             return_reasoning=True,
         )

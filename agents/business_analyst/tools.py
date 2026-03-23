@@ -783,6 +783,52 @@ class Neo4jConnector:
             logger.warning("[Neo4j] fetch_recent_chunks failed for %s: %s", ticker, exc)
             return []
 
+    def fetch_section_chunks(self, ticker: str, section: str, limit: int = 10) -> List["Chunk"]:
+        """Fetch most recent chunks for a specific section from Neo4j."""
+        cypher = """
+        MATCH (c:Company {ticker: $ticker})-[:HAS_CHUNK]->(ch:Chunk)
+        WHERE toLower(coalesce(ch.section, '')) = toLower($section)
+        RETURN ch.chunk_id AS chunk_id,
+               ch.text AS text,
+               ch.section AS section,
+               ch.filing_date AS filing_date,
+               ch.ticker AS ticker_symbol,
+               ch.institution AS institution,
+               ch.source_file AS source_file,
+               ch.source_name AS source_name
+        ORDER BY ch.filing_date DESC
+        LIMIT $limit
+        """
+        try:
+            with self.driver.session(database=None) as session:
+                rows = session.run(cypher, ticker=ticker, section=section, limit=limit).data()
+            chunks: List[Chunk] = []
+            for i, row in enumerate(rows):
+                sec = row.get("section") or section
+                ticker_sym = row.get("ticker_symbol") or ticker
+                source_name = row.get("source_name") or row.get("source_file") or sec
+                chunk_id = row.get("chunk_id") or f"neo4j::{ticker_sym}::{sec}::fallback::{i}"
+                chunks.append(
+                    Chunk(
+                        chunk_id=chunk_id,
+                        text=row.get("text") or "",
+                        score=0.35,
+                        source="neo4j",
+                        metadata={
+                            "section": sec,
+                            "filing_date": row.get("filing_date"),
+                            "ticker": ticker_sym,
+                            "institution": row.get("institution"),
+                            "source_file": row.get("source_file"),
+                            "source_name": source_name,
+                        },
+                    )
+                )
+            return chunks
+        except Exception as exc:
+            logger.warning("[Neo4j] fetch_section_chunks failed for %s/%s: %s", ticker, section, exc)
+            return []
+
     def is_vector_index_online(self) -> bool:
         """Return True when the chunk_embedding vector index is ONLINE."""
         cypher = "SHOW INDEXES YIELD name, state WHERE name = $name RETURN state"
@@ -1292,6 +1338,46 @@ class PgVectorConnector:
         except Exception as exc:
             logger.warning("[PgVector] has_embedding_index check failed: %s", exc)
             return False
+
+    def fetch_section_chunks(self, ticker: str, section: str, limit: int = 10) -> List[Chunk]:
+        """Fetch most recent section-specific chunks from PostgreSQL text_chunks."""
+        sql = """
+        SELECT chunk_id, text, section, filing_date, ticker
+        FROM text_chunks
+        WHERE ticker = %s
+          AND lower(coalesce(section, '')) = lower(%s)
+        ORDER BY filing_date DESC
+        LIMIT %s
+        """
+        try:
+            conn = self._pg_connect()
+            with closing(conn), conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(sql, (ticker, section, limit))
+                rows = cur.fetchall()
+        except Exception as exc:
+            logger.warning("[PgVector] fetch_section_chunks failed for %s/%s: %s", ticker, section, exc)
+            return []
+
+        chunks: List[Chunk] = []
+        for i, row in enumerate(rows):
+            sec = row.get("section") or section
+            tk = row.get("ticker") or ticker
+            chunk_id = row.get("chunk_id") or f"pgvec::{tk}::{sec}::fallback::{i}"
+            chunks.append(
+                Chunk(
+                    chunk_id=chunk_id,
+                    text=row.get("text") or "",
+                    score=0.33,
+                    source="pgvector",
+                    metadata={
+                        "section": sec,
+                        "filing_date": row.get("filing_date"),
+                        "ticker": tk,
+                        "source_name": sec.replace("_", " ").title(),
+                    },
+                )
+            )
+        return chunks
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1842,12 +1928,25 @@ class BusinessAnalystToolkit:
         # are lower than other sections.
         _min_sec = self.config.min_chunks_per_section
         if _min_sec > 0 and recall_pool:
-            _key_sections = ("earnings_call", "broker_report", "10-K", "annual_report")
+            _key_sections = ("earnings_call", "broker_report", "10-k", "annual_report")
+            _section_aliases = {
+                "earnings_call": {"earnings_call", "earnings call", "transcript", "earnings_transcript"},
+                "broker_report": {"broker_report", "broker report", "analyst_report", "analyst report"},
+                "10-k": {"10-k", "10k", "10_k", "10-k filing"},
+                "annual_report": {"annual_report", "annual report", "annual"},
+            }
+
+            def _norm_sec(val: str) -> str:
+                return (val or "").strip().lower().replace("_", " ")
+
             _fused_ids = {c.chunk_id for c in fused}
             _section_counts: Dict[str, int] = {}
             for c in fused:
-                sec = (c.metadata or {}).get("section") or ""
-                _section_counts[sec] = _section_counts.get(sec, 0) + 1
+                sec = _norm_sec((c.metadata or {}).get("section") or "")
+                for canonical, aliases in _section_aliases.items():
+                    if sec in aliases:
+                        _section_counts[canonical] = _section_counts.get(canonical, 0) + 1
+                        break
 
             # Fallback pool sorted by raw vector score (best from recall_pool)
             _fallback_pool = sorted(recall_pool, key=lambda c: -c.score)
@@ -1859,12 +1958,32 @@ class BusinessAnalystToolkit:
                 _candidates = [
                     c for c in _fallback_pool
                     if c.chunk_id not in _fused_ids
-                    and (c.metadata or {}).get("section") == _sec
+                    and _norm_sec((c.metadata or {}).get("section") or "") in _section_aliases.get(_sec, {_sec})
                 ]
                 for c in _candidates[:_deficit]:
                     fused.append(c)
                     _fused_ids.add(c.chunk_id)
                     _added += 1
+
+            # If still missing targeted sections, pull direct section samples from Neo4j/Postgres.
+            if ticker:
+                for _sec in _key_sections:
+                    _remaining_deficit = _min_sec - _section_counts.get(_sec, 0)
+                    if _remaining_deficit <= 0:
+                        continue
+                    _direct_candidates: List[Chunk] = []
+                    for alias in _section_aliases.get(_sec, {_sec}):
+                        _direct_candidates.extend(self.neo4j.fetch_section_chunks(ticker, alias, limit=_remaining_deficit))
+                        _direct_candidates.extend(self.pgvec.fetch_section_chunks(ticker, alias, limit=_remaining_deficit))
+                    for c in _direct_candidates:
+                        if c.chunk_id in _fused_ids or _is_boilerplate(c.text):
+                            continue
+                        fused.append(c)
+                        _fused_ids.add(c.chunk_id)
+                        _section_counts[_sec] = _section_counts.get(_sec, 0) + 1
+                        _added += 1
+                        if _section_counts[_sec] >= _min_sec:
+                            break
             if _added:
                 logger.info(
                     "[MultiStage] Section-diversity: injected %d chunk(s) to satisfy "

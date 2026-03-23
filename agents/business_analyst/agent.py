@@ -1131,6 +1131,28 @@ def _node_format_json_output(state: AgentState) -> AgentState:
         for item in missing_context
     ]
 
+    # Remove stale generic missing-context gaps when we already retrieved section evidence.
+    _have_earnings_evidence = any(
+        isinstance(c.metadata, dict)
+        and str(c.metadata.get("section") or "").lower().replace("_", " ") in {"earnings call", "earnings_call", "transcript", "earnings transcript"}
+        for c in (retrieval.chunks if retrieval else [])
+    )
+    _have_broker_evidence = any(
+        isinstance(c.metadata, dict)
+        and str(c.metadata.get("section") or "").lower().replace("_", " ") in {"broker report", "broker_report", "analyst report", "analyst_report"}
+        for c in (retrieval.chunks if retrieval else [])
+    )
+    if _have_earnings_evidence or _have_broker_evidence:
+        _filtered_missing_context: List[Dict[str, Any]] = []
+        for item in missing_context:
+            gap_text = str(item.get("gap", "")).lower()
+            if _have_earnings_evidence and ("earnings call" in gap_text or "transcript" in gap_text):
+                continue
+            if _have_broker_evidence and ("broker report" in gap_text or "broker research" in gap_text):
+                continue
+            _filtered_missing_context.append(item)
+        missing_context = _filtered_missing_context
+
     # Coerce key_risks: LLM sometimes writes mitigation_observed as the string "null"
     # instead of JSON null.  Also ensure each entry is a dict (defensive).
     # Additionally, null out any `source` field that isn't a real retrieved chunk_id

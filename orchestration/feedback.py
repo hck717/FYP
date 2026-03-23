@@ -28,6 +28,38 @@ _DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
 _DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
 
 
+def _normalise_weaknesses(value: Any) -> List[str]:
+    """Return weaknesses as a normalized list of strings."""
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(x).strip() for x in value if str(x).strip()]
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+            if isinstance(parsed, list):
+                return [str(x).strip() for x in parsed if str(x).strip()]
+        except Exception:
+            pass
+        v = value.strip()
+        return [v] if v else []
+    return [str(value).strip()]
+
+
+def _is_uninformative_worst_case(row: Dict[str, Any]) -> bool:
+    """True when a row is unusable for planner learning (judge unavailable/etc)."""
+    weaknesses = [w.lower() for w in _normalise_weaknesses(row.get("weaknesses"))]
+    specific_feedback = str(row.get("specific_feedback") or "").lower()
+
+    if any("judge unavailable" in w for w in weaknesses):
+        return True
+    if "error calling judge" in specific_feedback:
+        return True
+    if "unauthorized" in specific_feedback and "deepseek" in specific_feedback:
+        return True
+    return False
+
+
 def _get_pg_conn():
     """Open a new psycopg2 connection using env vars."""
     return psycopg2.connect(
@@ -800,11 +832,37 @@ def get_worst_cases(
                 ORDER BY penalised_score ASC
                 LIMIT %s
                 """,
-                (limit,),
+                (max(limit * 10, 20),),
             )
             rows = cur.fetchall()
         conn.close()
-        return [dict(row) for row in rows]
+
+        # Filter out rows that carry no useful learning signal (e.g. judge unavailable).
+        filtered_rows: List[Dict[str, Any]] = []
+        seen: set[tuple[str, str, str, str]] = set()
+        for row in rows:
+            item = dict(row)
+            if _is_uninformative_worst_case(item):
+                continue
+
+            weaknesses = _normalise_weaknesses(item.get("weaknesses"))
+            item["weaknesses"] = weaknesses
+
+            # Deduplicate repetitive failures so planner context is diverse.
+            key = (
+                str(item.get("user_query") or "").strip().lower(),
+                str(item.get("ticker") or "").strip().upper(),
+                str(item.get("agent_blamed") or "none").strip().lower(),
+                "|".join(sorted(w.lower() for w in weaknesses[:3])),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            filtered_rows.append(item)
+            if len(filtered_rows) >= limit:
+                break
+
+        return filtered_rows
     except Exception as exc:
         logger.warning("[feedback] get_worst_cases failed (non-fatal): %s", exc)
         return []

@@ -23,7 +23,28 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 # ── Ensure repo root is on sys.path so orchestration imports work ─────────────
-_REPO_ROOT = Path(__file__).resolve().parents[2]
+def _discover_repo_root() -> Path:
+    """Find project root in both local and Docker-mounted layouts."""
+    env_root = os.getenv("REPO_ROOT")
+    if env_root:
+        p = Path(env_root).expanduser().resolve()
+        if p.exists():
+            return p
+
+    this_file = Path(__file__).resolve()
+    search_roots = [this_file.parent, *this_file.parents]
+    for candidate in search_roots:
+        orch_graph = candidate / "orchestration" / "graph.py"
+        orch_nodes = candidate / "orchestration" / "nodes.py"
+        agents_dir = candidate / "agents"
+        if orch_graph.exists() and orch_nodes.exists() and agents_dir.exists():
+            return candidate
+
+    # Last-resort fallback: previous local layout assumption.
+    return this_file.parents[2] if len(this_file.parents) > 2 else this_file.parent
+
+
+_REPO_ROOT = _discover_repo_root()
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
@@ -204,6 +225,24 @@ def _clean_text_for_display(text: str) -> str:
     text = text.replace('\r\n', '\n').replace('\r', '\n')
 
     return text
+
+
+def _sanitize_llm_markdown(text: str) -> str:
+    """Sanitize model markdown so headings and HTML cannot break layout."""
+    if not text:
+        return text
+
+    import re
+
+    cleaned = _clean_text_for_display(text)
+    # Remove raw HTML heading tags if model emits them.
+    cleaned = re.sub(r"<h[1-6][^>]*>.*?</h[1-6]>", "", cleaned, flags=re.IGNORECASE | re.DOTALL)
+    # Downgrade all ATX headings to level-3 for consistent typography.
+    cleaned = re.sub(r"(?m)^\s*#{1,2}\s+", "### ", cleaned)
+    cleaned = re.sub(r"(?m)^\s*#{3,}\s+", "### ", cleaned)
+    # Collapse excessive blank lines from malformed LLM markdown.
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
 
 
 def _collect_ba_references(output: Dict[str, Any]) -> List[str]:
@@ -1593,7 +1632,7 @@ def _render_planner_feedback_learning(state: Dict[str, Any]) -> None:
                 f"Ticker: {w.get('ticker', 'N/A')} | "
                 f"Score: {float(w.get('overall_score') or 0):.1f}/10 | "
                 f"Blamed: {w.get('agent_blamed', 'unknown')} | "
-                f"Weaknesses: {'; '.join(str(x) for x in weaknesses[:2])}"
+                f"Weaknesses: {'; '.join(str(x) for x in weaknesses[:2]) or 'N/A'}"
                 f"{human_signal}"
             )
 
@@ -2072,7 +2111,9 @@ def main() -> None:
                     # Import and run the inspection
                     import sys
                     from pathlib import Path
-                    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "ingestion" / "etl"))
+                    etl_root = _REPO_ROOT / "ingestion" / "etl"
+                    if etl_root.exists():
+                        sys.path.insert(0, str(etl_root))
                     from ingestion.etl.inspect_db import check_postgres, check_neo4j
                     
                     import io
@@ -2243,7 +2284,7 @@ def main() -> None:
             st.subheader("Research Note")
             
             # Clean and display the text
-            final_summary_clean = _clean_text_for_display(final_summary)
+            final_summary_clean = _sanitize_llm_markdown(final_summary)
             
             # Check if text has proper formatting
             has_proper_spaces = " " in final_summary_clean[:100] and "\n" in final_summary_clean[:500]
@@ -2254,6 +2295,10 @@ def main() -> None:
                 show_raw = st.checkbox("Raw text", value=not has_proper_spaces, key="show_raw_text")
             with col2:
                 pass
+
+            with st.expander("Render debug", expanded=False):
+                st.caption("Raw LLM preview (first 2000 chars)")
+                st.code(final_summary_clean[:2000], language="markdown")
             
             if show_raw:
                 st.text(final_summary_clean)

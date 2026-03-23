@@ -15,7 +15,7 @@
 #   NGROK_AUTHTOKEN - Your ngrok auth token (can pass as argument)
 #
 
-set -e
+set -euo pipefail
 
 # Colors for output
 RED='\033[0;31m'
@@ -24,6 +24,19 @@ YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
 echo -e "${GREEN}=== Starting FYP with ngrok tunnel ===${NC}"
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR"
+
+PYTHON_CMD="python3"
+STREAMLIT_CMD="streamlit"
+PIP_CMD="python3 -m pip"
+
+if [ -x "$SCRIPT_DIR/.venv/bin/python" ] && [ -x "$SCRIPT_DIR/.venv/bin/streamlit" ]; then
+    PYTHON_CMD="$SCRIPT_DIR/.venv/bin/python"
+    STREAMLIT_CMD="$SCRIPT_DIR/.venv/bin/streamlit"
+    PIP_CMD="$SCRIPT_DIR/.venv/bin/python -m pip"
+fi
 
 # Check if ngrok token is provided
 NGROK_TOKEN=${1:-${NGROK_AUTHTOKEN:-}}
@@ -36,13 +49,41 @@ if [ -z "$NGROK_TOKEN" ]; then
     read -p "Enter your ngrok token (or press Enter to skip): " NGROK_TOKEN
 fi
 
+# Pick a free local port (prefers 8501)
+pick_port() {
+    local candidate
+    for candidate in 8501 8502 8503 8504 8505; do
+        if ! lsof -nP -iTCP:"$candidate" -sTCP:LISTEN >/dev/null 2>&1; then
+            echo "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+STREAMLIT_PORT="$(pick_port || true)"
+if [ -z "$STREAMLIT_PORT" ]; then
+    echo -e "${RED}Error: no free port found in 8501-8505${NC}"
+    exit 1
+fi
+
+if [ "$STREAMLIT_PORT" != "8501" ]; then
+    echo -e "${YELLOW}Port 8501 is busy, using port ${STREAMLIT_PORT} instead${NC}"
+fi
+
+# Ensure local dependencies exist (installs once if missing)
+echo -e "${GREEN}Checking Python dependencies...${NC}"
+if ! "$PYTHON_CMD" -c "import streamlit, dotenv, langchain_openai, neo4j, psycopg2" >/dev/null 2>&1; then
+    echo -e "${YELLOW}Missing dependencies detected. Installing requirements...${NC}"
+    $PIP_CMD install -r "$SCRIPT_DIR/requirements.txt"
+fi
+
 # Start PostgreSQL and Neo4j
 echo -e "${GREEN}Starting PostgreSQL and Neo4j...${NC}"
-cd "$(dirname "$0")"
 
 # Check if docker-compose.yml exists
 if [ -f "docker-compose.yml" ]; then
-    docker-compose up -d postgres neo4j
+    docker compose up -d postgres neo4j
     echo -e "${GREEN}✓ PostgreSQL and Neo4j started${NC}"
 else
     echo -e "${YELLOW}Warning: docker-compose.yml not found, skipping database start${NC}"
@@ -58,12 +99,12 @@ if [ -n "$NGROK_TOKEN" ]; then
     ngrok config add-authtoken "$NGROK_TOKEN" 2>/dev/null || true
 fi
 
-# Kill any existing ngrok processes on port 8501
-pkill -f "ngrok.*8501" 2>/dev/null || true
+# Kill any existing ngrok process to avoid 4040 conflicts
+pkill -f "ngrok http" 2>/dev/null || true
 
 # Start ngrok tunnel in background
-echo -e "${GREEN}Starting ngrok tunnel on port 8501...${NC}"
-ngrok http 8501 --log=stdout > /tmp/ngrok.log 2>&1 &
+echo -e "${GREEN}Starting ngrok tunnel on port ${STREAMLIT_PORT}...${NC}"
+ngrok http "$STREAMLIT_PORT" --log=stdout > /tmp/ngrok.log 2>&1 &
 NGROK_PID=$!
 
 # Wait for ngrok to start
@@ -86,21 +127,33 @@ echo ""
 
 # Start streamlit
 echo -e "${GREEN}Starting Streamlit...${NC}"
-export STREAMLIT_SERVER_PORT=8501
+export STREAMLIT_SERVER_PORT="$STREAMLIT_PORT"
 export STREAMLIT_SERVER_HEADLESS=true
 
 cd "$(dirname "$0")/POC/streamlit"
-streamlit run app.py --server.port 8501 --server.headless true &
+"$STREAMLIT_CMD" run app.py --server.port "$STREAMLIT_PORT" --server.headless true > /tmp/streamlit.log 2>&1 &
+STREAMLIT_PID=$!
 
-# Wait for streamlit to start
-sleep 3
+# Wait for streamlit to start and fail fast on startup errors
+for i in {1..20}; do
+    if lsof -nP -iTCP:"$STREAMLIT_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+        break
+    fi
+    if ! kill -0 "$STREAMLIT_PID" 2>/dev/null; then
+        echo -e "${RED}Streamlit failed to start. Last logs:${NC}"
+        tail -n 120 /tmp/streamlit.log || true
+        kill "$NGROK_PID" 2>/dev/null || true
+        exit 1
+    fi
+    sleep 1
+done
 
 echo ""
 echo -e "${YELLOW}========================================${NC}"
 echo -e "${YELLOW}  📱 Access URLs:${NC}"
 echo -e "${YELLOW}========================================${NC}"
 echo ""
-echo -e "  Local:   ${GREEN}http://localhost:8501${NC}"
+echo -e "  Local:   ${GREEN}http://localhost:${STREAMLIT_PORT}${NC}"
 echo ""
 
 # Try to get ngrok URL
@@ -133,7 +186,7 @@ echo -e "${YELLOW}Press Ctrl+C to stop all services${NC}"
 echo ""
 
 # Keep script running
-trap "echo 'Stopping services...'; kill $NGROK_PID 2>/dev/null; pkill -f 'streamlit run'; docker-compose down 2>/dev/null; exit" INT TERM
+trap "echo 'Stopping services...'; kill $NGROK_PID 2>/dev/null; kill $STREAMLIT_PID 2>/dev/null; docker compose down 2>/dev/null; exit" INT TERM
 
-# Wait for ngrok
-wait $NGROK_PID
+# Wait for streamlit process (and keep ngrok alive)
+wait "$STREAMLIT_PID"

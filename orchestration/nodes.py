@@ -42,6 +42,54 @@ logger = logging.getLogger(__name__)
 _MAX_REACT_ITERATIONS = 3  # safety cap (legacy sequential path only)
 
 
+def _build_local_fallback_summary(
+    user_query: str,
+    tickers: List[str],
+    ba_outputs: List[Dict[str, Any]],
+    quant_outputs: List[Dict[str, Any]],
+    web_outputs: List[Dict[str, Any]],
+    fm_outputs: List[Dict[str, Any]],
+    sr_outputs: List[Dict[str, Any]],
+    macro_outputs: List[Dict[str, Any]],
+    insider_news_outputs: List[Dict[str, Any]],
+    errors: Dict[str, Any],
+) -> str:
+    """Build a deterministic markdown fallback when LLM summarisation fails."""
+    tks = ", ".join(tickers) if tickers else "N/A"
+    lines: List[str] = [
+        "## Executive Summary",
+        "",
+        "The pipeline completed, but the LLM summariser is temporarily unavailable.",
+        f"Query: {user_query}",
+        f"Tickers: {tks}",
+        "",
+        "## Agent Execution Status",
+        "",
+        f"- Business Analyst outputs: {len(ba_outputs)}",
+        f"- Quant Fundamental outputs: {len(quant_outputs)}",
+        f"- Financial Modelling outputs: {len(fm_outputs)}",
+        f"- Web Search outputs: {len(web_outputs)}",
+        f"- Stock Research outputs: {len(sr_outputs)}",
+        f"- Macro outputs: {len(macro_outputs)}",
+        f"- Insider & News outputs: {len(insider_news_outputs)}",
+    ]
+
+    if errors:
+        lines.extend(["", "## Errors", ""])
+        for agent, err in errors.items():
+            lines.append(f"- {agent}: {err}")
+
+    lines.extend(
+        [
+            "",
+            "## Next Step",
+            "",
+            "Set a valid `DEEPSEEK_API_KEY` in the UI sidebar, then rerun to generate the full narrative report.",
+        ]
+    )
+    return "\n".join(lines)
+
+
 # ── Per-session agent progress queues ────────────────────────────────────────
 # The Streamlit UI subscribes to a session's queue before the graph runs.
 # node_parallel_agents pushes AgentProgressEvent dicts as each agent
@@ -260,7 +308,7 @@ def node_planner(state: OrchestrationState) -> OrchestrationState:
                     f"Ticker: {w.get('ticker', 'N/A')} | "
                     f"Score: {float(w.get('overall_score') or 0):.1f}/10 | "
                     f"Blamed: {w.get('agent_blamed', 'unknown')} | "
-                    f"Weaknesses: {'; '.join(str(x) for x in weaknesses[:2])}"
+                    f"Weaknesses: {'; '.join(str(x) for x in weaknesses[:2]) or 'N/A'}"
                     f"{human_signal}"
                 )
             lines.append(
@@ -314,6 +362,37 @@ def node_planner(state: OrchestrationState) -> OrchestrationState:
     run_qf = bool(plan.get("run_quant_fundamental", True))
     run_ws = bool(plan.get("run_web_search", False))
     run_fm = bool(plan.get("run_financial_modelling", False))
+    run_sr = bool(plan.get("run_stock_research", False))
+    run_macro = bool(plan.get("run_macro", False))
+    run_insider = bool(plan.get("run_insider_news", False))
+
+    # Robust keyword fallback when planner LLM is unavailable.
+    ql = user_query.lower()
+    _comprehensive_kw = (
+        "fundamental analysis", "full analysis", "complete analysis",
+        "full fundamental analysis", "complete fundamental analysis",
+        "funamanetal analysis", "fundamanetal analysis", "fundemental analysis",
+        "comprehensive analysis", "deep dive", "deep-dive", "full report", "complete report",
+    )
+    _needs_macro_kw = (
+        "macro", "marco", "macroeconomic", "market environment", "fed", "federal reserve",
+        "interest rate", "inflation", "gdp", "economic outlook", "economy",
+    )
+    _needs_news_kw = (
+        "news", "latest", "breaking", "insider", "headlines", "sentiment",
+    )
+    _is_comprehensive = any(kw in ql for kw in _comprehensive_kw)
+    _needs_macro = any(kw in ql for kw in _needs_macro_kw)
+    _needs_news = any(kw in ql for kw in _needs_news_kw)
+
+    if _is_comprehensive:
+        run_fm = True
+        run_sr = True
+    if _needs_macro or _is_comprehensive:
+        run_macro = True
+    if _needs_news or _is_comprehensive:
+        run_ws = True
+        run_insider = True
 
     # ReAct looping disabled by design: run each agent node once.
     raw_complexity = plan.get("complexity", 1)
@@ -368,9 +447,9 @@ def node_planner(state: OrchestrationState) -> OrchestrationState:
         "run_quant_fundamental": run_qf,
         "run_web_search": run_ws,
         "run_financial_modelling": run_fm,
-        "run_stock_research": bool(plan.get("run_stock_research", False)),
-        "run_macro": bool(plan.get("run_macro", False)),
-        "run_insider_news": bool(plan.get("run_insider_news", False)),
+        "run_stock_research": run_sr,
+        "run_macro": run_macro,
+        "run_insider_news": run_insider,
         "data_availability": data_availability,
         "episodic_hints": episodic_hints,
         "planner_trace": planner_trace,
@@ -408,7 +487,7 @@ def node_business_analyst(state: OrchestrationState) -> OrchestrationState:
 
     # Fall back to legacy single ticker if list is empty
     if not tickers and state.get("ticker"):
-        tickers = [state["ticker"]]  # type: ignore[list-item]
+        tickers = [state.get("ticker")]  # type: ignore[list-item]
 
     session_id: str = state.get("session_id", "") or ""  # type: ignore[assignment]
     run_id: str = session_id or str(uuid.uuid4())[:8]
@@ -497,7 +576,7 @@ def node_quant_fundamental(state: OrchestrationState) -> OrchestrationState:
 
     # Fall back to legacy single ticker if list is empty
     if not tickers and state.get("ticker"):
-        tickers = [state["ticker"]]  # type: ignore[list-item]
+        tickers = [state.get("ticker")]  # type: ignore[list-item]
 
     session_id: str = state.get("session_id", "") or ""  # type: ignore[assignment]
     run_id: str = session_id or str(uuid.uuid4())[:8]
@@ -594,7 +673,7 @@ def node_web_search(state: OrchestrationState) -> OrchestrationState:
 
     # Fall back to legacy single ticker if list is empty
     if not tickers and state.get("ticker"):
-        tickers = [state["ticker"]]  # type: ignore[list-item]
+        tickers = [state.get("ticker")]  # type: ignore[list-item]
     # If still no tickers, do a single query-only search
     if not tickers:
         tickers = [None]  # type: ignore[list-item]
@@ -673,7 +752,7 @@ def node_financial_modelling(state: OrchestrationState) -> OrchestrationState:
 
     # Fall back to legacy single ticker if list is empty
     if not tickers and state.get("ticker"):
-        tickers = [state["ticker"]]  # type: ignore[list-item]
+        tickers = [state.get("ticker")]  # type: ignore[list-item]
 
     session_id: str = state.get("session_id", "") or ""  # type: ignore[assignment]
     run_id: str = session_id or str(uuid.uuid4())[:8]
@@ -746,7 +825,7 @@ def node_stock_research(state: OrchestrationState) -> OrchestrationState:
     outputs: List[Dict[str, Any]] = []
 
     if not tickers and state.get("ticker"):
-        tickers = [state["ticker"]]  # type: ignore[list-item]
+        tickers = [state.get("ticker")]  # type: ignore[list-item]
 
     session_id: str = state.get("session_id", "") or ""  # type: ignore[assignment]
     run_id: str = session_id or str(uuid.uuid4())[:8]
@@ -981,7 +1060,7 @@ def node_summarizer(state: OrchestrationState) -> OrchestrationState:
     sr_outputs: List[Dict[str, Any]]    = list(state.get("stock_research_outputs") or [])
     macro_outputs: List[Dict[str, Any]] = list(state.get("macro_outputs") or [])
     insider_news_outputs: List[Dict[str, Any]] = list(state.get("insider_news_outputs") or [])
-    errors        = state.get("agent_errors") or {}
+    errors        = dict(state.get("agent_errors") or {})
 
     data_availability = state.get("data_availability")
 
@@ -1018,24 +1097,41 @@ def node_summarizer(state: OrchestrationState) -> OrchestrationState:
                        "check agent_errors for crash details.")
 
     summarizer_trace_out: List[str] = []
-    final_summary = summarise_results_structured(
-        user_query=user_query,
-        tickers=tickers,
-        ba_outputs=ba_outputs,
-        quant_outputs=quant_outputs,
-        web_outputs=web_outputs,
-        fm_outputs=fm_outputs,
-        sr_outputs=sr_outputs,
-        macro_outputs=macro_outputs,
-        insider_news_outputs=insider_news_outputs,
-        data_availability=data_availability,
-        output_language=output_language,
-        _trace_out=summarizer_trace_out,
-    )
+    try:
+        final_summary = summarise_results_structured(
+            user_query=user_query,
+            tickers=tickers,
+            ba_outputs=ba_outputs,
+            quant_outputs=quant_outputs,
+            web_outputs=web_outputs,
+            fm_outputs=fm_outputs,
+            sr_outputs=sr_outputs,
+            macro_outputs=macro_outputs,
+            insider_news_outputs=insider_news_outputs,
+            data_availability=data_availability,
+            output_language=output_language,
+            _trace_out=summarizer_trace_out,
+        )
+    except Exception as exc:
+        msg = f"{type(exc).__name__}: {exc}"
+        logger.error("[summarizer] Structured summarisation failed: %s", msg)
+        errors["summarizer"] = msg
+        final_summary = _build_local_fallback_summary(
+            user_query=user_query,
+            tickers=tickers,
+            ba_outputs=ba_outputs,
+            quant_outputs=quant_outputs,
+            web_outputs=web_outputs,
+            fm_outputs=fm_outputs,
+            sr_outputs=sr_outputs,
+            macro_outputs=macro_outputs,
+            insider_news_outputs=insider_news_outputs,
+            errors=errors,
+        )
 
     # Final safeguard: ensure UI-selected output_language is respected even if
     # the structured summarizer path returned untranslated content.
-    if output_language:
+    if output_language and "summarizer" not in errors:
         try:
             from .llm import translate_text  # type: ignore[import]
             final_summary = translate_text(final_summary, str(output_language))
