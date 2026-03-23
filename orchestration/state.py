@@ -49,6 +49,8 @@ class OrchestrationState(TypedDict, total=False):
     run_web_search: bool                    # whether to call web search agent
     run_financial_modelling: bool           # whether to call financial modelling agent
     run_stock_research: bool                # whether to call stock research (PDF broker/transcript) agent
+    run_macro: bool                         # whether to call macro agent
+    run_insider_news: bool                 # whether to call insider news agent
 
     # ── ReAct iteration tracking ─────────────────────────────────────────────
     # react_steps uses operator.add so concurrent agent writes are concatenated
@@ -65,6 +67,8 @@ class OrchestrationState(TypedDict, total=False):
     web_search_outputs: List[Dict[str, Any]]
     financial_modelling_outputs: List[Dict[str, Any]]
     stock_research_outputs: List[Dict[str, Any]]
+    macro_outputs: List[Dict[str, Any]]
+    insider_news_outputs: List[Dict[str, Any]]
 
     # Legacy single-output aliases — set to outputs[0] for backward-compat
     business_analyst_output: Optional[Dict[str, Any]]
@@ -72,6 +76,8 @@ class OrchestrationState(TypedDict, total=False):
     web_search_output: Optional[Dict[str, Any]]
     financial_modelling_output: Optional[Dict[str, Any]]
     stock_research_output: Optional[Dict[str, Any]]
+    macro_output: Optional[Dict[str, Any]]
+    insider_news_output: Optional[Dict[str, Any]]
 
     # ── Data availability snapshot ───────────────────────────────────────────
     # Populated by node_planner once per request; consumed by all agent nodes

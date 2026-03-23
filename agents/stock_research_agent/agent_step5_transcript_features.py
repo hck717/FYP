@@ -30,8 +30,8 @@ from pathlib import Path
 
 from langchain_core.documents import Document
 
-from agent_step1_load import list_stock_files, load_pdf_pages
-from agent_step3_parse_quality import (
+from agents.stock_research_agent.agent_step1_load import list_stock_files, load_pdf_pages
+from agents.stock_research_agent.agent_step3_parse_quality import (
     flag_quality_issues, tag_transcript_sections, filter_usable,
     _normalize_spaced_text,
 )
@@ -248,7 +248,7 @@ def compare_kpi_coverage(latest_features: dict, prev_features: dict) -> dict:
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    from agent_step3_parse_quality import tag_broker_sections
+    from agents.stock_research_agent.agent_step3_parse_quality import tag_broker_sections
 
     print(f"=== Steps 1-3: Load + quality + section tag for {TICKER} ===\n")
     broker_pdfs, transcript_pdfs = list_stock_files(BASE_DIR, TICKER)

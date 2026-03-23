@@ -79,8 +79,8 @@ PG_PASSWORD = os.getenv("POSTGRES_PASSWORD", "airflow")
 OLLAMA_BASE_URL    = os.getenv("OLLAMA_BASE_URL",    "http://localhost:11434")
 OLLAMA_EMBED_MODEL = os.getenv("EMBEDDING_MODEL",   "nomic-embed-text")
 
-from agent_step1_load import list_stock_files, load_pdf_pages
-from agent_step3_parse_quality import (
+from agents.stock_research_agent.agent_step1_load import list_stock_files, load_pdf_pages
+from agents.stock_research_agent.agent_step3_parse_quality import (
     flag_quality_issues, tag_transcript_sections,
     tag_broker_sections, filter_usable,
     _normalize_spaced_text,

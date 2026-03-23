@@ -32,19 +32,19 @@ from langchain_openai import ChatOpenAI
 from langchain_core.documents import Document
 from pydantic import SecretStr
 
-from agent_step1_load import list_stock_files, load_pdf_pages
-from agent_step3_parse_quality import (
+from agents.stock_research_agent.agent_step1_load import list_stock_files, load_pdf_pages
+from agents.stock_research_agent.agent_step3_parse_quality import (
     flag_quality_issues, tag_transcript_sections,
     tag_broker_sections, filter_usable,
 )
-from agent_step4_broker_labels import extract_all_broker_labels
-from agent_step4b_broker_parse import (
+from agents.stock_research_agent.agent_step4_broker_labels import extract_all_broker_labels
+from agents.stock_research_agent.agent_step4b_broker_parse import (
     parse_all_broker_docs, format_broker_summary_for_llm,
 )
-from agent_step5_transcript_features import (
+from agents.stock_research_agent.agent_step5_transcript_features import (
     extract_transcript_features, compare_kpi_coverage,
 )
-from agent_step6_embeddings import (
+from agents.stock_research_agent.agent_step6_embeddings import (
     chunk_documents, build_index, build_index_neo4j, retrieve, retrieve_broker_evidence,
     format_evidence_pack, TOP_K,
 )

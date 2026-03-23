@@ -36,8 +36,8 @@ from pathlib import Path
 
 from langchain_core.documents import Document
 
-from agent_step1_load import list_stock_files, load_pdf_pages, parse_log
-from agent_step3_parse_quality import flag_quality_issues, filter_usable
+from agents.stock_research_agent.agent_step1_load import list_stock_files, load_pdf_pages, parse_log
+from agents.stock_research_agent.agent_step3_parse_quality import flag_quality_issues, filter_usable
 
 # ── Config ────────────────────────────────────────────────────────────────────
 TICKER   = "AAPL"

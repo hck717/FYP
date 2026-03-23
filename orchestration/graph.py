@@ -63,6 +63,8 @@ from langgraph.graph import END, StateGraph
 from .nodes import (
     node_business_analyst,
     node_financial_modelling,
+    node_insider_news,
+    node_macro,
     node_planner,
     node_post_processing,
     node_quant_fundamental,
@@ -140,6 +142,30 @@ def _route_after_sr(state: OrchestrationState) -> str:
     return "summarizer"
 
 
+def _route_after_macro(state: OrchestrationState) -> str:
+    """Route after macro: retry if no output and under iteration cap."""
+    if not state.get("run_macro"):
+        return "summarizer"
+    iters = (state.get("agent_react_iterations") or {}).get("macro", 0)
+    react_max = state.get("react_max_iterations") or 1
+    if not state.get("macro_outputs") and iters < react_max:
+        logger.info("[route] macro retry (iter=%d/%d)", iters, react_max)
+        return "node_macro"
+    return "summarizer"
+
+
+def _route_after_insider_news(state: OrchestrationState) -> str:
+    """Route after insider_news: retry if no output and under iteration cap."""
+    if not state.get("run_insider_news"):
+        return "summarizer"
+    iters = (state.get("agent_react_iterations") or {}).get("insider_news", 0)
+    react_max = state.get("react_max_iterations") or 1
+    if not state.get("insider_news_outputs") and iters < react_max:
+        logger.info("[route] insider_news retry (iter=%d/%d)", iters, react_max)
+        return "node_insider_news"
+    return "summarizer"
+
+
 # ── Planner fan-out routing ────────────────────────────────────────────────────
 
 def _route_after_planner(state: OrchestrationState) -> list[str]:
@@ -160,6 +186,10 @@ def _route_after_planner(state: OrchestrationState) -> list[str]:
         targets.append("node_financial_modelling")
     if state.get("run_stock_research"):
         targets.append("node_stock_research")
+    if state.get("run_macro"):
+        targets.append("node_macro")
+    if state.get("run_insider_news"):
+        targets.append("node_insider_news")
     # Fallback: if planner disabled everything, route to BA anyway
     if not targets:
         targets.append("node_business_analyst")
@@ -191,6 +221,8 @@ def build_graph() -> Any:
     graph.add_node("node_stock_research",    node_stock_research)
     graph.add_node("summarizer",             node_summarizer)
     graph.add_node("post_processing",        node_post_processing)
+    graph.add_node("node_macro",             node_macro)
+    graph.add_node("node_insider_news",     node_insider_news)
 
     # Entry point
     graph.set_entry_point("planner")
@@ -205,6 +237,8 @@ def build_graph() -> Any:
             "node_web_search":         "node_web_search",
             "node_financial_modelling":"node_financial_modelling",
             "node_stock_research":     "node_stock_research",
+            "node_macro":              "node_macro",
+            "node_insider_news":      "node_insider_news",
         },
     )
 
@@ -233,6 +267,16 @@ def build_graph() -> Any:
         "node_stock_research",
         _route_after_sr,
         {"node_stock_research": "node_stock_research", "summarizer": "summarizer"},
+    )
+    graph.add_conditional_edges(
+        "node_macro",
+        _route_after_macro,
+        {"node_macro": "node_macro", "summarizer": "summarizer"},
+    )
+    graph.add_conditional_edges(
+        "node_insider_news",
+        _route_after_insider_news,
+        {"node_insider_news": "node_insider_news", "summarizer": "summarizer"},
     )
 
     # Fan-in: LangGraph waits for all branches before proceeding to summarizer

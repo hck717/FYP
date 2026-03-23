@@ -38,12 +38,12 @@ from pathlib import Path
 
 from langchain_core.documents import Document
 
-from agent_step1_load import list_stock_files, load_pdf_pages
-from agent_step3_parse_quality import (
+from agents.stock_research_agent.agent_step1_load import list_stock_files, load_pdf_pages
+from agents.stock_research_agent.agent_step3_parse_quality import (
     flag_quality_issues, tag_broker_sections, filter_usable,
     _normalize_spaced_text,
 )
-from agent_step4_broker_labels import extract_all_broker_labels
+from agents.stock_research_agent.agent_step4_broker_labels import extract_all_broker_labels
 
 # ── Config ────────────────────────────────────────────────────────────────────
 TICKER   = "AAPL"
@@ -305,7 +305,7 @@ if __name__ == "__main__":
     usable_broker = filter_usable(broker_pages_raw)
 
     print(f"\n=== Step 4: Broker labels ===\n")
-    from agent_step4_broker_labels import extract_all_broker_labels
+    from agents.stock_research_agent.agent_step4_broker_labels import extract_all_broker_labels
     # Labels use ALL pages (before disclaimer filter) to maximise keyword hits
     # but pass ALL broker pages (raw) for label extraction
     all_broker_nondisclaimer = [p for p in broker_pages_raw

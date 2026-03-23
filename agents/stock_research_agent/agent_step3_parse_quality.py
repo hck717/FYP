@@ -25,7 +25,7 @@ from pathlib import Path
 from langchain_core.documents import Document
 
 # Import Step 1/2 helpers
-from agent_step1_load import list_stock_files, load_pdf_pages, parse_log
+from agents.stock_research_agent.agent_step1_load import list_stock_files, load_pdf_pages, parse_log
 
 # ── Config ────────────────────────────────────────────────────────────────────
 TICKER   = "AAPL"   # change to GOOGL, MSFT, NVDA, TSLA

@@ -57,17 +57,13 @@ from __future__ import annotations
 
 import logging
 import os
-import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
-# ── Ensure step modules are importable ───────────────────────────────────────
-# All step files now live in this same directory (stock_research_agent/).
+# ── Agent directory ──────────────────────────────────────────────────────────
 _AGENT_DIR = Path(__file__).resolve().parent
-if str(_AGENT_DIR) not in sys.path:
-    sys.path.insert(0, str(_AGENT_DIR))
 
 # ── Data directory (PDF fallback) ─────────────────────────────────────────────
 _DEFAULT_DATA_DIR = _AGENT_DIR / "data_reports"
@@ -162,8 +158,9 @@ def run_full_analysis(
 
     logger.info("[stock_research] Starting full analysis for ticker=%s", ticker)
 
-    # Import here (not at module level) so the import resolves after sys.path setup
-    from agent_step7_synthesis import run_full_analysis as _run  # type: ignore[import]
+    # Import here (not at module level) to avoid startup cost.
+    # Use package-qualified imports to prevent cross-agent module collisions.
+    from agents.stock_research_agent.agent_step7_synthesis import run_full_analysis as _run  # type: ignore[import]
 
     # Initialise to satisfy static analysis — will be set in one of the branches below
     raw: Dict[str, Any] = {}
@@ -175,7 +172,7 @@ def run_full_analysis(
     if use_neo4j:
         logger.info("[stock_research] PostgreSQL/pgvector data found for ticker=%s — using PG mode", ticker)
         try:
-            from agent_step1_neo4j import load_neo4j_pages  # type: ignore[import]
+            from agents.stock_research_agent.agent_step1_neo4j import load_neo4j_pages  # type: ignore[import]
             transcript_pages, broker_pages, latest_name, previous_name = load_neo4j_pages(ticker)
 
             raw: Dict[str, Any] = _run(

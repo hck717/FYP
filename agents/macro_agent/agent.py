@@ -59,16 +59,13 @@ from __future__ import annotations
 
 import logging
 import os
-import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
-# ── Ensure step modules are importable ───────────────────────────────────────
+# ── Agent directory ──────────────────────────────────────────────────────────
 _AGENT_DIR = Path(__file__).resolve().parent
-if str(_AGENT_DIR) not in sys.path:
-    sys.path.insert(0, str(_AGENT_DIR))
 
 # ── Load .env for local Streamlit/CLI runs ───────────────────────────────────
 _REPO_ROOT = _AGENT_DIR.parents[1]
@@ -143,8 +140,9 @@ def run_full_analysis(
 
     logger.info("[macro] Starting full analysis for ticker=%s", ticker)
 
-    # Import here (not at module level) so the import resolves after sys.path setup
-    from agent_step7_synthesis import run_full_analysis as _run  # type: ignore[import]
+    # Import here (not at module level) to avoid startup cost.
+    # Use package-qualified imports to prevent cross-agent module collisions.
+    from agents.macro_agent.agent_step7_synthesis import run_full_analysis as _run  # type: ignore[import]
 
     # Initialise to satisfy static analysis — will be set below
     raw: Dict[str, Any] = {}
@@ -156,7 +154,7 @@ def run_full_analysis(
     if has_macro_data:
         logger.info("[macro] PostgreSQL/Neo4j macro data found — using DB mode")
         try:
-            from agent_step1_neo4j import load_macro_and_earnings  # type: ignore[import]
+            from agents.macro_agent.agent_step1_neo4j import load_macro_and_earnings  # type: ignore[import]
             macro_pages, earnings_pages, macro_doc_names = load_macro_and_earnings(ticker)
 
             raw = _run(

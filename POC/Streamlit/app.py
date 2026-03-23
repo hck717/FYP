@@ -94,24 +94,94 @@ NODE_LABELS = {
 st.markdown(
     """
     <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;600&display=swap');
+
+    :root {
+        --ui-font: 'Inter', system-ui, -apple-system, 'Segoe UI', sans-serif;
+        --num-font: 'JetBrains Mono', 'SF Mono', Monaco, monospace;
+        --text-main: #e6eaf0;
+        --text-muted: #a8b3c2;
+        --line-subtle: rgba(230, 234, 240, 0.14);
+    }
+
+    html, body, [class*="css"], .stMarkdown, .stText, .stCaption {
+        font-family: var(--ui-font);
+        color: var(--text-main);
+        -webkit-font-smoothing: antialiased;
+        -moz-osx-font-smoothing: grayscale;
+        font-feature-settings: "liga" 1, "kern" 1;
+    }
+
+    .block-container {
+        max-width: 100% !important;
+        padding-top: 1.5rem;
+        padding-bottom: 2.5rem;
+        padding-left: 2rem;
+        padding-right: 2rem;
+    }
+
+    h1, h2, h3 {
+        font-family: var(--ui-font);
+        letter-spacing: -0.02em;
+        line-height: 1.15;
+        font-weight: 700;
+    }
+
+    h1 { font-size: 2.35rem; }
+    h2 { font-size: 1.75rem; }
+    h3 { font-size: 1.25rem; }
+
+    p, li, .stMarkdown p {
+        font-size: 1.02rem;
+        line-height: 1.75;
+        color: var(--text-main);
+    }
+
+    .report-wrap {
+        max-width: 920px;
+        margin: 0 auto;
+    }
+
+    .report-wrap p, .report-wrap li {
+        max-width: 78ch;
+    }
+
+    .stCaption, small, .metric-label {
+        font-size: 0.9rem;
+        color: var(--text-muted);
+    }
+
+    .stMetricValue, .metric-value {
+        font-family: var(--num-font);
+        letter-spacing: -0.01em;
+    }
+
+    hr {
+        border: none;
+        border-top: 1px solid var(--line-subtle);
+        margin: 1.5rem 0;
+    }
+
     .agent-card { border: 1px solid #2d2d2d; border-radius: 8px; padding: 1rem; margin-bottom: 1rem; }
     .status-ok   { color: #22c55e; font-weight: 600; }
     .status-warn { color: #f59e0b; font-weight: 600; }
     .status-err  { color: #ef4444; font-weight: 600; }
     .metric-label { font-size: 0.75rem; color: #9ca3af; text-transform: uppercase; letter-spacing: 0.05em; }
     .metric-value { font-size: 1.1rem; font-weight: 600; }
-    
-    /* Fix for text rendering issues */
-    .stMarkdown {
-        font-feature-settings: "liga" 1, "kern" 1;
-        -webkit-font-smoothing: antialiased;
-        -moz-osx-font-smoothing: grayscale;
+
+    /* Inline code in markdown should not look like bright green chips */
+    .stMarkdown code {
+        color: inherit !important;
+        background: rgba(255, 255, 255, 0.05) !important;
+        border-radius: 4px !important;
+        padding: 0.05rem 0.2rem !important;
+        font-family: var(--ui-font) !important;
+        font-size: 0.95em !important;
     }
-    
-    /* Better font for code/technical content */
-    code {
-        font-family: 'JetBrains Mono', 'Fira Code', 'SF Mono', Monaco, monospace;
-        font-size: 0.85em;
+
+    /* Keep code blocks readable/monospace */
+    pre code, .stCodeBlock code {
+        font-family: var(--num-font) !important;
     }
     </style>
     """,
@@ -933,6 +1003,173 @@ def _render_stock_research(output: Dict[str, Any], ticker: str) -> None:
         _render_stock_research_references(output)
 
 
+def _render_macro(output: Dict[str, Any], ticker: str) -> None:
+    """Render Macro agent card (macroeconomic analysis)."""
+    data_source = str(output.get("data_source", "none")).lower()
+    source_badge = "PostgreSQL/Neo4j" if data_source in ("pg", "neo4j") else data_source
+    with st.expander(f"Macro Analysis — {ticker}", expanded=True):
+
+        st.markdown(
+            f"Data source: <span class='status-ok'>{source_badge}</span>",
+            unsafe_allow_html=True,
+        )
+
+        err = output.get("error")
+        if err:
+            st.error(f"Agent error: {err}")
+
+        regime = output.get("regime", "")
+        if regime:
+            st.markdown(f"**Market Regime:** {regime}")
+
+        macro_themes = output.get("macro_themes") or []
+        if macro_themes:
+            st.markdown("**Macro Themes**")
+            for theme in macro_themes:
+                direction = theme.get("direction", "neutral")
+                confidence = theme.get("confidence", 0)
+                st.markdown(
+                    f"- **{theme.get('theme', '')}** — {direction} "
+                    f"(confidence: {confidence:.0%})"
+                )
+
+        per_report_summaries = output.get("per_report_summaries") or []
+        if per_report_summaries:
+            with st.expander("Report Summaries", expanded=False):
+                for report in per_report_summaries:
+                    st.markdown(f"**{report.get('report_name', '')}**")
+                    st.markdown(f"_{report.get('summary', '')}_")
+                    st.caption(f"Stock relevance: {report.get('stock_relevance', '')}")
+
+        top_drivers = output.get("top_macro_drivers") or []
+        if top_drivers:
+            st.markdown(f"**Top Macro Drivers:** {', '.join(top_drivers)}")
+
+        top_risk = output.get("top_risk", "")
+        if top_risk:
+            st.markdown(f"**Top Risk:** {top_risk}")
+
+        risk_scenario = output.get("risk_scenario", "")
+        if risk_scenario:
+            st.markdown(f"**Risk Scenario:** {risk_scenario}")
+
+        citations = output.get("citations") or []
+        if citations:
+            with st.expander(f"Citations ({len(citations)})", expanded=False):
+                for c in citations:
+                    st.caption(c.get("doc_name", ""))
+
+
+def _render_insider_news(output: Dict[str, Any], ticker: str) -> None:
+    """Render Insider News agent card (insider trading + news sentiment)."""
+    data_source = str(output.get("data_source", "pg")).lower()
+    source_badge = "PostgreSQL" if data_source == "pg" else data_source
+    with st.expander(f"Insider & News Analysis — {ticker}", expanded=True):
+
+        st.markdown(
+            f"Data source: <span class='status-ok'>{source_badge}</span>",
+            unsafe_allow_html=True,
+        )
+
+        data_coverage = output.get("data_coverage") or {}
+        insider_count = data_coverage.get("insider_transactions_count", 0)
+        news_count = data_coverage.get("news_articles_count", 0)
+        date_range = data_coverage.get("date_range", "N/A")
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Insider Transactions", insider_count)
+        c2.metric("News Articles", news_count)
+        c3.caption(f"Date Range: {date_range}")
+
+        err = output.get("error")
+        if err:
+            st.error(f"Agent error: {err}")
+
+        insider_analysis = output.get("insider_analysis") or {}
+        if insider_analysis:
+            with st.expander("Insider Activity Analysis", expanded=True):
+                activity = insider_analysis.get("activity_summary", "")
+                if activity:
+                    st.markdown(f"**Summary:** {activity}")
+
+                buy_sell = insider_analysis.get("buy_sell_ratio")
+                if buy_sell:
+                    st.metric("Buy/Sell Ratio", f"{buy_sell:.2f}")
+
+                net_position = insider_analysis.get("net_position", "")
+                if net_position:
+                    st.markdown(f"**Net Position:** {net_position}")
+
+                conviction = insider_analysis.get("conviction", "")
+                if conviction:
+                    st.markdown(f"**Conviction:** {conviction}")
+
+                sentiment = insider_analysis.get("insider_sentiment", "")
+                if sentiment:
+                    st.markdown(f"**Sentiment:** {sentiment}")
+
+                red_flags = insider_analysis.get("red_flags") or []
+                if red_flags:
+                    st.markdown("**Red Flags:**")
+                    for flag in red_flags:
+                        st.markdown(f"- {flag}")
+
+        news_analysis = output.get("news_analysis") or {}
+        if news_analysis:
+            with st.expander("News Sentiment Analysis", expanded=True):
+                sentiment_summary = news_analysis.get("sentiment_summary", "")
+                if sentiment_summary:
+                    st.markdown(f"**Summary:** {sentiment_summary}")
+
+                avg_score = news_analysis.get("avg_sentiment_score")
+                if avg_score is not None:
+                    st.metric("Avg Sentiment Score", f"{avg_score:.2f}")
+
+                sentiment_trend = news_analysis.get("sentiment_trend", "")
+                if sentiment_trend:
+                    st.markdown(f"**Trend:** {sentiment_trend}")
+
+                positive_catalysts = news_analysis.get("positive_catalysts") or []
+                negative_catalysts = news_analysis.get("negative_catalysts") or []
+                if positive_catalysts:
+                    st.markdown("**Positive Catalysts:**")
+                    for cat in positive_catalysts:
+                        st.markdown(f"- {cat}")
+                if negative_catalysts:
+                    st.markdown("**Negative Catalysts:**")
+                    for cat in negative_catalysts:
+                        st.markdown(f"- {cat}")
+
+        investment_thesis = output.get("investment_thesis") or {}
+        if investment_thesis:
+            with st.expander("Investment Thesis", expanded=True):
+                combined = investment_thesis.get("combined_thesis", "")
+                if combined:
+                    st.markdown(combined)
+
+                bull_case = investment_thesis.get("bull_case", "")
+                if bull_case:
+                    st.markdown(f"**Bull Case:** {bull_case}")
+
+                bear_case = investment_thesis.get("bear_case", "")
+                if bear_case:
+                    st.markdown(f"**Bear Case:** {bear_case}")
+
+                recommendation = investment_thesis.get("recommendation", "")
+                if recommendation:
+                    st.markdown(f"**Recommendation:** {recommendation}")
+
+                conviction = investment_thesis.get("conviction", "")
+                if conviction:
+                    st.markdown(f"**Conviction:** {conviction}")
+
+        citations = output.get("citations") or []
+        if citations:
+            with st.expander(f"Citations ({len(citations)})", expanded=False):
+                for c in citations:
+                    st.caption(c.get("doc_name", ""))
+
+
 def _render_visualisations(state: Dict[str, Any]) -> None:
     """Render Plotly charts driven by planner chart_hints + available data.
 
@@ -1262,6 +1499,22 @@ def _render_agent_outputs(state: Dict[str, Any]) -> None:
         t = tickers[i] if i < len(tickers) else out.get("ticker", "?")
         _render_stock_research(out, t)
 
+    # ── Macro ────────────────────────────────────────────────────────────────
+    macro_outputs: List[Dict] = state.get("macro_outputs") or []
+    if not macro_outputs and state.get("macro_output"):
+        macro_outputs = [state["macro_output"]]
+    for i, out in enumerate(macro_outputs):
+        t = tickers[i] if i < len(tickers) else out.get("ticker", "?")
+        _render_macro(out, t)
+
+    # ── Insider News ─────────────────────────────────────────────────────────
+    insider_news_outputs: List[Dict] = state.get("insider_news_outputs") or []
+    if not insider_news_outputs and state.get("insider_news_output"):
+        insider_news_outputs = [state["insider_news_output"]]
+    for i, out in enumerate(insider_news_outputs):
+        t = tickers[i] if i < len(tickers) else out.get("ticker", "?")
+        _render_insider_news(out, t)
+
 
 def _render_plan_info(plan: Optional[Dict[str, Any]], state: Dict[str, Any]) -> None:
     """Show plan metadata in a compact info bar."""
@@ -1432,6 +1685,8 @@ _AGENT_DISPLAY = {
     "financial_modelling":"Financial Modelling",
     "web_search":         "Web Search",
     "stock_research":     "Stock Research",
+    "macro":              "Macro",
+    "insider_news":       "Insider & News",
 }
 
 
@@ -1574,6 +1829,8 @@ def _run_with_streaming(query: str, output_language: Optional[str] = None) -> Op
                             ("run_financial_modelling","Financial Modelling"),
                             ("run_web_search",         "Web Search"),
                             ("run_stock_research",     "Stock Research"),
+                            ("run_macro",              "Macro"),
+                            ("run_insider_news",       "Insider & News"),
                         ]
                         active_agents = [
                             name for key, name in _run_flag_map
@@ -2001,7 +2258,9 @@ def main() -> None:
             if show_raw:
                 st.text(final_summary_clean)
             else:
+                st.markdown('<div class="report-wrap">', unsafe_allow_html=True)
                 st.markdown(final_summary_clean)
+                st.markdown('</div>', unsafe_allow_html=True)
             
             st.download_button(
                 label="Download Research Note (.md)",

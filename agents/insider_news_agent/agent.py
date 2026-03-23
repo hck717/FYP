@@ -69,16 +69,13 @@ from __future__ import annotations
 
 import logging
 import os
-import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
-# ── Ensure step modules are importable ───────────────────────────────────────
+# ── Agent directory ──────────────────────────────────────────────────────────
 _AGENT_DIR = Path(__file__).resolve().parent
-if str(_AGENT_DIR) not in sys.path:
-    sys.path.insert(0, str(_AGENT_DIR))
 
 # ── Load .env for local Streamlit/CLI runs ───────────────────────────────────
 _REPO_ROOT = _AGENT_DIR.parents[1]
@@ -120,14 +117,16 @@ def _pg_has_insider_news_data(ticker: str) -> bool:
             "SELECT COUNT(*) FROM insider_transactions WHERE ticker = %s",
             (ticker,),
         )
-        insider_count = cursor.fetchone()[0]
+        insider_row = cursor.fetchone()
+        insider_count = int(insider_row[0]) if insider_row else 0
 
         # Check if news_articles table exists and has data
         cursor.execute(
             "SELECT COUNT(*) FROM news_articles WHERE ticker = %s",
             (ticker,),
         )
-        news_count = cursor.fetchone()[0]
+        news_row = cursor.fetchone()
+        news_count = int(news_row[0]) if news_row else 0
 
         cursor.close()
         conn.close()
@@ -188,13 +187,13 @@ def run_full_analysis(
 
         # Step 1: Fetch data from PostgreSQL
         logger.info(f"[step1_pg] Fetching insider & news data for {ticker}...")
-        from agent_step1_pg import fetch_insider_and_news_data
+        from agents.insider_news_agent.agent_step1_pg import fetch_insider_and_news_data
 
         insider_docs, news_docs, metadata = fetch_insider_and_news_data(ticker)
 
         # Step 7: Run LLM synthesis
         logger.info(f"[step7_synthesis] Running 3 concurrent LLM tasks...")
-        from agent_step7_synthesis import run_synthesis
+        from agents.insider_news_agent.agent_step7_synthesis import run_synthesis
 
         synthesis_result = run_synthesis(insider_docs, news_docs, ticker)
 

@@ -271,6 +271,22 @@ Output ONLY a valid JSON object with this schema:
   "chart_hints": ["<chart_type1>", "<chart_type2>"]
 }
 
+=== PRIORITY FOR MAX-INSIGHT ANALYSIS ===
+When the user asks for deep research (e.g., complete/full/comprehensive/deep-dive/fundamental analysis),
+you MUST maximize insight coverage by enabling the full analytical stack:
+- run_business_analyst = true
+- run_quant_fundamental = true
+- run_financial_modelling = true
+- run_stock_research = true
+- run_macro = true
+- run_insider_news = true
+- run_web_search = true when recent/current/latest/news is requested or implied by wording.
+
+For these deep-research queries, set complexity=3 and ensure reasoning explicitly states that outputs
+from all enabled agents will be synthesized jointly (not siloed) to produce an integrated thesis.
+
+When in doubt between narrower vs broader coverage on deep-research prompts, choose broader coverage.
+
 === CHART_HINTS RULES ===
 "chart_hints" is an array of zero or more chart type strings selected from the list below.
 Choose ONLY charts that are directly relevant to what the user asked for.
@@ -366,16 +382,27 @@ Default to 2 if uncertain.
   Also enable for "complete analysis", "full analysis", "comprehensive analysis", or "deep dive"
   queries — these benefit from transcript and broker report context.
   Do NOT enable for standard financial ratios, DCF, real-time news, or technical analysis.
+- run_macro: true when the question involves macro-economic analysis, market regime,
+  macroeconomic themes, interest rates, inflation, GDP, Federal Reserve policy,
+  market risk-off/risk-on scenarios, or broad economic trends affecting the ticker.
+  Also enable for "complete analysis", "full analysis", "comprehensive analysis", or "deep dive"
+  queries — these benefit from macro context.
+- run_insider_news: true when the question involves insider trading activity, insider transactions,
+  insider buying/selling, management stock purchases, or news sentiment analysis.
+  Also enable for "complete analysis", "full analysis", "comprehensive analysis", or "deep dive"
+  queries — these benefit from insider and news context.
 
 COMPREHENSIVE QUERY RULE: If the query contains any of: "fundamental analysis",
 "complete analysis", "full analysis", "comprehensive analysis", "deep dive", "full report",
-"complete report" — set ALL FIVE of run_business_analyst, run_quant_fundamental,
-run_financial_modelling, run_stock_research to true. Only keep run_web_search=false unless news is
-explicitly requested.
+"complete report" — set ALL SEVEN of run_business_analyst, run_quant_fundamental,
+run_financial_modelling, run_stock_research, run_macro, run_insider_news to true.
+Set run_web_search=true when the query asks for recent/current/latest/news or implies market-moving events.
 
 Always enable at least one tool. If the question is ambiguous, enable both
 business_analyst and quant_fundamental.
-For "complete", "full", "comprehensive", or "fundamental analysis" queries, enable ALL FIVE agents.
+For "complete", "full", "comprehensive", or "fundamental analysis" queries, enable ALL core agents
+(business_analyst, quant_fundamental, financial_modelling, stock_research, macro, insider_news), and
+enable web_search whenever the query mentions or implies recent/current news context.
 """
 
 
@@ -720,6 +747,26 @@ def plan_query(
     if cached is not None:
         logger.info("[planner] Semantic router cache hit (similarity>%.2f) — skipping LLM.",
                     SEMANTIC_ROUTER_THRESHOLD)
+        _q = user_query.lower()
+        _cached_needs_macro = any(kw in _q for kw in [
+            "macro", "macroeconomic", "market environment", "fed", "federal reserve",
+            "interest rate", "inflation", "gdp", "economic outlook", "economy",
+            "risk-off", "risk-on", "market regime", "trade war", "tariff",
+        ])
+        _cached_needs_insider_news = any(kw in _q for kw in [
+            "news", "insider", "insider trading", "insider transaction",
+            "management bought", "management sold", "ceo bought", "director bought",
+            "recent news", "latest news", "breaking news", "sentiment",
+        ])
+        _cached_is_comprehensive = any(kw in _q for kw in [
+            "fundamental analysis", "full analysis", "complete analysis",
+            "comprehensive analysis", "deep dive", "deep-dive",
+        ])
+        cached["run_macro"] = bool(cached.get("run_macro", False) or _cached_needs_macro or _cached_is_comprehensive)
+        cached["run_insider_news"] = bool(cached.get("run_insider_news", False) or _cached_needs_insider_news or _cached_is_comprehensive)
+        cached["run_web_search"] = bool(cached.get("run_web_search", False) or _cached_needs_insider_news)
+        cached.setdefault("run_stock_research", _cached_is_comprehensive)
+        cached.setdefault("run_financial_modelling", _cached_is_comprehensive)
         cached.setdefault("planner_trace", "")
         return cached
 
@@ -762,6 +809,18 @@ def plan_query(
         "technical analysis", "rsi", "macd", "overvalued", "undervalued",
         "price target", "financial modelling", "financial modeling",
     ])
+    
+    # Keyword detection for new agents
+    _needs_macro = any(kw in _query_lower for kw in [
+        "macro", "macroeconomic", "market environment", "fed", "federal reserve",
+        "interest rate", "inflation", "gdp", "economic outlook", "economy",
+        "risk-off", "risk-on", "market regime", "trade war", "tariff",
+    ])
+    _needs_insider_news = any(kw in _query_lower for kw in [
+        "news", "insider", "insider trading", "insider transaction",
+        "management bought", "management sold", "ceo bought", "director bought",
+        "recent news", "latest news", "breaking news", "sentiment",
+    ])
 
     # Keyword-based complexity baseline (used when LLM doesn't return a valid value)
     _complexity_keywords_3 = [
@@ -791,9 +850,16 @@ def plan_query(
         plan = _extract_json(raw)
         plan.setdefault("run_business_analyst", True)
         plan.setdefault("run_quant_fundamental", True)
-        plan.setdefault("run_web_search", False)
-        # Default run_financial_modelling to True for comprehensive/valuation queries
+        plan.setdefault("run_web_search", _needs_insider_news)
         plan.setdefault("run_financial_modelling", _is_comprehensive)
+        plan.setdefault("run_stock_research", _is_comprehensive)
+        plan.setdefault("run_macro", _needs_macro or _is_comprehensive)
+        plan.setdefault("run_insider_news", _needs_insider_news or _is_comprehensive)
+        plan["run_web_search"] = bool(plan.get("run_web_search", False) or _needs_insider_news)
+        plan["run_financial_modelling"] = bool(plan.get("run_financial_modelling", False) or _is_comprehensive)
+        plan["run_stock_research"] = bool(plan.get("run_stock_research", False) or _is_comprehensive)
+        plan["run_macro"] = bool(plan.get("run_macro", False) or _needs_macro or _is_comprehensive)
+        plan["run_insider_news"] = bool(plan.get("run_insider_news", False) or _needs_insider_news or _is_comprehensive)
         plan.setdefault("ticker", None)
         plan.setdefault("tickers", [])
         # Sanitise complexity: must be 1, 2, or 3; fall back to keyword-derived default
@@ -827,8 +893,11 @@ def plan_query(
             "intent": user_query,
             "run_business_analyst": True,
             "run_quant_fundamental": True,
-            "run_web_search": False,
+            "run_web_search": _needs_insider_news,
             "run_financial_modelling": _is_comprehensive,
+            "run_stock_research": _is_comprehensive,
+            "run_macro": _needs_macro or _is_comprehensive,
+            "run_insider_news": _needs_insider_news or _is_comprehensive,
             "complexity": _default_complexity,
             "reasoning": "Fallback: planner LLM unavailable, running core agents.",
             "planner_trace": "",
@@ -2112,16 +2181,125 @@ def _build_stock_research_context(sr_output: Dict[str, Any]) -> List[str]:
     # ── Error / empty guard ───────────────────────────────────────────────────
     if sr_output.get("error"):
         parts.append(f"Pipeline error: {sr_output['error']}")
+    return parts
+
+
+def _build_macro_context(macro_output: Dict[str, Any]) -> List[str]:
+    """Format macro-agent output into readable lines for the summarizer prompt."""
+    ticker = macro_output.get("ticker", "?")
+    parts: List[str] = [f"=== MACRO ANALYSIS OUTPUT: {ticker} ==="]
+    parts.append(
+        "NOTE: This section is generated by the Macro agent analyzing macroeconomic reports "
+        "and linking them to the target ticker. Includes market regime, macro themes, and risks."
+    )
+
+    if macro_output.get("error"):
+        parts.append(f"Pipeline error: {macro_output['error']}")
         return parts
 
-    # ── Transcript metadata ───────────────────────────────────────────────────
-    latest_t   = sr_output.get("latest_transcript", "")
-    previous_t = sr_output.get("previous_transcript", "")
-    if latest_t or previous_t:
-        parts.append(f"Latest transcript: {latest_t} | Previous transcript: {previous_t}")
+    regime = macro_output.get("regime", "")
+    if regime:
+        parts.append(f"Market Regime: {regime}")
 
-    # ── Deterministic NLP features ────────────────────────────────────────────
-    features = sr_output.get("features") or {}
+    macro_themes = macro_output.get("macro_themes") or []
+    if macro_themes:
+        parts.append("Macro Themes:")
+        for theme in macro_themes[:5]:
+            direction = theme.get("direction", "neutral")
+            confidence = theme.get("confidence", 0)
+            parts.append(
+                f"  - {theme.get('theme', '')}: {direction} "
+                f"(confidence: {confidence:.0%})"
+            )
+
+    per_report = macro_output.get("per_report_summaries") or []
+    if per_report:
+        parts.append("Report Summaries:")
+        for report in per_report[:3]:
+            parts.append(f"  - {report.get('report_name', '')}: {report.get('summary', '')[:200]}")
+
+    top_drivers = macro_output.get("top_macro_drivers") or []
+    if top_drivers:
+        parts.append(f"Top Macro Drivers: {', '.join(top_drivers)}")
+
+    top_risk = macro_output.get("top_risk", "")
+    if top_risk:
+        parts.append(f"Top Risk: {top_risk}")
+
+    risk_scenario = macro_output.get("risk_scenario", "")
+    if risk_scenario:
+        parts.append(f"Risk Scenario: {risk_scenario}")
+
+    return parts
+
+
+def _build_insider_news_context(insider_output: Dict[str, Any]) -> List[str]:
+    """Format insider_news-agent output into readable lines for the summarizer prompt."""
+    ticker = insider_output.get("ticker", "?")
+    parts: List[str] = [f"=== INSIDER & NEWS ANALYSIS OUTPUT: {ticker} ==="]
+    parts.append(
+        "NOTE: This section is generated by the Insider News agent analyzing insider trading "
+        "transactions and news sentiment. Includes activity summary, buy/sell ratios, and sentiment."
+    )
+
+    if insider_output.get("error"):
+        parts.append(f"Pipeline error: {insider_output['error']}")
+        return parts
+
+    data_coverage = insider_output.get("data_coverage") or {}
+    insider_count = data_coverage.get("insider_transactions_count", 0)
+    news_count = data_coverage.get("news_articles_count", 0)
+    if insider_count or news_count:
+        parts.append(f"Data coverage: {insider_count} insider transactions, {news_count} news articles")
+
+    insider_analysis = insider_output.get("insider_analysis") or {}
+    if insider_analysis:
+        activity = insider_analysis.get("activity_summary", "")
+        if activity:
+            parts.append(f"Insider Activity: {activity}")
+
+        buy_sell = insider_analysis.get("buy_sell_ratio")
+        if buy_sell:
+            parts.append(f"Buy/Sell Ratio: {buy_sell:.2f}")
+
+        net_position = insider_analysis.get("net_position", "")
+        if net_position:
+            parts.append(f"Net Position: {net_position}")
+
+        sentiment = insider_analysis.get("insider_sentiment", "")
+        if sentiment:
+            parts.append(f"Insider Sentiment: {sentiment}")
+
+        red_flags = insider_analysis.get("red_flags") or []
+        if red_flags:
+            parts.append(f"Red Flags: {', '.join(red_flags)}")
+
+    news_analysis = insider_output.get("news_analysis") or {}
+    if news_analysis:
+        sentiment_summary = news_analysis.get("sentiment_summary", "")
+        if sentiment_summary:
+            parts.append(f"News Sentiment: {sentiment_summary}")
+
+        avg_score = news_analysis.get("avg_sentiment_score")
+        if avg_score is not None:
+            parts.append(f"Avg Sentiment Score: {avg_score:.2f}")
+
+        trend = news_analysis.get("sentiment_trend", "")
+        if trend:
+            parts.append(f"Sentiment Trend: {trend}")
+
+    investment_thesis = insider_output.get("investment_thesis") or {}
+    if investment_thesis:
+        thesis = investment_thesis.get("combined_thesis", "")
+        if thesis:
+            parts.append(f"Investment Thesis: {thesis[:300]}")
+
+        recommendation = investment_thesis.get("recommendation", "")
+        if recommendation:
+            parts.append(f"Recommendation: {recommendation}")
+
+    return parts
+
     latest_feat = features.get("latest") or {}
     prev_feat   = features.get("previous") or {}
     kpi_diff    = features.get("kpi_diff") or {}
@@ -2519,12 +2697,14 @@ def _validate_anchor_values(data: Dict[str, Any], anchor: Dict[str, Any], ticker
 
 
 _JSON_STAGE2_SYSTEM = """You are a senior equity research analyst writing investment research notes.
-You have access to outputs from 5 specialized agents that you must synthesize into a coherent narrative:
+You have access to outputs from 7 specialized agents that you must synthesize into a coherent narrative:
 1. BUSINESS ANALYST (ba_outputs): Company overview, competitive positioning, management assessment, industry trends
 2. QUANT FUNDAMENTAL (quant_outputs): Valuation metrics, financial ratios, Piotroski/Altman/Beneish scores, price performance
-3. WEB SEARCH (web_outputs): Recent news, market sentiment, analyst upgrades/downgrades, macro factors
+3. WEB SEARCH (web_outputs): Recent news, market sentiment, analyst upgrades/downgrades
 4. FINANCIAL MODELLING (fm_outputs): DCF valuation, intrinsic value scenarios, margin projections
 5. STOCK RESEARCH (sr_outputs): Earnings transcript analysis, broker sentiment, Q&A dynamics, growth catalysts
+6. MACRO (macro_outputs): Macroeconomic analysis, market regime, macro themes, interest rates, economic outlook
+7. INSIDER NEWS (insider_news_outputs): Insider trading activity, management transactions, news sentiment analysis
 
 CRITICAL RULES:
 1. Use the EXACT numbers from the JSON — do NOT change, round, or substitute any figure.
@@ -2542,13 +2722,17 @@ ANALYSIS DEPTH REQUIREMENTS:
 - Discuss causation, not just correlation: Why did margins improve? What drove the change in cash flow?
 - Address forward-looking implications: What do current trends suggest for future performance?
 - Consider stakeholder perspectives: How do these metrics affect shareholders, creditors, and management decisions?
+- INCORPORATE MACRO INSIGHTS: When discussing market environment, integrate macro data (regime, themes, risks) into the analysis
+- INCORPORATE INSIDER NEWS: Use insider trading activity and news sentiment to validate or challenge the investment thesis
 
 SYNTHESIS GUIDANCE:
-- Weave insights from ALL 5 agents together — don't treat them as siloed sections
-- The Web Search provides context; Quant Fundamental provides numbers; Business Analyst provides narrative; Stock Research provides tone; Financial Modelling provides valuation
+- Weave insights from ALL 7 agents together — don't treat them as siloed sections
+- The Web Search provides context; Quant Fundamental provides numbers; Business Analyst provides narrative; Stock Research provides tone; Financial Modelling provides valuation; Macro provides economic context; Insider News provides sentiment and insider signals
 - When discussing valuation, incorporate both DCF outputs and peer comparisons
 - Use broker sentiment from Stock Research to contextualize quantitative findings
-- Connect recent news (Web Search) to financial performance (Quant/BA)"""
+- Connect recent news (Web Search) to financial performance (Quant/BA)
+- Integrate macro economic factors into the overall investment thesis
+- Factor in insider buying/selling as sentiment signals"""
 
 
 def summarise_results_structured(
@@ -2559,6 +2743,8 @@ def summarise_results_structured(
     web_outputs: List[Dict[str, Any]],
     fm_outputs: List[Dict[str, Any]] = [],
     sr_outputs: List[Dict[str, Any]] = [],
+    macro_outputs: List[Dict[str, Any]] = [],
+    insider_news_outputs: List[Dict[str, Any]] = [],
     ticker: Optional[str] = None,
     ba_output: Optional[Dict[str, Any]] = None,
     quant_output: Optional[Dict[str, Any]] = None,
@@ -2592,6 +2778,8 @@ def summarise_results_structured(
     effective_ba      = ba_outputs     or ([ba_output]     if ba_output     else [])
     effective_web     = web_outputs    or []
     effective_sr      = sr_outputs     or []
+    effective_macro   = macro_outputs  or []
+    effective_insider = insider_news_outputs or []
 
     if not effective_tickers:
         logger.warning("[structured] No tickers — falling back to summarise_results")
@@ -2599,9 +2787,11 @@ def summarise_results_structured(
             user_query=user_query, tickers=tickers,
             ba_outputs=ba_outputs, quant_outputs=quant_outputs,
             web_outputs=web_outputs, fm_outputs=fm_outputs,
-            sr_outputs=sr_outputs, ticker=ticker, ba_output=ba_output,
+            sr_outputs=sr_outputs, macro_outputs=macro_outputs,
+            insider_news_outputs=insider_news_outputs,
+            ticker=ticker, ba_output=ba_output,
             quant_output=quant_output, web_output=web_output,
-            data_availability=data_availability, _trace_out=_trace_out,
+            data_availability=data_availability, output_language=output_language, _trace_out=_trace_out,
         )
 
     # ── Build the authoritative anchor dict ───────────────────────────────────
@@ -2623,7 +2813,13 @@ def summarise_results_structured(
     for sr_o in effective_sr:
         if sr_o:
             qual_parts.extend(_build_stock_research_context(sr_o))
-    qualitative_context = "\n".join(qual_parts)[:6000]  # cap at ~6k chars
+    for macro_o in effective_macro:
+        if macro_o:
+            qual_parts.extend(_build_macro_context(macro_o))
+    for insider_o in effective_insider:
+        if insider_o:
+            qual_parts.extend(_build_insider_news_context(insider_o))
+    qualitative_context = "\n".join(qual_parts)[:8000]  # cap at ~8k chars to accommodate new agents
 
     # ── Stage 1: JSON generation ──────────────────────────────────────────────
     anchor_json_str = json.dumps(
@@ -2688,9 +2884,11 @@ CRITICAL RULES:
             user_query=user_query, tickers=tickers,
             ba_outputs=ba_outputs, quant_outputs=quant_outputs,
             web_outputs=web_outputs, fm_outputs=fm_outputs,
-            sr_outputs=sr_outputs, ticker=ticker, ba_output=ba_output,
+            sr_outputs=sr_outputs, macro_outputs=macro_outputs,
+            insider_news_outputs=insider_news_outputs,
+            ticker=ticker, ba_output=ba_output,
             quant_output=quant_output, web_output=web_output,
-            data_availability=data_availability, _trace_out=_trace_out,
+            data_availability=data_availability, output_language=output_language, _trace_out=_trace_out,
         )
 
     # ── Stage 2: JSON → prose ─────────────────────────────────────────────────
@@ -2774,9 +2972,11 @@ RULES:
             user_query=user_query, tickers=tickers,
             ba_outputs=ba_outputs, quant_outputs=quant_outputs,
             web_outputs=web_outputs, fm_outputs=fm_outputs,
-            sr_outputs=sr_outputs, ticker=ticker, ba_output=ba_output,
+            sr_outputs=sr_outputs, macro_outputs=macro_outputs,
+            insider_news_outputs=insider_news_outputs,
+            ticker=ticker, ba_output=ba_output,
             quant_output=quant_output, web_output=web_output,
-            data_availability=data_availability, _trace_out=_trace_out,
+            data_availability=data_availability, output_language=output_language, _trace_out=_trace_out,
         )
 
     # ── Stage 2.5: Fix malformed number artifacts and banned words ────────────
@@ -2878,6 +3078,8 @@ RULES:
             web_output=web_o,
             fm_output=fm_o,
             sr_output=sr_o,
+            macro_output=effective_macro[i] if i < len(effective_macro) else None,
+            insider_news_output=effective_insider[i] if i < len(effective_insider) else None,
             ticker=t,
             index_offset=offset,
         )
@@ -3053,12 +3255,15 @@ def summarise_results(
     web_outputs: List[Dict[str, Any]],
     fm_outputs: List[Dict[str, Any]] = [],
     sr_outputs: List[Dict[str, Any]] = [],
+    macro_outputs: List[Dict[str, Any]] = [],
+    insider_news_outputs: List[Dict[str, Any]] = [],
     # Legacy single-value params kept for backward-compat (ignored if lists provided)
     ticker: Optional[str] = None,
     ba_output: Optional[Dict[str, Any]] = None,
     quant_output: Optional[Dict[str, Any]] = None,
     web_output: Optional[Dict[str, Any]] = None,
     data_availability: Optional[Dict[str, Any]] = None,
+    output_language: Optional[str] = None,
     _trace_out: Optional[List[str]] = None,
 ) -> str:
     """Call DeepSeek summarizer with all agent outputs and return the narrative + citations.
@@ -3079,6 +3284,8 @@ def summarise_results(
     effective_web    = web_outputs or ([web_output] if web_output else [])
     effective_fm     = fm_outputs or []
     effective_sr     = sr_outputs or []
+    effective_macro  = macro_outputs or []
+    effective_insider = insider_news_outputs or []
     effective_ticker = tickers[0] if tickers else ticker
 
     is_comparison = len(tickers) > 1
@@ -3104,6 +3311,8 @@ def summarise_results(
             web_output=web_o,
             fm_output=fm_o,
             sr_output=sr_o,
+            macro_output=effective_macro[i] if i < len(effective_macro) else None,
+            insider_news_output=effective_insider[i] if i < len(effective_insider) else None,
             ticker=t,
             index_offset=offset,
         )
@@ -3308,6 +3517,26 @@ def summarise_results(
             ctx_parts.extend(_build_stock_research_context(sr_o))
             ctx_parts.append("")
 
+    for macro_o in effective_macro:
+        if macro_o:
+            ctx_parts.extend(_build_macro_context(macro_o))
+            ctx_parts.append("")
+
+    for insider_o in effective_insider:
+        if insider_o:
+            ctx_parts.extend(_build_insider_news_context(insider_o))
+            ctx_parts.append("")
+
+    for macro_o in effective_macro:
+        if macro_o:
+            ctx_parts.extend(_build_macro_context(macro_o))
+            ctx_parts.append("")
+
+    for insider_o in effective_insider:
+        if insider_o:
+            ctx_parts.extend(_build_insider_news_context(insider_o))
+            ctx_parts.append("")
+
     context = "\n".join(ctx_parts)
 
     # Build ordered header checklist for the prompt reminder
@@ -3379,9 +3608,8 @@ def summarise_results(
     # deepseek-reasoner:
     #   single:     3000 tok ≈ 200-300s + ~45s prefill ≈ 4-6 min  → target 8-12 min total
     #   comparison: 3000 tok ≈ 200-300s + ~45s prefill ≈ 4-6 min
-    # Raised from 6000 → 8000 to give enough headroom for all 11 required sections
-    # (target 5000-7000 words ≈ 7000-9000 tokens at ~1.3 tok/word).
-    max_tokens = 8000
+    # Raised from 8000 → 12000 to increase depth/output length by ~50%.
+    max_tokens = 12000
     try:
         raw, reasoning = _deepseek_generate(
             _SUMMARIZER_MODEL, prompt, max_tokens=max_tokens, temperature=0.2,
@@ -3674,23 +3902,42 @@ def summarise_results(
         # Fallback: include at least a placeholder references section
         cleaned = cleaned + "\n\n---\n### References\n*No external citations available — analysis based on internal data sources.*"
 
+    # ── 7. Translate final summary if requested ──────────────────────────────
+    if output_language:
+        try:
+            cleaned = translate_text(cleaned, output_language)
+            logger.info("[summarise_results] translated to %s (%d chars)", output_language, len(cleaned))
+        except Exception as exc:
+            logger.warning("[summarise_results] translation failed; returning English: %s", exc)
+
     return cleaned
 
 
 # ── Translation Helper ───────────────────────────────────────────────────────────
 
 def translate_text(text: str, target_language: str) -> str:
-    """Translate text to the target language using DeepSeek."""
+    """Translate report body only, keep citations/references unchanged."""
+
+    # Keep citations/source list in original language and formatting.
+    # We only translate the narrative body before the References block.
+    ref_match = re.search(r"\n---\n###\s+References\b", text, flags=re.IGNORECASE)
+    if ref_match:
+        body_text = text[:ref_match.start()]
+        references_block = text[ref_match.start():]
+    else:
+        body_text = text
+        references_block = ""
 
     system_prompt = (
         "You are a senior translator for financial research. Translate the provided report into "
         f"{target_language} while preserving formatting, headers, numeric citations, and analytical tone."
-        " Do not add any commentary or change the numeric citations."
+        " Do not add commentary. Keep all [N] numeric citations unchanged. "
+        "Do NOT translate the References section, source titles, URLs, file names, or citation labels."
     )
 
     prompt = """Translate the following financial research report:
 
-""" + text + "\n\nTranslation:"""
+""" + body_text + "\n\nTranslation:"""
 
     try:
         translated = _deepseek_generate(
@@ -3702,7 +3949,10 @@ def translate_text(text: str, target_language: str) -> str:
         )
         translated = _strip_think(translated)
         translated = _strip_fences(translated)
-        return translated.strip() or text
+        translated_body = translated.strip() or body_text
+        if references_block:
+            return translated_body.rstrip() + "\n" + references_block.lstrip("\n")
+        return translated_body
     except Exception as exc:
         logger.warning("Translation via DeepSeek failed: %s", exc)
         return text

@@ -78,9 +78,11 @@ class Citation:
 
     def footnote(self) -> str:
         """Full footnote line for the References section."""
-        parts = [f"[{self.index}]", self.label]
-        if self.detail:
-            parts.append(f"— {self.detail}")
+        label = re.sub(r'\s+', ' ', str(self.label or '')).strip()
+        detail = re.sub(r'\s+', ' ', str(self.detail or '')).strip()
+        parts = [f"[{self.index}]", label]
+        if detail:
+            parts.append(f"— {detail}")
         if self.url:
             parts.append(f"({self.url})")
         parts.append(f"[{self.source_agent}]")
@@ -200,6 +202,8 @@ def build_citation_block(
     web_output: Optional[Dict[str, Any]],
     fm_output: Optional[Dict[str, Any]] = None,
     sr_output: Optional[Dict[str, Any]] = None,
+    macro_output: Optional[Dict[str, Any]] = None,
+    insider_news_output: Optional[Dict[str, Any]] = None,
     ticker: Optional[str] = None,
     index_offset: int = 0,
 ) -> Tuple[str, Dict[str, Citation]]:
@@ -211,6 +215,8 @@ def build_citation_block(
         web_output:    Web Search agent output dict (or None).
         fm_output:     Financial Modelling agent output dict (or None).
         sr_output:     Stock Research agent output dict (or None).
+        macro_output:  Macro agent output dict (or None).
+        insider_news_output: Insider+News agent output dict (or None).
         ticker:        Primary ticker symbol for label generation.
         index_offset:  Starting index offset — used when building multi-ticker
                        citation blocks so each call produces globally-unique [N]
@@ -504,6 +510,66 @@ def build_citation_block(
                 chunk_id=chunk_id,
             )
 
+    # ── 6. Macro citations ────────────────────────────────────────────────────
+    if macro_output:
+        source = str(macro_output.get("data_source") or "neo4j").lower()
+        db_detail = "PostgreSQL/Neo4j macro report store"
+        # Add explicit citation rows from the macro agent
+        for c in (macro_output.get("citations") or []):
+            if not isinstance(c, dict):
+                continue
+            doc = str(c.get("doc_name") or "Macro Research Document").strip()
+            page = c.get("page")
+            detail = f"page {page}" if page is not None else db_detail
+            chunk_id = str(c.get("chunk_id") or f"macro::{doc}::{page}")
+            _add(
+                "macro",
+                "postgresql" if source in ("pg", "neo4j") else source,
+                doc,
+                detail,
+                chunk_id=chunk_id,
+            )
+        # Fallback anchor citation if no explicit per-doc citations were emitted
+        if not (macro_output.get("citations") or []):
+            _add(
+                "macro",
+                "postgresql" if source in ("pg", "neo4j") else source,
+                f"{(ticker or str(macro_output.get('ticker') or 'TICKER')).upper()} — Macro Regime and Thematic Analysis",
+                db_detail,
+                chunk_id="postgresql:macro:regime_and_themes",
+            )
+
+    # ── 7. Insider + News citations ───────────────────────────────────────────
+    if insider_news_output:
+        source = str(insider_news_output.get("data_source") or "postgresql").lower()
+        coverage = insider_news_output.get("data_coverage") or {}
+        insider_n = coverage.get("insider_transactions_count", 0)
+        news_n = coverage.get("news_articles_count", 0)
+        # Add explicit citations emitted by the insider/news synthesis
+        for c in (insider_news_output.get("citations") or []):
+            if not isinstance(c, dict):
+                continue
+            doc = str(c.get("doc_name") or "Insider/News Document").strip()
+            page = c.get("page")
+            detail = f"page {page}" if page is not None else "PostgreSQL insider/news store"
+            chunk_id = str(c.get("chunk_id") or f"insider_news::{doc}::{page}")
+            _add(
+                "insider_news",
+                "postgresql" if source == "pg" else source,
+                doc,
+                detail,
+                chunk_id=chunk_id,
+            )
+        # Fallback source anchor if citations are empty
+        if not (insider_news_output.get("citations") or []):
+            _add(
+                "insider_news",
+                "postgresql" if source == "pg" else source,
+                f"{(ticker or str(insider_news_output.get('ticker') or 'TICKER')).upper()} — Insider Transactions and News Articles",
+                f"PostgreSQL · insider_transactions/news_articles (insider={insider_n}, news={news_n})",
+                chunk_id="postgresql:insider_news:coverage",
+            )
+
     # ── Format the reference block ────────────────────────────────────────────
     if not citations:
         return "", {}
@@ -513,15 +579,19 @@ def build_citation_block(
     # Group by agent
     agent_order = [
         "business_analyst",
-        "stock_research",
         "quant_fundamental",
-        "web_search",
         "financial_modelling",
+        "stock_research",
+        "macro",
+        "insider_news",
+        "web_search",
         "web_fallback",
     ]
     agent_labels = {
         "business_analyst":   "Business Analyst (qualitative research)",
         "stock_research":     "Stock Research (earnings calls & broker reports)",
+        "macro":              "Macro (regime, thematic, transmission channels)",
+        "insider_news":       "Insider & News (transactions and sentiment)",
         "quant_fundamental":  "Quant Fundamental (financial data)",
         "web_search":         "Web Search (live sources)",
         "financial_modelling": "Financial Modelling (DCF, WACC, Comps, Technicals)",
@@ -533,12 +603,26 @@ def build_citation_block(
         bucket = c.source_agent if c.source_agent in by_agent else "business_analyst"
         by_agent[bucket].append(c)
 
+    # Re-number citations to follow the final display order exactly.
+    # This keeps references clean and avoids out-of-order numbers by section.
+    ordered: List[Citation] = []
+    for agent_key in agent_order:
+        group = by_agent[agent_key]
+        if not group:
+            continue
+        group_sorted = sorted(group, key=lambda c: c.index)
+        ordered.extend(group_sorted)
+
+    for i, c in enumerate(ordered, start=1):
+        c.index = index_offset + i
+
     for agent_key in agent_order:
         group = by_agent[agent_key]
         if not group:
             continue
         lines.append(f"\n**{agent_labels[agent_key]}**")
-        for c in group:
+        group_sorted = sorted(group, key=lambda c: c.index)
+        for c in group_sorted:
             lines.append(c.footnote())
 
     chunk_id_map: Dict[str, Citation] = {c.chunk_id: c for c in citations if c.chunk_id}

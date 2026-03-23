@@ -315,12 +315,9 @@ def node_planner(state: OrchestrationState) -> OrchestrationState:
     run_ws = bool(plan.get("run_web_search", False))
     run_fm = bool(plan.get("run_financial_modelling", False))
 
-    # complexity drives max ReAct passes — no upper cap
-    raw_complexity = plan.get("complexity", 2)
-    try:
-        react_max = max(1, int(raw_complexity))
-    except (TypeError, ValueError):
-        react_max = 2
+    # ReAct looping disabled by design: run each agent node once.
+    raw_complexity = plan.get("complexity", 1)
+    react_max = 1
 
     # --- data availability check -------------------------------------------
     # Run once per request in the planner so every downstream node can branch
@@ -371,9 +368,9 @@ def node_planner(state: OrchestrationState) -> OrchestrationState:
         "run_quant_fundamental": run_qf,
         "run_web_search": run_ws,
         "run_financial_modelling": run_fm,
-        # stock_research is enabled when the query explicitly asks for broker reports or
-        # earnings call transcripts, or when the planner opts it in.
         "run_stock_research": bool(plan.get("run_stock_research", False)),
+        "run_macro": bool(plan.get("run_macro", False)),
+        "run_insider_news": bool(plan.get("run_insider_news", False)),
         "data_availability": data_availability,
         "episodic_hints": episodic_hints,
         "planner_trace": planner_trace,
@@ -389,11 +386,15 @@ def node_planner(state: OrchestrationState) -> OrchestrationState:
         "web_search_outputs": [],
         "financial_modelling_outputs": [],
         "stock_research_outputs": [],
+        "macro_outputs": [],
+        "insider_news_outputs": [],
         "business_analyst_output": None,
         "quant_fundamental_output": None,
         "web_search_output": None,
         "financial_modelling_output": None,
         "stock_research_output": None,
+        "macro_output": None,
+        "insider_news_output": None,
     }
 
 
@@ -805,6 +806,147 @@ def node_stock_research(state: OrchestrationState) -> OrchestrationState:
         }
 
 
+def node_macro(state: OrchestrationState) -> OrchestrationState:
+    """Call the Macro agent for every ticker.
+
+    This node is only reached when the planner explicitly sets run_macro=True,
+    typically for queries that involve macro-economic analysis, market regime,
+    or macroeconomic themes.
+    """
+    tickers = state.get("tickers") or []
+
+    if not tickers and state.get("ticker"):
+        tickers = [state.get("ticker")]
+
+    session_id: str = state.get("session_id", "") or ""
+    run_id: str = session_id or str(uuid.uuid4())[:8]
+    complexity: int = state.get("react_max_iterations") or 1
+    start_t = time.time()
+    own_step: Dict[str, Any] = {"tool": "macro", "input": {"tickers": tickers}}
+    _push_progress(session_id, {"agent": "macro", "status": "started", "tickers": tickers, "elapsed_ms": 0, "error": None})
+
+    logger.info("[macro] Running for tickers=%s", tickers)
+
+    try:
+        from agents.macro_agent.agent import run_full_analysis  # type: ignore[import]
+
+        outputs: List[Dict[str, Any]] = []
+        for t in tickers:
+            logger.info("[macro] Processing ticker=%s", t)
+            result = run_full_analysis(ticker=str(t))
+            outputs.append(result)
+
+        obs_parts = [
+            f"{r.get('ticker', '?')}:themes={len(r.get('macro_themes', []))}"
+            for r in outputs
+        ]
+        own_step["observation"] = "Success — " + " | ".join(obs_parts)
+        logger.info("[macro] Done for %d ticker(s).", len(outputs))
+
+        elapsed_ms = int((time.time() - start_t) * 1000)
+        _excerpt = _extract_agent_excerpt("macro", outputs)
+        _push_progress(session_id, {"agent": "macro", "status": "done", "tickers": tickers, "elapsed_ms": elapsed_ms, "error": None, "excerpt": _excerpt})
+        _log_telemetry(run_id, "macro", "latency", latency_ms=elapsed_ms,
+                       complexity_declared=complexity, react_loops_used=_incr_agent_iter(state, "macro").get("macro", 1))
+
+        first = outputs[0] if outputs else None
+        return {
+            "macro_outputs": outputs,
+            "macro_output": first,
+            "react_steps": [own_step],
+            "agent_errors": {},
+            "agent_react_iterations": _incr_agent_iter(state, "macro"),
+        }
+
+    except Exception as exc:
+        msg = f"{type(exc).__name__}: {exc}"
+        logger.error("[macro] Failed: %s", msg)
+        own_step["observation"] = f"Error: {msg}"
+        elapsed_ms = int((time.time() - start_t) * 1000)
+        _push_progress(session_id, {"agent": "macro", "status": "error", "tickers": tickers, "elapsed_ms": elapsed_ms, "error": msg[:200]})
+        if "timeout" in msg.lower():
+            _log_telemetry(run_id, "macro", "timeout", latency_ms=elapsed_ms,
+                           complexity_declared=complexity, notes=msg[:500])
+        else:
+            _log_telemetry(run_id, "macro", "latency", latency_ms=elapsed_ms,
+                           complexity_declared=complexity, notes=f"error: {msg[:200]}")
+        return {
+            "react_steps": [own_step],
+            "agent_errors": {"macro": msg},
+            "agent_react_iterations": _incr_agent_iter(state, "macro"),
+        }
+
+
+def node_insider_news(state: OrchestrationState) -> OrchestrationState:
+    """Call the Insider News agent for every ticker.
+
+    This node is only reached when the planner explicitly sets run_insider_news=True,
+    typically for queries that involve insider trading activity or news sentiment analysis.
+    """
+    tickers = state.get("tickers") or []
+
+    if not tickers and state.get("ticker"):
+        tickers = [state.get("ticker")]
+
+    session_id: str = state.get("session_id", "") or ""
+    run_id: str = session_id or str(uuid.uuid4())[:8]
+    complexity: int = state.get("react_max_iterations") or 1
+    start_t = time.time()
+    own_step: Dict[str, Any] = {"tool": "insider_news", "input": {"tickers": tickers}}
+    _push_progress(session_id, {"agent": "insider_news", "status": "started", "tickers": tickers, "elapsed_ms": 0, "error": None})
+
+    logger.info("[insider_news] Running for tickers=%s", tickers)
+
+    try:
+        from agents.insider_news_agent.agent import run_full_analysis  # type: ignore[import]
+
+        outputs: List[Dict[str, Any]] = []
+        for t in tickers:
+            logger.info("[insider_news] Processing ticker=%s", t)
+            result = run_full_analysis(ticker=str(t))
+            outputs.append(result)
+
+        obs_parts = [
+            f"{r.get('ticker', '?')}:insiders={r.get('data_coverage', {}).get('insider_transactions_count', 0)}"
+            for r in outputs
+        ]
+        own_step["observation"] = "Success — " + " | ".join(obs_parts)
+        logger.info("[insider_news] Done for %d ticker(s).", len(outputs))
+
+        elapsed_ms = int((time.time() - start_t) * 1000)
+        _excerpt = _extract_agent_excerpt("insider_news", outputs)
+        _push_progress(session_id, {"agent": "insider_news", "status": "done", "tickers": tickers, "elapsed_ms": elapsed_ms, "error": None, "excerpt": _excerpt})
+        _log_telemetry(run_id, "insider_news", "latency", latency_ms=elapsed_ms,
+                       complexity_declared=complexity, react_loops_used=_incr_agent_iter(state, "insider_news").get("insider_news", 1))
+
+        first = outputs[0] if outputs else None
+        return {
+            "insider_news_outputs": outputs,
+            "insider_news_output": first,
+            "react_steps": [own_step],
+            "agent_errors": {},
+            "agent_react_iterations": _incr_agent_iter(state, "insider_news"),
+        }
+
+    except Exception as exc:
+        msg = f"{type(exc).__name__}: {exc}"
+        logger.error("[insider_news] Failed: %s", msg)
+        own_step["observation"] = f"Error: {msg}"
+        elapsed_ms = int((time.time() - start_t) * 1000)
+        _push_progress(session_id, {"agent": "insider_news", "status": "error", "tickers": tickers, "elapsed_ms": elapsed_ms, "error": msg[:200]})
+        if "timeout" in msg.lower():
+            _log_telemetry(run_id, "insider_news", "timeout", latency_ms=elapsed_ms,
+                           complexity_declared=complexity, notes=msg[:500])
+        else:
+            _log_telemetry(run_id, "insider_news", "latency", latency_ms=elapsed_ms,
+                           complexity_declared=complexity, notes=f"error: {msg[:200]}")
+        return {
+            "react_steps": [own_step],
+            "agent_errors": {"insider_news": msg},
+            "agent_react_iterations": _incr_agent_iter(state, "insider_news"),
+        }
+
+
 # (node_parallel_agents and node_react_check removed — replaced by LangGraph native
 #  fan-out edges in graph.py and per-agent conditional retry edges.)
 
@@ -837,6 +979,8 @@ def node_summarizer(state: OrchestrationState) -> OrchestrationState:
         [_fm_single] if _fm_single else []
     ))
     sr_outputs: List[Dict[str, Any]]    = list(state.get("stock_research_outputs") or [])
+    macro_outputs: List[Dict[str, Any]] = list(state.get("macro_outputs") or [])
+    insider_news_outputs: List[Dict[str, Any]] = list(state.get("insider_news_outputs") or [])
     errors        = state.get("agent_errors") or {}
 
     data_availability = state.get("data_availability")
@@ -847,6 +991,9 @@ def node_summarizer(state: OrchestrationState) -> OrchestrationState:
         "quant_fundamental":  f"{len(quant_outputs)} result(s)" if quant_outputs else "not run / no output",
         "web_search":         f"{len(web_outputs)} result(s)" if web_outputs else "not run / no output",
         "financial_modelling":f"{len(fm_outputs)} result(s)" if fm_outputs else "not run / no output",
+        "stock_research":    f"{len(sr_outputs)} result(s)" if sr_outputs else "not run / no output",
+        "macro":             f"{len(macro_outputs)} result(s)" if macro_outputs else "not run / no output",
+        "insider_news":      f"{len(insider_news_outputs)} result(s)" if insider_news_outputs else "not run / no output",
     }
     logger.info(
         "[summarizer] ReAct execution complete. tickers=%s  agent_outputs=%s  errors=%s",
@@ -863,6 +1010,12 @@ def node_summarizer(state: OrchestrationState) -> OrchestrationState:
     if state.get("run_financial_modelling") and not fm_outputs:
         logger.warning("[summarizer] financial_modelling was enabled but produced no output — "
                        "check agent_errors for crash details.")
+    if state.get("run_macro") and not macro_outputs:
+        logger.warning("[summarizer] macro was enabled but produced no output — "
+                       "check agent_errors for crash details.")
+    if state.get("run_insider_news") and not insider_news_outputs:
+        logger.warning("[summarizer] insider_news was enabled but produced no output — "
+                       "check agent_errors for crash details.")
 
     summarizer_trace_out: List[str] = []
     final_summary = summarise_results_structured(
@@ -873,10 +1026,21 @@ def node_summarizer(state: OrchestrationState) -> OrchestrationState:
         web_outputs=web_outputs,
         fm_outputs=fm_outputs,
         sr_outputs=sr_outputs,
+        macro_outputs=macro_outputs,
+        insider_news_outputs=insider_news_outputs,
         data_availability=data_availability,
         output_language=output_language,
         _trace_out=summarizer_trace_out,
     )
+
+    # Final safeguard: ensure UI-selected output_language is respected even if
+    # the structured summarizer path returned untranslated content.
+    if output_language:
+        try:
+            from .llm import translate_text  # type: ignore[import]
+            final_summary = translate_text(final_summary, str(output_language))
+        except Exception as exc:
+            logger.warning("[summarizer] Final translation safeguard failed: %s", exc)
     summarizer_trace: str = summarizer_trace_out[0] if summarizer_trace_out else ""
     if summarizer_trace:
         logger.info("[summarizer] Thinking trace captured (%d chars).", len(summarizer_trace))
@@ -897,12 +1061,16 @@ def node_summarizer(state: OrchestrationState) -> OrchestrationState:
         "web_search_outputs": web_outputs,
         "financial_modelling_outputs": fm_outputs,
         "stock_research_outputs": sr_outputs,
+        "macro_outputs": macro_outputs,
+        "insider_news_outputs": insider_news_outputs,
         # Legacy single aliases (first ticker)
         "business_analyst_output": ba_outputs[0] if ba_outputs else None,
         "quant_fundamental_output": quant_outputs[0] if quant_outputs else None,
         "web_search_output": web_outputs[0] if web_outputs else None,
         "financial_modelling_output": fm_outputs[0] if fm_outputs else None,
         "stock_research_output": sr_outputs[0] if sr_outputs else None,
+        "macro_output": macro_outputs[0] if macro_outputs else None,
+        "insider_news_output": insider_news_outputs[0] if insider_news_outputs else None,
         "agent_errors": errors,
         "final_summary": final_summary,
         "planner_trace": state.get("planner_trace", ""),
@@ -981,6 +1149,10 @@ def node_post_processing(state: OrchestrationState) -> OrchestrationState:
         gap_agents.append("financial_modelling")
     if state.get("run_stock_research") and not state.get("stock_research_outputs"):
         gap_agents.append("stock_research")
+    if state.get("run_macro") and not state.get("macro_outputs"):
+        gap_agents.append("macro")
+    if state.get("run_insider_news") and not state.get("insider_news_outputs"):
+        gap_agents.append("insider_news")
 
     error_agents      = list(errors.keys())
     agents_to_record  = list(dict.fromkeys(gap_agents + error_agents))
