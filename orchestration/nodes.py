@@ -56,6 +56,18 @@ def _build_local_fallback_summary(
 ) -> str:
     """Build a deterministic markdown fallback when LLM summarisation fails."""
     tks = ", ".join(tickers) if tickers else "N/A"
+    err_text = " ".join(str(v) for v in (errors or {}).values()).lower()
+    auth_related = any(
+        k in err_text
+        for k in (
+            "401",
+            "unauthorized",
+            "authentication",
+            "invalid api key",
+            "api key",
+            "deepseek_api_key",
+        )
+    )
     lines: List[str] = [
         "## Executive Summary",
         "",
@@ -84,7 +96,11 @@ def _build_local_fallback_summary(
             "",
             "## Next Step",
             "",
-            "Set a valid `DEEPSEEK_API_KEY` in the UI sidebar, then rerun to generate the full narrative report.",
+            (
+                "Set a valid `DEEPSEEK_API_KEY` in the UI sidebar, then rerun to generate the full narrative report."
+                if auth_related
+                else "Rerun once to confirm; if this persists, check summarizer logs for the stack trace and report the exact error text."
+            ),
         ]
     )
     return "\n".join(lines)
@@ -255,13 +271,13 @@ def node_planner(state: OrchestrationState) -> OrchestrationState:
     output_language: Optional[str] = None
     query_lower = user_query.lower()
     language_keywords = {
-        "cantonese": ["cantonese", "in cantonese", "write in cantonese", "cantonese language"],
+        "cantonese": ["cantonese", "cantones", "in cantonese", "write in cantonese", "cantonese language", "粵語", "粤语"],
         "spanish": ["spanish", "in spanish", "espanol", "write in spanish", "spanish language"],
-        "mandarin": ["mandarin", "in mandarin", "putonghua", "write in mandarin", "mandarin language"],
+        "mandarin": ["mandarin", "mandrain", "mandarine", "in mandarin", "putonghua", "write in mandarin", "mandarin language", "中文", "chinese"],
         "french": ["french", "in french", "francais", "write in french", "french language"],
         "german": ["german", "in german", "deutsch", "write in german", "german language"],
-        "japanese": ["japanese", "in japanese", "nihongo", "write in japanese", "japanese language"],
-        "korean": ["korean", "in korean", "hangul", "write in korean", "korean language"],
+        "japanese": ["japanese", "ja", "jp", "jpn", "in japanese", "nihongo", "write in japanese", "japanese language", "日本語"],
+        "korean": ["korean", "ko", "kr", "in korean", "hangul", "write in korean", "korean language", "한국어"],
         "portuguese": ["portuguese", "in portuguese", "portugues", "write in portuguese"],
         "italian": ["italian", "in italian", "italiano", "write in italian"],
         "dutch": ["dutch", "in dutch", "nederlands", "write in dutch"],
@@ -278,13 +294,52 @@ def node_planner(state: OrchestrationState) -> OrchestrationState:
             logger.info("[planner] Detected language requirement: %s", output_language)
             break
 
-    # --- in-context learning: inject worst past cases into planner prompt ---
+    # Normalize UI labels to canonical language keys expected by translators/scorers.
+    if isinstance(output_language, str):
+        _lang_map = {
+            "english": "english",
+            "cantonese": "cantonese",
+            "cantones": "cantonese",
+            "yue": "cantonese",
+            "mandarin": "mandarin",
+            "mandrain": "mandarin",
+            "mandarine": "mandarin",
+            "zh": "mandarin",
+            "cn": "mandarin",
+            "chinese": "mandarin",
+            "spanish": "spanish",
+            "french": "french",
+            "german": "german",
+            "japanese": "japanese",
+            "ja": "japanese",
+            "jp": "japanese",
+            "jpn": "japanese",
+            "korean": "korean",
+            "ko": "korean",
+            "kr": "korean",
+            "portuguese": "portuguese",
+            "italian": "italian",
+            "dutch": "dutch",
+            "russian": "russian",
+            "arabic": "arabic",
+            "hindi": "hindi",
+            "thai": "thai",
+            "vietnamese": "vietnamese",
+            "indonesian": "indonesian",
+        }
+        output_language = _lang_map.get(output_language.strip().lower(), output_language.strip().lower())
+
+    # --- in-context learning: inject low-score + latest human feedback context ---
     worst_case_context: str = ""
     try:
-        worst_cases = feedback.get_worst_cases(limit=5)
-        if worst_cases:
-            lines = ["PAST FAILURES TO AVOID (worst scored runs - learn from these):"]
-            for i, w in enumerate(worst_cases, 1):
+        lowest_rlaif = feedback.get_lowest_rlaif_cases(limit=5)
+        latest_human = feedback.get_latest_user_feedback(limit=5)
+
+        lines: List[str] = []
+
+        if lowest_rlaif:
+            lines.append("PAST LOW-RLAIF CASES TO AVOID (lowest scoring runs):")
+            for i, w in enumerate(lowest_rlaif, 1):
                 human_signal = ""
                 if w.get("helpful") is False:
                     comment = w.get("comment") or ""
@@ -311,13 +366,31 @@ def node_planner(state: OrchestrationState) -> OrchestrationState:
                     f"Weaknesses: {'; '.join(str(x) for x in weaknesses[:2]) or 'N/A'}"
                     f"{human_signal}"
                 )
+
+        if latest_human:
+            lines.append("LATEST HUMAN FEEDBACK SIGNALS (most recent explicit user feedback):")
+            for i, h in enumerate(latest_human, 1):
+                tags = h.get("issue_tags") or []
+                comment = str(h.get("comment") or "").strip()
+                helpful = h.get("helpful")
+                lines.append(
+                    f"  [{i}] Helpful: {helpful} | Issues: {'; '.join(str(t) for t in tags[:3]) or 'N/A'}"
+                    f" | Comment: {comment[:140] if comment else 'N/A'}"
+                )
+
+        if lines:
             lines.append(
-                "ACTION: Adjust your routing to avoid repeating these failure patterns. "
-                "If a similar query + ticker combination appears, increase react_max_iterations "
-                "or force run_web_search=true as a fallback."
+                "ACTION: Use these feedback patterns to improve routing and synthesis quality. "
+                "Proactively enable missing agents when prior failures indicate coverage gaps; "
+                "for similar failure signatures, increase complexity/retry budget and prioritize "
+                "cross-agent evidence fusion over single-agent summaries."
             )
             worst_case_context = "\n".join(lines)
-            logger.info("[planner] Injecting %d worst-case examples into planner context.", len(worst_cases))
+            logger.info(
+                "[planner] Injecting feedback context (lowest_rlaif=%d, latest_human=%d).",
+                len(lowest_rlaif),
+                len(latest_human),
+            )
     except Exception as exc:
         logger.warning("[planner] Worst-case context injection failed (non-fatal): %s", exc)
 
@@ -373,13 +446,19 @@ def node_planner(state: OrchestrationState) -> OrchestrationState:
         "full fundamental analysis", "complete fundamental analysis",
         "funamanetal analysis", "fundamanetal analysis", "fundemental analysis",
         "comprehensive analysis", "deep dive", "deep-dive", "full report", "complete report",
+        # Chinese comprehensive-report intents
+        "股票研究报告", "研究报告", "执行摘要", "全面分析", "完整分析", "深度分析", "投资报告",
     )
     _needs_macro_kw = (
         "macro", "marco", "macroeconomic", "market environment", "fed", "federal reserve",
         "interest rate", "inflation", "gdp", "economic outlook", "economy",
+        # Chinese macro intents
+        "宏观", "宏观经济", "利率", "通胀", "通货膨胀", "gdp", "美联储", "联储", "经济周期", "汇率",
     )
     _needs_news_kw = (
         "news", "latest", "breaking", "insider", "headlines", "sentiment",
+        # Chinese news/sentiment intents
+        "新闻", "最新", "舆情", "情绪", "内幕", "研报", "财报电话会",
     )
     _is_comprehensive = any(kw in ql for kw in _comprehensive_kw)
     _needs_macro = any(kw in ql for kw in _needs_macro_kw)
@@ -388,15 +467,24 @@ def node_planner(state: OrchestrationState) -> OrchestrationState:
     if _is_comprehensive:
         run_fm = True
         run_sr = True
+        run_ws = True
+        run_macro = True
+        run_insider = True
     if _needs_macro or _is_comprehensive:
         run_macro = True
     if _needs_news or _is_comprehensive:
         run_ws = True
         run_insider = True
 
-    # ReAct looping disabled by design: run each agent node once.
+    # ReAct loop budget: honour planner complexity (1-3) so failed/missing agents can retry.
+    # For comprehensive report intents, enforce at least 2 passes.
     raw_complexity = plan.get("complexity", 1)
-    react_max = 1
+    try:
+        react_max = max(1, min(3, int(raw_complexity)))
+    except Exception:
+        react_max = 1
+    if _is_comprehensive:
+        react_max = max(react_max, 2)
 
     # --- data availability check -------------------------------------------
     # Run once per request in the planner so every downstream node can branch
@@ -454,7 +542,11 @@ def node_planner(state: OrchestrationState) -> OrchestrationState:
         "episodic_hints": episodic_hints,
         "planner_trace": planner_trace,
         # Prefer language detected from query text; fall back to UI-supplied value in state
-        "output_language": output_language or state.get("output_language"),
+        "output_language": (
+            (str(state.get("output_language") or "").strip().lower() if state.get("output_language") else None)
+            if not output_language
+            else output_language
+        ),
         "react_steps": [],
         "react_iteration": 0,
         "react_max_iterations": react_max,
@@ -1196,6 +1288,7 @@ def node_post_processing(state: OrchestrationState) -> OrchestrationState:
     tickers       = state.get("tickers") or []
     errors        = state.get("agent_errors") or {}
     run_id        = state.get("rl_feedback_run_id") or str(_uuid.uuid4())[:12]
+    output_language = state.get("output_language")
 
     # ── Part 1: RLAIF scoring ─────────────────────────────────────────────────
     agent_outputs = {
@@ -1214,6 +1307,7 @@ def node_post_processing(state: OrchestrationState) -> OrchestrationState:
             final_summary=final_summary,
             agent_outputs=agent_outputs,
             ticker=ticker,
+            output_language=output_language,
         )
         logger.info(
             "[post_processing] RLAIF scores: overall=%.2f, factual=%.2f, citation=%.2f, "

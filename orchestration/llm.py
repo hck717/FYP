@@ -37,7 +37,15 @@ _REQUEST_TIMEOUT: Optional[int] = int(_REQUEST_TIMEOUT_ENV) if _REQUEST_TIMEOUT_
 _SUMMARIZER_TIMEOUT_ENV = os.getenv("ORCHESTRATION_SUMMARIZER_TIMEOUT", "").strip()
 _SUMMARIZER_TIMEOUT: Optional[int] = int(_SUMMARIZER_TIMEOUT_ENV) if _SUMMARIZER_TIMEOUT_ENV else 1200
 _SUMMARIZER_MAX_OUTPUT_TOKENS_ENV = os.getenv("ORCHESTRATION_SUMMARIZER_MAX_OUTPUT_TOKENS", "").strip()
-_SUMMARIZER_MAX_OUTPUT_TOKENS: int = int(_SUMMARIZER_MAX_OUTPUT_TOKENS_ENV) if _SUMMARIZER_MAX_OUTPUT_TOKENS_ENV else 32000
+_SUMMARIZER_MAX_OUTPUT_TOKENS: int = int(_SUMMARIZER_MAX_OUTPUT_TOKENS_ENV) if _SUMMARIZER_MAX_OUTPUT_TOKENS_ENV else 48000
+
+
+def _resolve_deepseek_api_key() -> str:
+    """Resolve API key at call time so UI/runtime updates are respected."""
+    key = (os.getenv("DEEPSEEK_API_KEY", "") or _DEEPSEEK_API_KEY or "").strip()
+    if not key:
+        raise RuntimeError("DEEPSEEK_API_KEY is not set")
+    return key
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -139,7 +147,7 @@ def _deepseek_generate(
     only when using deepseek-reasoner; empty string otherwise).
     """
     headers = {
-        "Authorization": f"Bearer {_DEEPSEEK_API_KEY}",
+        "Authorization": f"Bearer {_resolve_deepseek_api_key()}",
         "Content-Type": "application/json",
     }
     messages = []
@@ -163,7 +171,13 @@ def _deepseek_generate(
             timeout=_timeout,
         )
         resp.raise_for_status()
-        message = resp.json().get("choices", [{}])[0].get("message", {})
+        payload_json = resp.json()
+        choices = payload_json.get("choices") if isinstance(payload_json, dict) else None
+        if not isinstance(choices, list) or not choices:
+            logger.error("DeepSeek returned no choices. payload=%r", str(payload_json)[:500])
+            raise RuntimeError("DeepSeek response contained no choices")
+        first = choices[0] if isinstance(choices[0], dict) else {}
+        message = first.get("message", {}) if isinstance(first, dict) else {}
         content: str = message.get("content", "")
         if return_reasoning:
             reasoning: str = message.get("reasoning_content", "") or ""
@@ -337,6 +351,30 @@ SUPPORTED TICKERS: Any ticker with earnings call transcripts or broker reports i
   Neo4j (AAPL, MSFT, GOOGL, TSLA, NVDA have data); falls back to local PDFs if available
 DO NOT USE FOR: Financial ratios, DCF valuation, real-time news, technical analysis, price charts
 
+AGENT: macro
+README SUMMARY: The top-down macro regime and scenario layer. Analyses macro reports and
+links macro themes to ticker-level sensitivity. Handles:
+  - Market regime classification and risk-on/risk-off framing
+  - Interest-rate, inflation, GDP, and policy sensitivity mapping
+  - Top macro drivers and downside risk scenarios for the covered ticker
+  - Geopolitical and structural exposure context from macro reports
+SUPPORTED TICKERS: Any (macro context is market-level; linkage is ticker-specific)
+DO NOT USE FOR: Company-specific accounting ratios, DCF math, transcript parsing
+
+AGENT: insider_news
+README SUMMARY: Insider-flow and news-sentiment signal layer. Handles:
+  - Insider transaction activity summary and buy/sell ratio interpretation
+  - Net insider positioning shifts and red-flag detection
+  - News sentiment aggregation and trend direction
+  - Combined insider+news thesis signal for near-term positioning context
+SUPPORTED TICKERS: Any ticker with insider/news coverage in connected sources
+DO NOT USE FOR: Financial statement modelling, DCF valuation, transcript deep parsing
+
+AGENT: critic
+README SUMMARY: Offline QA layer that audits hallucination risk and citation utilisation after runs.
+Used for telemetry/quality monitoring, not for user-facing analysis generation.
+PLANNER POLICY: Do NOT route user queries to critic; it is not an online inference agent.
+
 === OUTPUT SCHEMA ===
 
 Output ONLY a valid JSON object with this schema:
@@ -349,6 +387,8 @@ Output ONLY a valid JSON object with this schema:
   "run_web_search": <true|false>,
   "run_financial_modelling": <true|false>,
   "run_stock_research": <true|false>,
+  "run_macro": <true|false>,
+  "run_insider_news": <true|false>,
   "complexity": <1|2|3>,
   "reasoning": "<2-3 sentences explaining tool selection and multi-ticker handling>",
   "chart_hints": ["<chart_type1>", "<chart_type2>"]
@@ -657,6 +697,7 @@ def _build_few_shot_block(examples: List[Dict[str, Any]]) -> str:
                 "tickers", "ticker", "intent",
                 "run_business_analyst", "run_quant_fundamental",
                 "run_web_search", "run_financial_modelling",
+                "run_stock_research", "run_macro", "run_insider_news",
                 "complexity", "reasoning",
             ) if k in plan
         }
@@ -1062,6 +1103,11 @@ Flowing, authoritative financial prose throughout — write like a senior sector
 Use precise financial terminology: TTM, YoY, QoQ, FCF conversion, operating leverage inflection, capital allocation
 efficiency, earnings quality, cost of capital, spread compression, working capital cycle, EPS accretion.
 State the analytical implication of every number — do not just recite metrics. Every sentence must carry weight.
+Synthesis depth requirement: always explain (1) what changed, (2) why it changed, and (3) why it matters for the
+investment thesis and forward risk/reward.
+Cross-agent fusion requirement: combine BA + Quant + FM + Stock Research + Macro + Insider/News + Web context in every
+major section where relevant; explicitly resolve tensions (for example, optimistic sentiment versus weak risk-adjusted
+returns) rather than reporting each signal in isolation.
 For COMPARISON queries: weave both companies through every section with explicit relative rankings and quantified
 spread analysis. Never analyse them in isolation. State which company leads on each named metric and by how much.
 
@@ -2268,6 +2314,93 @@ def _build_stock_research_context(sr_output: Dict[str, Any]) -> List[str]:
     # ── Error / empty guard ───────────────────────────────────────────────────
     if sr_output.get("error"):
         parts.append(f"Pipeline error: {sr_output['error']}")
+        return parts
+
+    # ── Deterministic transcript features ─────────────────────────────────────
+    features = sr_output.get("features") or {}
+    latest_feat = features.get("latest") or {}
+    prev_feat = features.get("previous") or {}
+    kpi_diff = features.get("kpi_diff") or {}
+
+    if latest_feat:
+        parts.append(
+            f"Transcript features (latest): "
+            f"kpi_per_1k_words={latest_feat.get('kpi_per_1k_words')}, "
+            f"hedge_ratio={latest_feat.get('hedge_ratio')}, "
+            f"evasive_count={latest_feat.get('evasive_count')}, "
+            f"qa_vs_prep_hedge_delta={latest_feat.get('qa_vs_prep_hedge_delta')}, "
+            f"pivot_per_1k_words={latest_feat.get('pivot_per_1k_words')}"
+        )
+    if prev_feat:
+        parts.append(
+            f"Transcript features (previous): "
+            f"kpi_per_1k_words={prev_feat.get('kpi_per_1k_words')}, "
+            f"hedge_ratio={prev_feat.get('hedge_ratio')}"
+        )
+    if kpi_diff:
+        dropped = kpi_diff.get("dropped_kpis") or []
+        added = kpi_diff.get("added_kpis") or []
+        if dropped or added:
+            parts.append(f"KPI changes: dropped={dropped}, added={added}")
+
+    # ── Broker rating distribution ────────────────────────────────────────────
+    broker_labels_raw = sr_output.get("broker_labels") or {}
+    broker_parsed = sr_output.get("broker_parsed") or []
+
+    if isinstance(broker_labels_raw, dict):
+        broker_labels_list = list(broker_labels_raw.values())
+    elif isinstance(broker_labels_raw, list):
+        broker_labels_list = broker_labels_raw
+    else:
+        broker_labels_list = []
+
+    if broker_labels_list:
+        bullish = sum(1 for v in broker_labels_list if (v or {}).get("rating") == "bullish")
+        neutral = sum(1 for v in broker_labels_list if (v or {}).get("rating") == "neutral")
+        bearish = sum(1 for v in broker_labels_list if (v or {}).get("rating") == "bearish")
+        unknown = sum(1 for v in broker_labels_list if (v or {}).get("rating") not in ("bullish", "neutral", "bearish"))
+        parts.append(
+            f"Broker rating distribution: {bullish} bullish / {neutral} neutral / "
+            f"{bearish} bearish / {unknown} unknown (from {len(broker_labels_list)} broker reports)"
+        )
+
+    if broker_parsed:
+        for bp in broker_parsed[:5]:
+            pt = bp.get("price_target")
+            eps = bp.get("eps_estimates") or {}
+            name = bp.get("broker_name", bp.get("institution", "unknown"))
+            rating = bp.get("rating", "")
+            line = f"Broker {name} [{rating}]:"
+            if pt is not None:
+                line += f" price_target={pt}"
+            if eps:
+                if isinstance(eps, dict):
+                    eps_str = ", ".join(f"{k}={v}" for k, v in list(eps.items())[:3])
+                elif isinstance(eps, list):
+                    eps_str = "; ".join(str(e) for e in eps[:3])
+                else:
+                    eps_str = str(eps)
+                line += f" eps={{{eps_str}}}"
+            if line.strip().endswith(":"):
+                line += " (no structured data extracted)"
+            parts.append(line)
+
+    # ── LLM-generated analyses ────────────────────────────────────────────────
+    transcript_cmp = sr_output.get("transcript_comparison", "")
+    if transcript_cmp:
+        parts.append("Transcript Comparison (LLM, cited):")
+        parts.append(transcript_cmp.strip())
+
+    qa_behavior = sr_output.get("qa_behavior", "")
+    if qa_behavior:
+        parts.append("Q&A Behaviour Analysis (LLM, cited):")
+        parts.append(qa_behavior.strip())
+
+    broker_consensus = sr_output.get("broker_consensus", "")
+    if broker_consensus:
+        parts.append("Broker Consensus (LLM, cited):")
+        parts.append(broker_consensus.strip())
+
     return parts
 
 
@@ -2384,95 +2517,6 @@ def _build_insider_news_context(insider_output: Dict[str, Any]) -> List[str]:
         recommendation = investment_thesis.get("recommendation", "")
         if recommendation:
             parts.append(f"Recommendation: {recommendation}")
-
-    return parts
-
-    latest_feat = features.get("latest") or {}
-    prev_feat   = features.get("previous") or {}
-    kpi_diff    = features.get("kpi_diff") or {}
-
-    if latest_feat:
-        parts.append(
-            f"Transcript features (latest): "
-            f"kpi_per_1k_words={latest_feat.get('kpi_per_1k_words')}, "
-            f"hedge_ratio={latest_feat.get('hedge_ratio')}, "
-            f"evasive_count={latest_feat.get('evasive_count')}, "
-            f"qa_vs_prep_hedge_delta={latest_feat.get('qa_vs_prep_hedge_delta')}, "
-            f"pivot_per_1k_words={latest_feat.get('pivot_per_1k_words')}"
-        )
-    if prev_feat:
-        parts.append(
-            f"Transcript features (previous): "
-            f"kpi_per_1k_words={prev_feat.get('kpi_per_1k_words')}, "
-            f"hedge_ratio={prev_feat.get('hedge_ratio')}"
-        )
-    if kpi_diff:
-        dropped = kpi_diff.get("dropped_kpis") or []
-        added   = kpi_diff.get("added_kpis") or []
-        if dropped or added:
-            parts.append(f"KPI changes: dropped={dropped}, added={added}")
-
-    # ── Broker rating distribution ─────────────────────────────────────────────
-    broker_labels_raw = sr_output.get("broker_labels") or {}
-    broker_parsed = sr_output.get("broker_parsed") or []
-
-    # broker_labels may be a list (from agent_step4_broker_labels) or a dict.
-    # Normalise to list[dict] for counting.
-    if isinstance(broker_labels_raw, dict):
-        broker_labels_list = list(broker_labels_raw.values())
-    elif isinstance(broker_labels_raw, list):
-        broker_labels_list = broker_labels_raw
-    else:
-        broker_labels_list = []
-
-    if broker_labels_list:
-        bullish = sum(1 for v in broker_labels_list if (v or {}).get("rating") == "bullish")
-        neutral = sum(1 for v in broker_labels_list if (v or {}).get("rating") == "neutral")
-        bearish = sum(1 for v in broker_labels_list if (v or {}).get("rating") == "bearish")
-        unknown = sum(1 for v in broker_labels_list if (v or {}).get("rating") not in ("bullish","neutral","bearish"))
-        parts.append(
-            f"Broker rating distribution: {bullish} bullish / {neutral} neutral / "
-            f"{bearish} bearish / {unknown} unknown  (from {len(broker_labels_list)} broker reports)"
-        )
-
-    # Per-broker price targets and EPS estimates (up to 5 brokers)
-    if broker_parsed:
-        for bp in broker_parsed[:5]:
-            pt   = bp.get("price_target")
-            eps  = bp.get("eps_estimates") or {}
-            name = bp.get("broker_name", bp.get("institution", "unknown"))
-            rating = bp.get("rating", "")
-            line = f"  Broker {name} [{rating}]:"
-            if pt is not None:
-                line += f" price_target={pt}"
-            if eps:
-                # eps_estimates may be a dict or a list of strings — handle both
-                if isinstance(eps, dict):
-                    eps_str = ", ".join(f"{k}={v}" for k, v in list(eps.items())[:3])
-                elif isinstance(eps, list):
-                    eps_str = "; ".join(str(e) for e in eps[:3])
-                else:
-                    eps_str = str(eps)
-                line += f" eps={{{eps_str}}}"
-            if line.strip().endswith(":"):
-                line += " (no structured data extracted)"
-            parts.append(line)
-
-    # ── LLM-generated analyses ────────────────────────────────────────────────
-    transcript_cmp = sr_output.get("transcript_comparison", "")
-    if transcript_cmp:
-        parts.append("Transcript Comparison (LLM, cited):")
-        parts.append(transcript_cmp.strip())
-
-    qa_behavior = sr_output.get("qa_behavior", "")
-    if qa_behavior:
-        parts.append("Q&A Behaviour Analysis (LLM, cited):")
-        parts.append(qa_behavior.strip())
-
-    broker_consensus = sr_output.get("broker_consensus", "")
-    if broker_consensus:
-        parts.append("Broker Consensus (LLM, cited):")
-        parts.append(broker_consensus.strip())
 
     return parts
 
@@ -2798,6 +2842,7 @@ CRITICAL RULES:
 2. Every sentence containing a number must end with a citation marker like [1], [2] etc.
 3. Use only numbers that appear in the JSON data object. Do NOT add any extra numbers from memory.
 3b. If a value is missing/null, explicitly state data is unavailable instead of inventing a proxy number.
+3c. Never output placeholder tokens such as "N/A", "n/a", "NA", "null", or "TBD" in narrative prose.
 4. Write in flowing multi-sentence paragraphs — NO bullet points, NO lists.
 5. Use professional financial terminology throughout.
 6. BALANCE SHEET: total_assets, total_liabilities, and total_equity are THREE DISTINCT values. Never confuse them.
@@ -2820,6 +2865,69 @@ SYNTHESIS GUIDANCE:
 - Connect recent news (Web Search) to financial performance (Quant/BA)
 - Integrate macro economic factors into the overall investment thesis
 - Factor in insider buying/selling as sentiment signals"""
+
+
+def _sanitize_unavailable_tokens(text: str) -> str:
+    """Remove placeholder tokens (N/A style) from final prose.
+
+    We never want user-facing output to contain placeholders like "N/A-day".
+    Replace these with readable, non-hallucinatory language.
+    """
+    if not text:
+        return text
+
+    # Handle forms like "N/A-day", "n/a day", "N.A.-month", "NA-year".
+    text = re.sub(
+        r"\b(?:N\s*/\s*A|N\.A\.|NA|n\s*/\s*a|null|NULL|tbd|TBD)\b(?:[-\s]*(?:day|week|month|year))?",
+        "data unavailable",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    # Clean malformed forms like "-data unavailable".
+    text = re.sub(r"(?:^|\s)-\s*data unavailable\b", " data unavailable", text, flags=re.IGNORECASE)
+
+    # Remove malformed percentage/currency attachments such as
+    # "data unavailable%" or "$data unavailable" that can leak into translated output.
+    text = re.sub(r"\$\s*data unavailable", "data unavailable", text, flags=re.IGNORECASE)
+    text = re.sub(r"data unavailable\s*[%٪％]", "data unavailable", text, flags=re.IGNORECASE)
+
+    # Collapse repeated spaces/tabs only (preserve newlines/section structure).
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    return text
+
+
+def _normalize_placeholder_citations(text: str, fallback_index: int = 1) -> str:
+    """Replace unresolved placeholder citations like [N] with a valid numeric ref.
+
+    Some model outputs follow the instruction format literally and emit [N].
+    Convert those placeholders into a concrete index so final output never leaks [N].
+    """
+    if not text:
+        return text
+    idx = max(1, int(fallback_index or 1))
+    return re.sub(r"\[\s*[Nn]\s*\]", f"[{idx}]", text)
+
+
+def _normalize_markdown_section_spacing(text: str) -> str:
+    """Ensure markdown section headers are on standalone lines.
+
+    Guards against model output like:
+      "... critical test. ## Macroeconomic Factors ..."
+    which breaks heading rendering in markdown viewers.
+    """
+    if not text:
+        return text
+
+    # Force section headers to start on a new paragraph.
+    text = re.sub(r"(?<!\n)\s*(##\s+)", r"\n\n\1", text)
+
+    # Keep exactly one blank line after each section header.
+    text = re.sub(r"(?m)^(##\s+[^\n]+)\n(?!\n)", r"\1\n\n", text)
+
+    # Collapse overly large gaps without removing paragraph structure.
+    text = re.sub(r"\n{4,}", "\n\n\n", text)
+    return text
 
 
 def summarise_results_structured(
@@ -2885,7 +2993,32 @@ def summarise_results_structured(
     anchor = _build_anchor_dict(effective_tickers, effective_quant, effective_fm)
     logger.info("[structured] Anchor built: %d fields for tickers=%s", len(anchor), effective_tickers)
 
-    # For now support single-ticker path (extend later for multi-ticker comparison)
+    # Structured schema is currently single-ticker. For comparisons, use the
+    # multi-ticker summariser path so both companies are synthesized faithfully.
+    if len(effective_tickers) > 1:
+        logger.info(
+            "[structured] Multi-ticker comparison detected (%s) — using multi-ticker summarise_results path",
+            effective_tickers,
+        )
+        return summarise_results(
+            user_query=user_query,
+            tickers=effective_tickers,
+            ba_outputs=effective_ba,
+            quant_outputs=effective_quant,
+            web_outputs=effective_web,
+            fm_outputs=effective_fm,
+            sr_outputs=effective_sr,
+            macro_outputs=effective_macro,
+            insider_news_outputs=effective_insider,
+            ticker=ticker,
+            ba_output=ba_output,
+            quant_output=quant_output,
+            web_output=web_output,
+            data_availability=data_availability,
+            output_language=output_language,
+            _trace_out=_trace_out,
+        )
+
     primary_ticker = effective_tickers[0]
     schema = _build_json_schema(anchor, primary_ticker)
 
@@ -3010,6 +3143,8 @@ AGENT SOURCES TO SYNTHESIZE:
 - WEB SEARCH outputs: recent news, analyst actions, macro headwinds/tailwinds, market sentiment
 - FINANCIAL MODELLING outputs: DCF intrinsic value, bull/bear/base scenarios, margin forecasts
 - STOCK RESEARCH outputs: earnings call tone, broker consensus, Q&A dynamics, forward-looking catalysts
+- MACRO outputs: market regime, macro themes, top macro drivers, risk scenarios
+- INSIDER NEWS outputs: insider buy/sell activity, net positioning, news sentiment trends
 
 Write EXACTLY these 11 sections in this order, using ## headers:
 ## Executive Summary
@@ -3030,12 +3165,14 @@ ANALYSIS DEPTH REQUIREMENTS:
 - Example: Don't just say "ROIC is 58%" — explain "58% ROIC indicates exceptional capital efficiency, suggesting a durable competitive moat and strong pricing power"
 - Connect data points: How do earnings trends relate to cash flow? What drove margin expansion?
 - Forward-looking: What do current trends imply for next quarter/year?
-- Weave ALL 5 agent outputs together — don't siloe them
+- Weave ALL available agent outputs together — do not treat them as silos
 
 RULES:
 - Every number you write MUST appear in the JSON data above. NO other numbers.
-- Do NOT introduce numbers not present in the JSON (no RSI, no current ratio, no market capitalisation unless it's in the JSON).
+- Structural period labels are allowed even if not in JSON (e.g., 12-month, 14-day RSI, 20/50/200-day moving averages).
+- Do NOT introduce metric values that are not present in the JSON.
 - If a number is not present in JSON, write a qualitative sentence without a numeric literal.
+- Never print placeholders such as N/A, n/a, NA, null, or TBD in the narrative. Use "data unavailable" wording.
 - Every sentence with a number must end with [N] citation.
 - Flowing prose paragraphs only — NO bullet points, NO lists.
 - 6-10 sentences per section minimum to ensure depth.
@@ -3145,6 +3282,9 @@ RULES:
         logger.warning("[structured] Stage3.5: fixed %d double-decimal artefacts after audit (%d remain)",
                        _dd_before - _dd_after, _dd_after)
 
+    # ── Stage 3.6: Strip N/A-style placeholder tokens ─────────────────────────
+    prose = _sanitize_unavailable_tokens(prose)
+
     # ── Inject full combined citation block (BA + SR + Web + Quant + FM) ─────
     # Keep numbering consistent with build_citation_block ordering.
     from .citations import build_citation_block, inject_inline_numbers  # type: ignore[import]
@@ -3176,6 +3316,8 @@ RULES:
         offset += len(chunk_id_map)
 
     prose = inject_inline_numbers(prose, all_chunk_id_maps)
+    prose = _normalize_placeholder_citations(prose, 1)
+    prose = _normalize_markdown_section_spacing(prose)
     combined_ref_block = "\n".join(ref_blocks) if ref_blocks else ""
     if combined_ref_block:
         prose = prose.rstrip() + "\n" + combined_ref_block
@@ -3203,6 +3345,8 @@ RULES:
     if output_language:
         try:
             prose = translate_text(prose, output_language)
+            prose = _normalize_placeholder_citations(prose, 1)
+            prose = _normalize_markdown_section_spacing(prose)
             logger.info("[structured] Stage4: translated to %s (%d chars)", output_language, len(prose))
         except Exception as _te:
             logger.warning("[structured] Stage4 translation failed (returning English): %s", _te)
@@ -3324,9 +3468,10 @@ def _audit_and_replace_numbers(
             replacement = str(anchor[best_key])
             logger.info("[audit] Replacing stray number %s with anchor %s=%s", num_str, best_key, replacement)
             return replacement
-        # No safe anchor match: redact numeric literal to prevent hallucinated figures
+        # No safe anchor match: redact numeric literal to prevent hallucinated figures.
+        # Use plain-language token rather than N/A so user output stays clean.
         logger.warning("[audit] Stray number %s not in anchor — redacting", num_str)
-        return "N/A"
+        return "data unavailable"
 
     # Match standalone numbers (not inside words or immediately followed by a decimal point,
     # which would indicate we're matching just the integer part of a larger decimal number
@@ -3430,6 +3575,10 @@ def summarise_results(
         ctx_parts.append(
             "COMPARISON QUERY: Analyse both companies across every dimension and "
             "provide explicit relative assessments. Do not analyse them in isolation."
+        )
+        ctx_parts.append(
+            "COMPARISON HARD RULE: In EACH section, mention both tickers explicitly and "
+            "state at least one relative conclusion (which is stronger/weaker and why)."
         )
 
     # ── LOCKED DATA ANCHOR: pre-computed from agent outputs ──────────────────
@@ -3602,16 +3751,6 @@ def summarise_results(
     for sr_o in effective_sr:
         if sr_o:
             ctx_parts.extend(_build_stock_research_context(sr_o))
-            ctx_parts.append("")
-
-    for macro_o in effective_macro:
-        if macro_o:
-            ctx_parts.extend(_build_macro_context(macro_o))
-            ctx_parts.append("")
-
-    for insider_o in effective_insider:
-        if insider_o:
-            ctx_parts.extend(_build_insider_news_context(insider_o))
             ctx_parts.append("")
 
     for macro_o in effective_macro:
@@ -3858,6 +3997,9 @@ def summarise_results(
 
     cleaned = _strip_rec_paragraphs(cleaned)
 
+    # ── 4d. Remove N/A-style placeholders from user-facing narrative ──────────
+    cleaned = _sanitize_unavailable_tokens(cleaned)
+
     # ── 4e-pre. Strip LLM-generated metadata lines from body text ────────────
     # The LLM sometimes writes its own "AAPL | Equity Research Note | 2026-02-28"
     # line (or variants with * italic markers) inside the body. Strip these before
@@ -3969,6 +4111,8 @@ def summarise_results(
 
     # ── 5. Replace any residual chunk_id tokens with [N] numbers ─────────────
     cleaned = inject_inline_numbers(cleaned, all_chunk_id_maps)
+    cleaned = _normalize_placeholder_citations(cleaned, 1)
+    cleaned = _normalize_markdown_section_spacing(cleaned)
 
     # ── 5b. Fix double-decimal artefacts (e.g. "$435.62.62B", "18.72.8%") ────
     # The Stage-2 LLM sometimes duplicates or concatenates decimal parts.
@@ -4001,6 +4145,85 @@ def summarise_results(
 def translate_text(text: str, target_language: str) -> str:
     """Translate report body only, keep citations/references unchanged."""
 
+    lang = str(target_language or "").strip().lower()
+    if not lang or lang == "english":
+        return text
+
+    # Canonicalise common aliases from UI/planner/user prompts.
+    _LANG_ALIASES = {
+        "zh": "mandarin",
+        "chinese": "mandarin",
+        "putonghua": "mandarin",
+        "cn": "mandarin",
+        "mandrain": "mandarin",
+        "mandarine": "mandarin",
+        "yue": "cantonese",
+        "cantonese chinese": "cantonese",
+        "cantones": "cantonese",
+        "cantoness": "cantonese",
+        "jp": "japanese",
+        "ja": "japanese",
+        "jpn": "japanese",
+        "kr": "korean",
+        "ko": "korean",
+    }
+    lang = _LANG_ALIASES.get(lang, lang)
+
+    def _non_latin_ratio(s: str, bucket: str) -> float:
+        if not s:
+            return 0.0
+        total = max(len([c for c in s if not c.isspace()]), 1)
+
+        def _match(code: int) -> bool:
+            if bucket == "japanese":
+                return (0x3040 <= code <= 0x30FF) or (0x4E00 <= code <= 0x9FFF)
+            if bucket == "korean":
+                return 0xAC00 <= code <= 0xD7AF
+            if bucket in ("mandarin", "cantonese"):
+                return 0x4E00 <= code <= 0x9FFF
+            if bucket == "arabic":
+                return 0x0600 <= code <= 0x06FF
+            if bucket == "russian":
+                return 0x0400 <= code <= 0x04FF
+            if bucket == "hindi":
+                return 0x0900 <= code <= 0x097F
+            if bucket == "thai":
+                return 0x0E00 <= code <= 0x0E7F
+            return False
+
+        cnt = 0
+        for ch in s:
+            if ch.isspace():
+                continue
+            if _match(ord(ch)):
+                cnt += 1
+        return cnt / total
+
+    def _translation_looks_target_language(s: str, bucket: str) -> bool:
+        # Strict checks for non-Latin script targets where accidental English fallback is common.
+        if bucket in {"japanese", "korean", "mandarin", "cantonese", "arabic", "russian", "hindi", "thai"}:
+            return _non_latin_ratio(s, bucket) >= 0.08
+
+        # Lightweight lexical checks for Latin-script targets so accidental English
+        # fallback is retried instead of silently accepted.
+        normalized = f" {(s or '').lower()} "
+        if bucket == "spanish":
+            markers = [" el ", " la ", " los ", " las ", " de ", " y ", " que ", " para "]
+            return sum(1 for m in markers if m in normalized) >= 2
+        if bucket == "french":
+            markers = [" le ", " la ", " les ", " des ", " et ", " que ", " pour ", " avec "]
+            return sum(1 for m in markers if m in normalized) >= 2
+        if bucket == "german":
+            markers = [" der ", " die ", " das ", " und ", " mit ", " für ", " auf "]
+            return sum(1 for m in markers if m in normalized) >= 2
+        if bucket == "portuguese":
+            markers = [" o ", " a ", " os ", " as ", " de ", " e ", " que ", " para "]
+            return sum(1 for m in markers if m in normalized) >= 2
+        if bucket == "italian":
+            markers = [" il ", " lo ", " la ", " gli ", " le ", " e ", " che ", " per "]
+            return sum(1 for m in markers if m in normalized) >= 2
+        return True
+
     # Keep citations/source list in original language and formatting.
     # We only translate the narrative body before the References block.
     ref_match = re.search(r"\n---\n###\s+References\b", text, flags=re.IGNORECASE)
@@ -4012,9 +4235,12 @@ def translate_text(text: str, target_language: str) -> str:
         references_block = ""
 
     system_prompt = (
-        "You are a senior translator for financial research. Translate the provided report into "
-        f"{target_language} while preserving formatting, headers, numeric citations, and analytical tone."
-        " Do not add commentary. Keep all [N] numeric citations unchanged. "
+        "You are a senior translator for financial research. "
+        f"Translate the provided report into {lang}. "
+        "HARD RULE: the translated report body MUST be in the target language, not English. "
+        "Allow English only for ticker symbols, company names, source names, URLs, and citation tokens like [1]. "
+        "Preserve markdown formatting, section headers, numeric values, and analytical tone. "
+        "Do not add commentary or explanations. Keep all [N] citations unchanged. "
         "Do NOT translate the References section, source titles, URLs, file names, or citation labels."
     )
 
@@ -4023,16 +4249,31 @@ def translate_text(text: str, target_language: str) -> str:
 """ + body_text + "\n\nTranslation:"""
 
     try:
-        translated = _deepseek_generate(
-            _TRANSLATION_MODEL,
-            prompt,
-            max_tokens=4096,
-            temperature=0.1,
-            system_prompt=system_prompt,
-        )
-        translated = _strip_think(translated)
-        translated = _strip_fences(translated)
-        translated_body = translated.strip() or body_text
+        translated_body = body_text
+        for attempt in range(3):
+            attempt_prompt = prompt
+            if attempt >= 1:
+                attempt_prompt = (
+                    "RETRY (strict): Previous output was not sufficiently in the target language. "
+                    f"Return ONLY {lang} for the report body (except tickers/company names/URLs/[N] citations).\n\n"
+                    + prompt
+                )
+
+            translated = _deepseek_generate(
+                _TRANSLATION_MODEL,
+                attempt_prompt,
+                max_tokens=4096,
+                temperature=0.0,
+                system_prompt=system_prompt,
+            )
+            translated = _strip_think(translated)
+            translated = _strip_fences(translated)
+            candidate = translated.strip() or body_text
+            translated_body = candidate
+
+            if _translation_looks_target_language(candidate, lang):
+                break
+
         if references_block:
             return translated_body.rstrip() + "\n" + references_block.lstrip("\n")
         return translated_body

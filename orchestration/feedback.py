@@ -60,6 +60,52 @@ def _is_uninformative_worst_case(row: Dict[str, Any]) -> bool:
     return False
 
 
+def _infer_report_language(
+    output_language: Optional[str],
+    user_query: str,
+    final_summary: str,
+) -> str:
+    """Infer report language so the judge can evaluate multilingual outputs reliably."""
+    if isinstance(output_language, str) and output_language.strip():
+        return output_language.strip().lower()
+
+    q = (user_query or "").lower()
+    query_hints = {
+        "spanish": ["in spanish", "espanol"],
+        "french": ["in french", "francais"],
+        "german": ["in german", "deutsch"],
+        "japanese": ["in japanese", "nihongo"],
+        "korean": ["in korean", "hangul"],
+        "mandarin": ["in mandarin", "putonghua", "chinese"],
+        "cantonese": ["in cantonese", "yue"],
+        "vietnamese": ["in vietnamese", "tieng viet"],
+        "arabic": ["in arabic"],
+    }
+    for lang, hints in query_hints.items():
+        if any(h in q for h in hints):
+            return lang
+
+    s = final_summary or ""
+    for ch in s:
+        code = ord(ch)
+        if 0xAC00 <= code <= 0xD7AF:
+            return "korean"
+        if 0x3040 <= code <= 0x30FF:
+            return "japanese"
+        if 0x4E00 <= code <= 0x9FFF:
+            return "chinese"
+        if 0x0600 <= code <= 0x06FF:
+            return "arabic"
+        if 0x0400 <= code <= 0x04FF:
+            return "cyrillic"
+        if 0x0900 <= code <= 0x097F:
+            return "devanagari"
+        if 0x0E00 <= code <= 0x0E7F:
+            return "thai"
+
+    return "english"
+
+
 def _get_pg_conn():
     """Open a new psycopg2 connection using env vars."""
     return psycopg2.connect(
@@ -142,6 +188,7 @@ def _call_deepseek_judge(
     report: str,
     user_query: str,
     agent_outputs_summary: str,
+    report_language: str = "english",
 ) -> Dict[str, Any]:
     """Call DeepSeek as a judge to score the report on multiple dimensions.
     
@@ -172,11 +219,17 @@ You must score the report on these 4 dimensions (0-10 scale):
    11. Analyst Verdict
    Score 10 = all 11 present; subtract 1 point per missing section. Read the ENTIRE report before scoring.
 
-4. LANGUAGE QUALITY: Professional tone, no banned words (robust, solid, strong performance, etc.)
+4. LANGUAGE QUALITY: Professional tone in the REPORT LANGUAGE, no generic hype language,
+   and terminology appropriate for institutional investment analysis.
 
 IMPORTANT: Do NOT score factual_accuracy. The upstream agent pipelines are deterministic and
 grounded in database outputs; this evaluator focuses on citation quality, analytical quality,
 structure compliance, and language quality only.
+
+MULTILINGUAL REQUIREMENT:
+- The report may be in any language.
+- Evaluate quality in the report's own language; do NOT penalize non-English output.
+- Judge clarity, professionalism, and analytical precision relative to that language.
 
 IMPORTANT: You must provide a JSON response with these exact keys:
 - citation_completeness (float 0-10)
@@ -202,6 +255,8 @@ agent_blamed should identify which agent most likely caused any issues:
     judge_user_prompt = f"""Evaluate this research report:
 
 USER QUERY: {user_query}
+
+REPORT LANGUAGE: {report_language}
 
 AGENT OUTPUTS SUMMARY (ground truth — use these to check factual accuracy):
 {agent_outputs_summary}
@@ -306,6 +361,7 @@ def score_report_with_rlaif(
     final_summary: str,
     agent_outputs: Dict[str, Any],
     ticker: Optional[str] = None,
+    output_language: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Score a report using RLAIF and store the feedback.
     
@@ -315,6 +371,7 @@ def score_report_with_rlaif(
         final_summary: The generated report
         agent_outputs: Dict containing all agent outputs for reference
         ticker: Optional ticker symbol
+        output_language: Optional target output language detected by orchestration
         
     Returns:
         Dict with RLAIF scores and feedback
@@ -503,8 +560,14 @@ def score_report_with_rlaif(
     
     agent_outputs_summary = "\n".join(outputs_parts) if outputs_parts else "No agent outputs available"
     
-    # Call DeepSeek judge
-    scores = _call_deepseek_judge(final_summary, user_query, agent_outputs_summary)
+    # Call DeepSeek judge (language-aware for multilingual summaries)
+    report_language = _infer_report_language(output_language, user_query, final_summary)
+    scores = _call_deepseek_judge(
+        final_summary,
+        user_query,
+        agent_outputs_summary,
+        report_language=report_language,
+    )
     
     # Store in database
     try:
@@ -868,6 +931,94 @@ def get_worst_cases(
         return []
 
 
+def get_lowest_rlaif_cases(limit: int = 5, min_runs: int = 3) -> List[Dict[str, Any]]:
+    """Fetch lowest-scored RLAIF rows only (no user-feedback join sorting)."""
+    ensure_feedback_tables_exist()
+    try:
+        conn = _get_pg_conn()
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT COUNT(*) AS cnt FROM rl_feedback")
+            total = (cur.fetchone() or {}).get("cnt", 0)
+            if total < min_runs:
+                logger.debug(
+                    "[feedback] get_lowest_rlaif_cases: only %d run(s), need %d.",
+                    total,
+                    min_runs,
+                )
+                return []
+
+            cur.execute(
+                """
+                SELECT
+                    run_id,
+                    user_query,
+                    ticker,
+                    overall_score,
+                    agent_blamed,
+                    weaknesses,
+                    specific_feedback,
+                    timestamp
+                FROM rl_feedback
+                ORDER BY overall_score ASC NULLS LAST, timestamp DESC
+                LIMIT %s
+                """,
+                (limit,),
+            )
+            rows = [dict(r) for r in cur.fetchall()]
+        conn.close()
+
+        filtered: List[Dict[str, Any]] = []
+        for row in rows:
+            if _is_uninformative_worst_case(row):
+                continue
+            row["weaknesses"] = _normalise_weaknesses(row.get("weaknesses"))
+            filtered.append(row)
+        return filtered
+    except Exception as exc:
+        logger.warning("[feedback] get_lowest_rlaif_cases failed (non-fatal): %s", exc)
+        return []
+
+
+def get_latest_user_feedback(limit: int = 5) -> List[Dict[str, Any]]:
+    """Fetch latest explicit human feedback rows for planner in-context learning."""
+    ensure_feedback_tables_exist()
+    try:
+        conn = _get_pg_conn()
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT
+                    run_id,
+                    session_id,
+                    helpful,
+                    comment,
+                    issue_tags,
+                    report_version,
+                    timestamp
+                FROM user_feedback
+                ORDER BY timestamp DESC
+                LIMIT %s
+                """,
+                (limit,),
+            )
+            rows = [dict(r) for r in cur.fetchall()]
+        conn.close()
+
+        for row in rows:
+            tags = row.get("issue_tags")
+            if isinstance(tags, str):
+                try:
+                    tags = json.loads(tags)
+                except Exception:
+                    tags = [tags]
+            row["issue_tags"] = [str(t).strip() for t in (tags or []) if str(t).strip()]
+            row["comment"] = str(row.get("comment") or "").strip()
+        return rows
+    except Exception as exc:
+        logger.warning("[feedback] get_latest_user_feedback failed (non-fatal): %s", exc)
+        return []
+
+
 __all__ = [
     "ensure_feedback_tables_exist",
     "score_report_with_rlaif",
@@ -877,4 +1028,6 @@ __all__ = [
     "get_agent_performance_summary",
     "check_low_score_alert",
     "get_worst_cases",
+    "get_lowest_rlaif_cases",
+    "get_latest_user_feedback",
 ]

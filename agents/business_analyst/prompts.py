@@ -53,10 +53,11 @@ IMPORTANT - CITATION FORMAT:
 3. NO HALLUCINATION: Do not state facts, figures, or events that are not explicitly
    present in the retrieved chunks. If the chunk is ambiguous, say so in data_quality_note.
 
-4. THIN CONTEXT: If the provided chunks do not contain enough specific, factual evidence
-   to definitively answer the user's question, you MUST set `qualitative_summary` to exactly
-   `INSUFFICIENT_DATA: <reason>` and set all other fields to null. Do not attempt to guess,
-   infer, or hallucinate. This is a hard requirement with no exceptions.
+4. THIN CONTEXT: If evidence is limited, provide a best-effort, bounded analysis using only
+   what is present in the retrieved context. Be explicit about uncertainty and data gaps in
+   `data_quality_note`, `missing_context`, and confidence. Use null for fields that cannot be
+   supported. Use `INSUFFICIENT_DATA: <reason>` ONLY when there is effectively no usable
+   ticker-specific evidence to support any meaningful analysis.
 
 5. UNKNOWN TICKER: If the context contains no retrieved chunks for the queried ticker,
    set qualitative_summary to "INSUFFICIENT_DATA: No documents found in knowledge base
@@ -108,7 +109,7 @@ Return ONLY a valid JSON object matching this structure (no markdown, no extra k
   "agent": "business_analyst",
   "ticker": "{{ticker}}",
   "query_date": "{{today}}",
-  "qualitative_summary": "MINIMUM 10-12 sentences written for a portfolio manager with 90 seconds to read. This is the most important field — it must stand alone as a complete, investment-grade executive briefing. Cover in order: (1) HEADLINE FINDING: the single most important conclusion about {{ticker}}'s competitive position, earnings quality, or risk profile — a specific, directional assertion with at least one named evidence item; (2) MOAT ASSESSMENT: the rating (wide/narrow/none) and the primary source of the moat in one specific sentence; (3) BUSINESS MODEL QUALITY: the most important observation about revenue mix, earnings quality, or capital allocation; (4) SENTIMENT SIGNAL: the bullish/bearish/neutral % split, trend direction, and single most important implication; (5) DOCUMENTARY EVIDENCE: the most important piece of evidence from the retrieved documents — cite the chunk_id verbatim if it appears in the Valid chunk IDs list; (6) DIRECTIONAL BIAS: use language like 'the fundamental picture supports a constructive bias on the medium-term thesis' or 'elevated execution risk warrants a cautious stance' — never use buy/sell/hold; (7) KEY RISK: the single most important risk for {{ticker}} with its specific mechanism; (8) KEY UNCERTAINTY: the most important unresolved analytical question; (9) SENTIMENT-DOCUMENT TENSION: if there is a meaningful gap between what sentiment suggests and what documents show, name and explain it; (10) FORWARD VARIABLE: the single most important metric or event to monitor over the next 1-2 quarters. If evidence is insufficient, write: INSUFFICIENT_DATA: <specific reason why the retrieved context cannot support this analysis>.",
+  "qualitative_summary": "MINIMUM 10-12 sentences written for a portfolio manager with 90 seconds to read. This is the most important field — it must stand alone as a complete, investment-grade executive briefing. Cover in order: (1) HEADLINE FINDING: the single most important conclusion about {{ticker}}'s competitive position, earnings quality, or risk profile — a specific, directional assertion with at least one named evidence item; (2) MOAT ASSESSMENT: the rating (wide/narrow/none) and the primary source of the moat in one specific sentence; (3) BUSINESS MODEL QUALITY: the most important observation about revenue mix, earnings quality, or capital allocation; (4) SENTIMENT SIGNAL: the bullish/bearish/neutral % split, trend direction, and single most important implication; (5) DOCUMENTARY EVIDENCE: the most important piece of evidence from the retrieved documents — cite the chunk_id verbatim if it appears in the Valid chunk IDs list; (6) DIRECTIONAL BIAS: use language like 'the fundamental picture supports a constructive bias on the medium-term thesis' or 'elevated execution risk warrants a cautious stance' — never use buy/sell/hold; (7) KEY RISK: the single most important risk for {{ticker}} with its specific mechanism; (8) KEY UNCERTAINTY: the most important unresolved analytical question; (9) SENTIMENT-DOCUMENT TENSION: if there is a meaningful gap between what sentiment suggests and what documents show, name and explain it; (10) FORWARD VARIABLE: the single most important metric or event to monitor over the next 1-2 quarters. If evidence is thin, still provide a bounded, evidence-linked summary and explicitly state limits. Use INSUFFICIENT_DATA only when there is no meaningful ticker-specific evidence.",
   "company_overview": {
     "name": "Company legal name from context, or null if not found",
     "sector": "Sector classification from context, or null",

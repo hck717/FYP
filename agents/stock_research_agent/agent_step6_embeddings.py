@@ -415,6 +415,71 @@ def _embed_query(evidence: EvidenceIndex, query: str) -> np.ndarray:
         return _embed_query_ollama(query)
 
 
+def _tokenize_for_fallback(text: str) -> set[str]:
+    import re
+
+    toks = re.findall(r"[A-Za-z0-9_]+", (text or "").lower())
+    return {t for t in toks if len(t) >= 2}
+
+
+def _keyword_retrieve(
+    evidence: EvidenceIndex,
+    query: str,
+    top_k: int,
+    filter_doc_type: str | None = None,
+    filter_section: str | None = None,
+) -> list[Document]:
+    """Lexical fallback when query embedding backend is unavailable.
+
+    Scores by token overlap between query and chunk text/metadata.
+    """
+    q_tokens = _tokenize_for_fallback(query)
+    scored: list[tuple[float, int]] = []
+
+    for i, chunk in enumerate(evidence.chunks):
+        meta = chunk.metadata
+        if filter_doc_type and meta.get("doc_type") != filter_doc_type:
+            continue
+        if filter_section and meta.get("section") != filter_section:
+            continue
+
+        text_tokens = _tokenize_for_fallback(chunk.page_content)
+        meta_tokens = _tokenize_for_fallback(
+            " ".join(
+                [
+                    str(meta.get("doc_name") or ""),
+                    str(meta.get("section") or ""),
+                    str(meta.get("doc_type") or ""),
+                    str(meta.get("institution") or ""),
+                ]
+            )
+        )
+        overlap = len(q_tokens & (text_tokens | meta_tokens))
+        if overlap > 0:
+            scored.append((float(overlap), i))
+
+    if not scored:
+        # If no lexical matches, return first filtered chunks deterministically.
+        results: list[Document] = []
+        for chunk in evidence.chunks:
+            meta = chunk.metadata
+            if filter_doc_type and meta.get("doc_type") != filter_doc_type:
+                continue
+            if filter_section and meta.get("section") != filter_section:
+                continue
+            results.append(Document(page_content=chunk.page_content, metadata={**meta, "retrieval_score": 0.0}))
+            if len(results) >= top_k:
+                break
+        return results
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    out: list[Document] = []
+    for score, idx in scored[:top_k]:
+        c = evidence.chunks[idx]
+        out.append(Document(page_content=c.page_content, metadata={**c.metadata, "retrieval_score": round(score, 4)}))
+    return out
+
+
 def retrieve(
     evidence: EvidenceIndex,
     query: str,
@@ -422,7 +487,18 @@ def retrieve(
     filter_doc_type: str | None = None,
     filter_section:  str | None = None,
 ) -> list[Document]:
-    q_vec = _embed_query(evidence, query)
+    try:
+        q_vec = _embed_query(evidence, query)
+    except Exception as exc:
+        logger.warning("[step6] Query embedding unavailable; using lexical fallback retrieval: %s", exc)
+        return _keyword_retrieve(
+            evidence,
+            query,
+            top_k=top_k,
+            filter_doc_type=filter_doc_type,
+            filter_section=filter_section,
+        )
+
     q_vec /= max(np.linalg.norm(q_vec), 1e-9)
 
     fetch_k = top_k * 5 if (filter_doc_type or filter_section) else top_k
@@ -461,9 +537,19 @@ def retrieve_broker_evidence(
 
     q_vecs = []
     for q in queries:
-        v = _embed_query(evidence, q)
-        v /= max(np.linalg.norm(v), 1e-9)
-        q_vecs.append(v)
+        try:
+            v = _embed_query(evidence, q)
+            v /= max(np.linalg.norm(v), 1e-9)
+            q_vecs.append(v)
+        except Exception as exc:
+            logger.warning("[step6] Broker query embedding unavailable; using lexical fallback: %s", exc)
+            return _keyword_retrieve(
+                evidence,
+                " ".join(queries),
+                top_k=max(1, top_k_per_doc * 4),
+                filter_doc_type="broker",
+                filter_section=None,
+            )
 
     doc_chunk_indices: dict[str, list[int]] = defaultdict(list)
     for i, chunk in enumerate(evidence.chunks):

@@ -17,6 +17,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from orchestration.citations import build_citation_block
+
 # Ensure repo root is on sys.path
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
@@ -482,3 +484,38 @@ def get_source_type_registry() -> Dict[str, List[str]]:
         "company_filings": ["chunk_id", "filing_type", "period"],
         "news_article": ["chunk_id", "date", "source"],
     }
+
+
+@pytest.mark.prompt
+def test_web_citations_use_human_labels_and_filter_low_quality_domains():
+    """Web references should avoid raw watch?v labels and drop low-quality sources."""
+    web_output = {
+        "ticker": "TSLA",
+        "breaking_news": [
+            {
+                "title": "Tesla opens new battery line",
+                "url": "https://www.reuters.com/world/us/tesla-opens-new-battery-line-2026-03-24/",
+                "published_date": "2026-03-24",
+                "source_tier": 1,
+                "verified": True,
+            }
+        ],
+        "raw_citations": [
+            "https://www.youtube.com/watch?v=vr90J-3AD44",
+            "https://www.wsj.com/finance/stocks/tesla-valuation-2026",
+        ],
+    }
+
+    ref_block, chunk_map = build_citation_block(
+        ba_output=None,
+        quant_output=None,
+        web_output=web_output,
+        ticker="TSLA",
+    )
+
+    assert "Reuters" in ref_block or "reuters" in ref_block.lower()
+    assert "watch?v=" not in ref_block
+    assert "youtube.com" not in ref_block
+    assert "Wall Street Journal" in ref_block or "wsj" in ref_block.lower()
+    # Reuters + WSJ should both survive filtering.
+    assert len(chunk_map) >= 2

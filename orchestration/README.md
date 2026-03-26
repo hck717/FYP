@@ -107,11 +107,14 @@ After each query, the **RLAIF scorer** automatically evaluates the generated rep
 
 | Dimension | Weight | What It Measures |
 |-----------|--------|------------------|
-| Factual Accuracy | 30% | Do all numbers match the original agent outputs? |
-| Citation Completeness | 20% | Does every claim have [N] citation? |
-| Analysis Depth | 25% | Does it explain WHY numbers matter? |
-| Structure Compliance | 15% | Are all 11 sections present in correct order? |
-| Language Quality | 10% | Professional tone, no banned words |
+| Citation Completeness | 30% | Does every claim with numbers have [N] citation? |
+| Analysis Depth | 35% | Does it explain WHY numbers matter? |
+| Structure Compliance | 20% | Are all 11 sections present in correct order? |
+| Language Quality | 15% | Professional tone in the report's own language |
+
+Notes:
+- The judge no longer scores factual accuracy (upstream pipelines are deterministic).
+- RLAIF scoring is language-aware: non-English reports are evaluated in their own language and are not penalized for not being English.
 
 ### Database Tables
 

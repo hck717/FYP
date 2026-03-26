@@ -240,6 +240,12 @@ def _sanitize_llm_markdown(text: str) -> str:
     # Downgrade all ATX headings to level-3 for consistent typography.
     cleaned = re.sub(r"(?m)^\s*#{1,2}\s+", "### ", cleaned)
     cleaned = re.sub(r"(?m)^\s*#{3,}\s+", "### ", cleaned)
+    # Ensure section headers are always on their own lines (prevents
+    # "... sentence. ## Header" from rendering as plain paragraph text).
+    cleaned = re.sub(r"(?<!\n)\s*(##\s+)", r"\n\n\1", cleaned)
+    # Ensure a blank line after each section header for paragraph separation.
+    cleaned = re.sub(r"(?m)^(###\s+[^\n]+)\n(?!\n)", r"\1\n\n", cleaned)
+
     # Collapse excessive blank lines from malformed LLM markdown.
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
     return cleaned.strip()
@@ -2286,13 +2292,13 @@ def main() -> None:
             # Clean and display the text
             final_summary_clean = _sanitize_llm_markdown(final_summary)
             
-            # Check if text has proper formatting
-            has_proper_spaces = " " in final_summary_clean[:100] and "\n" in final_summary_clean[:500]
+            # Check if text has proper markdown structure
+            has_markdown_sections = "\n## " in final_summary_clean or "\n### " in final_summary_clean
             
             # Show toggle for raw vs formatted view
             col1, col2 = st.columns([1, 5])
             with col1:
-                show_raw = st.checkbox("Raw text", value=not has_proper_spaces, key="show_raw_text")
+                show_raw = st.checkbox("Raw text", value=not has_markdown_sections, key="show_raw_text")
             with col2:
                 pass
 

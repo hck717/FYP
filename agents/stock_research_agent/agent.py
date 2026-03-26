@@ -166,32 +166,32 @@ def run_full_analysis(
     raw: Dict[str, Any] = {}
     data_source: str = "none"
 
-    # ── Try PG mode first ──────────────────────────────────────────────────────
-    use_neo4j = _pg_has_data(ticker)
+    # ── Try DB-backed mode first (Neo4j chunks + PGvector embeddings) ────────
+    # Do NOT gate this on a PostgreSQL pre-check: that can return false negatives
+    # even when Neo4j has the required transcript/broker chunks for this ticker.
+    use_neo4j = True
 
-    if use_neo4j:
-        logger.info("[stock_research] PostgreSQL/pgvector data found for ticker=%s — using PG mode", ticker)
-        try:
-            from agents.stock_research_agent.agent_step1_neo4j import load_neo4j_pages  # type: ignore[import]
-            transcript_pages, broker_pages, latest_name, previous_name = load_neo4j_pages(ticker)
+    try:
+        from agents.stock_research_agent.agent_step1_neo4j import load_neo4j_pages  # type: ignore[import]
+        transcript_pages, broker_pages, latest_name, previous_name = load_neo4j_pages(ticker)
 
-            raw: Dict[str, Any] = _run(
-                ticker=ticker,
-                base_dir=base_dir,
-                use_neo4j=True,
-                transcript_pages=transcript_pages,
-                broker_pages=broker_pages,
-                latest_name=latest_name,
-                previous_name=previous_name,
-            )
-            data_source = "pg"
-        except Exception as exc:
-            logger.warning(
-                "[stock_research] PG mode failed for ticker=%s (%s) — "
-                "falling back to PDF mode",
-                ticker, exc,
-            )
-            use_neo4j = False
+        raw = _run(
+            ticker=ticker,
+            base_dir=base_dir,
+            use_neo4j=True,
+            transcript_pages=transcript_pages,
+            broker_pages=broker_pages,
+            latest_name=latest_name,
+            previous_name=previous_name,
+        )
+        data_source = "pg"
+    except Exception as exc:
+        logger.warning(
+            "[stock_research] DB-backed mode failed for ticker=%s (%s) — "
+            "falling back to PDF mode",
+            ticker, exc,
+        )
+        use_neo4j = False
 
     if not use_neo4j:
         # ── PDF fallback ──────────────────────────────────────────────────────

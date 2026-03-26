@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import re
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
 
 # ── Human-readable database labels ────────────────────────────────────────────
@@ -45,6 +46,82 @@ _SECTION_LABELS: Dict[str, str] = {
     "press_release":     "Press Release",
     "news":              "News Article",
 }
+
+# High-confidence finance/news sources for web citations.
+_HIGH_QUALITY_WEB_DOMAINS = {
+    "sec.gov", "reuters.com", "bloomberg.com", "wsj.com", "ft.com", "cnbc.com",
+    "marketwatch.com", "barrons.com", "apnews.com", "investor.tesla.com",
+    "investor.apple.com", "investor.microsoft.com", "abc.xyz", "nasdaq.com",
+    "nyse.com", "federalreserve.gov", "bis.doc.gov", "ec.europa.eu", "imf.org",
+    "worldbank.org", "oecd.org", "tradingeconomics.com", "finance.yahoo.com",
+}
+
+_LOW_QUALITY_WEB_DOMAINS = {
+    "youtube.com", "youtu.be", "tiktok.com", "reddit.com", "x.com", "twitter.com",
+    "stocktwits.com", "seekingalpha.com", "fool.com", "motleyfool.com", "medium.com",
+    "substack.com", "blogspot.com", "wordpress.com",
+}
+
+_WEB_PUBLISHER_ALIASES = {
+    "sec.gov": "SEC",
+    "reuters.com": "Reuters",
+    "bloomberg.com": "Bloomberg",
+    "wsj.com": "Wall Street Journal",
+    "ft.com": "Financial Times",
+    "cnbc.com": "CNBC",
+    "marketwatch.com": "MarketWatch",
+    "barrons.com": "Barron's",
+    "apnews.com": "AP News",
+    "finance.yahoo.com": "Yahoo Finance",
+    "nasdaq.com": "Nasdaq",
+}
+
+
+def _url_domain(url: str) -> str:
+    try:
+        domain = urlparse(url or "").netloc.lower().strip()
+        if domain.startswith("www."):
+            domain = domain[4:]
+        return domain
+    except Exception:
+        return ""
+
+
+def _is_high_quality_web_source(url: str) -> bool:
+    domain = _url_domain(url)
+    if not domain:
+        return False
+    if any(domain == d or domain.endswith("." + d) for d in _LOW_QUALITY_WEB_DOMAINS):
+        return False
+    return any(domain == d or domain.endswith("." + d) for d in _HIGH_QUALITY_WEB_DOMAINS)
+
+
+def _publisher_from_url(url: str) -> str:
+    domain = _url_domain(url)
+    if not domain:
+        return "Web Source"
+    for key, pub in _WEB_PUBLISHER_ALIASES.items():
+        if domain == key or domain.endswith("." + key):
+            return pub
+    return domain
+
+
+def _human_web_label(title: str, url: str) -> str:
+    """Return a clean citation label for web sources.
+
+    Avoid raw fragments like `watch?v=...` in the reference list.
+    """
+    t = (title or "").strip()
+    if t and not re.match(r"^(?:watch\?v=|https?://)", t, flags=re.IGNORECASE):
+        return t[:90]
+    pub = _publisher_from_url(url)
+    path = (urlparse(url).path or "").strip("/") if url else ""
+    if path:
+        tail = path.split("/")[-1].replace("-", " ").replace("_", " ").strip()
+        if tail and tail.lower() not in {"watch", "video"}:
+            tail = re.sub(r"\s+", " ", tail)
+            return f"{pub}: {tail[:64]}"
+    return f"{pub} article"
 
 
 # ── Citation dataclass ─────────────────────────────────────────────────────────
@@ -232,17 +309,17 @@ def build_citation_block(
                                   summarizer can inject inline [N] numbers.
     """
     citations: List[Citation] = []
-    seen_ids: Dict[str, int] = {}  # chunk_id/url → citation index (dedup)
+    seen_ids: Dict[str, int] = {}  # chunk_id/url → local citations list index (dedup)
 
     def _add(source_agent: str, db: str, label: str, detail: str = "",
              url: str = "", chunk_id: str = "") -> Citation:
         dedup_key = chunk_id or url or label
         if dedup_key in seen_ids:
-            return citations[seen_ids[dedup_key] - 1]
+            return citations[seen_ids[dedup_key]]
         idx = index_offset + len(citations) + 1
         c = Citation(idx, source_agent, db, label, detail, url, chunk_id)
         citations.append(c)
-        seen_ids[dedup_key] = idx
+        seen_ids[dedup_key] = len(citations) - 1
         return c
 
     # ── 1. Business Analyst citations ─────────────────────────────────────────
@@ -355,7 +432,11 @@ def build_citation_block(
         for item in (web_output.get("breaking_news") or []):
             if not isinstance(item, dict):
                 continue
-            title = item.get("title") or "News article"
+            url = item.get("url") or ""
+            if not _is_high_quality_web_source(url):
+                # Keep reference list focused on investable-quality sources.
+                continue
+            title = _human_web_label(str(item.get("title") or ""), url)
             url   = item.get("url") or ""
             date  = item.get("published_date") or ""
             tier  = item.get("source_tier")
@@ -409,12 +490,12 @@ def build_citation_block(
 
         # 3d. Raw Perplexity citations (URLs not already captured above)
         for url in (web_output.get("raw_citations") or []):
-            if isinstance(url, str) and url and url not in seen_ids:
+            if isinstance(url, str) and url and url not in seen_ids and _is_high_quality_web_source(url):
                 _add(
                     "web_search",
                     "web",
-                    url.split("/")[-1][:60] or url[:60],
-                    "Perplexity Sonar citation",
+                    _human_web_label("", url),
+                    f"Perplexity Sonar citation · {_publisher_from_url(url)}",
                     url=url,
                     chunk_id=url,
                 )
