@@ -655,6 +655,28 @@ def _node_generate_analysis(state: AgentState, llm: LLMClient) -> AgentState:
                 "(2B: Chunks are tagged by recency. Where both RECENT and HISTORICAL chunks exist, "
                 "analyse the *delta* — what has changed and what the trend implies.)"
             )
+
+        # Segment-hint block: surface segment-specific chunks (if available) so the
+        # LLM can name concrete segment drivers in business-model analysis.
+        seg_terms = (
+            "iphone", "services", "mac", "ipad", "wearables", "greater china",
+            "americas", "europe", "japan", "rest of asia pacific",
+        )
+        seg_chunks: List[Chunk] = []
+        for c in chunks:
+            txt = (c.text or "").lower()
+            sec = str((c.metadata or {}).get("section") or "").lower()
+            if any(t in txt for t in seg_terms) or "segment" in sec:
+                seg_chunks.append(c)
+        if seg_chunks:
+            context_parts.append("=== SEGMENT-SPECIFIC EVIDENCE (prioritise for business model section) ===")
+            for c in seg_chunks[:4]:
+                source_name = (c.metadata or {}).get("source_name", "")
+                source_label = f", source_name={source_name!r}" if source_name else ""
+                context_parts.append(
+                    f"\n[chunk_id: {c.chunk_id}] (relevance={c.score:.3f}{source_label})\n{c.text[:900]}"
+                )
+
         for chunk in chunks[:7]:
             band = (chunk.metadata or {}).get("temporal_band", "")
             band_label = f", temporal={band}" if band else ""

@@ -55,7 +55,7 @@ def _build_local_fallback_summary(
     errors: Dict[str, Any],
 ) -> str:
     """Build a deterministic markdown fallback when LLM summarisation fails."""
-    tks = ", ".join(tickers) if tickers else "N/A"
+    tks = ", ".join(tickers) if tickers else "UNKNOWN"
     err_text = " ".join(str(v) for v in (errors or {}).values()).lower()
     auth_related = any(
         k in err_text
@@ -71,7 +71,7 @@ def _build_local_fallback_summary(
     lines: List[str] = [
         "## Executive Summary",
         "",
-        "The pipeline completed, but the LLM summariser is temporarily unavailable.",
+        "The pipeline completed, but full narrative generation is temporarily interrupted.",
         f"Query: {user_query}",
         f"Tickers: {tks}",
         "",

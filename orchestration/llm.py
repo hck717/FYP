@@ -2747,6 +2747,58 @@ def _normalize_markdown_section_spacing(text: str) -> str:
     return text
 
 
+def _truncate_preserve_ends(text: str, max_chars: int) -> str:
+    """Trim long blocks while preserving both start and end context."""
+    if not text or len(text) <= max_chars:
+        return text
+    head = int(max_chars * 0.65)
+    tail = max_chars - head
+    return text[:head] + "\n\n[...trimmed for context window...]\n\n" + text[-tail:]
+
+
+def _build_balanced_qualitative_context(
+    effective_ba: List[Dict[str, Any]],
+    effective_web: List[Dict[str, Any]],
+    effective_sr: List[Dict[str, Any]],
+    effective_macro: List[Dict[str, Any]],
+    effective_insider: List[Dict[str, Any]],
+) -> str:
+    """Build a balanced qualitative context so later agents are not truncated away.
+
+    Previous behavior concatenated all text then applied one global slice, which
+    frequently retained BA/Quant-heavy early content while dropping SR/Macro/Insider
+    sections appended later.
+    """
+    sections: List[tuple[str, str, int]] = []
+
+    def _join(parts: List[str]) -> str:
+        return "\n".join([p for p in parts if p])
+
+    ba_text = _join([ln for o in effective_ba if o for ln in _build_ba_context(o)])
+    web_text = _join([ln for o in effective_web if o for ln in _build_web_context(o)])
+    sr_text = _join([ln for o in effective_sr if o for ln in _build_stock_research_context(o)])
+    macro_text = _join([ln for o in effective_macro if o for ln in _build_macro_context(o)])
+    insider_text = _join([ln for o in effective_insider if o for ln in _build_insider_news_context(o)])
+
+    # Per-agent budgets (chars): keep each domain represented.
+    sections.append(("BUSINESS_ANALYST", ba_text, 7000))
+    sections.append(("WEB_SEARCH", web_text, 3500))
+    sections.append(("STOCK_RESEARCH", sr_text, 7000))
+    sections.append(("MACRO", macro_text, 4500))
+    sections.append(("INSIDER_NEWS", insider_text, 4500))
+
+    blocks: List[str] = []
+    for name, raw, budget in sections:
+        if not raw:
+            continue
+        blocks.append(f"=== {name} QUALITATIVE CONTEXT ===")
+        blocks.append(_truncate_preserve_ends(raw, budget))
+
+    merged = "\n\n".join(blocks)
+    # Final global cap to protect Stage-1 prompt size.
+    return _truncate_preserve_ends(merged, 26000)
+
+
 def summarise_results_structured(
     user_query: str,
     tickers: List[str],
@@ -2839,24 +2891,14 @@ def summarise_results_structured(
     primary_ticker = effective_tickers[0]
     schema = _build_json_schema(anchor, primary_ticker)
 
-    # ── Gather qualitative context (BA, web, SR) ──────────────────────────────
-    qual_parts: List[str] = []
-    for ba_o in effective_ba:
-        if ba_o:
-            qual_parts.extend(_build_ba_context(ba_o))
-    for web_o in effective_web:
-        if web_o:
-            qual_parts.extend(_build_web_context(web_o))
-    for sr_o in effective_sr:
-        if sr_o:
-            qual_parts.extend(_build_stock_research_context(sr_o))
-    for macro_o in effective_macro:
-        if macro_o:
-            qual_parts.extend(_build_macro_context(macro_o))
-    for insider_o in effective_insider:
-        if insider_o:
-            qual_parts.extend(_build_insider_news_context(insider_o))
-    qualitative_context = "\n".join(qual_parts)[:8000]  # cap at ~8k chars to accommodate new agents
+    # ── Gather qualitative context with balanced per-agent budgets ──────────────
+    qualitative_context = _build_balanced_qualitative_context(
+        effective_ba=effective_ba,
+        effective_web=effective_web,
+        effective_sr=effective_sr,
+        effective_macro=effective_macro,
+        effective_insider=effective_insider,
+    )
 
     # ── Stage 1: JSON generation ──────────────────────────────────────────────
     anchor_json_str = json.dumps(
@@ -2930,8 +2972,15 @@ CRITICAL RULES:
 
     # ── Stage 2: JSON → prose ─────────────────────────────────────────────────
     # Build citation index from web outputs for [N] references
-    citation_index = _build_citation_index(effective_web, effective_sr, effective_ba)
-    citation_str = "\n".join(f"[{i+1}] {src}" for i, src in enumerate(citation_index[:20]))
+    citation_index = _build_citation_index(
+        effective_web, 
+        effective_sr, 
+        effective_ba,
+        effective_macro,
+        effective_insider,
+        effective_fm,
+    )
+    citation_str = "\n".join(f"[{i+1}] {src}" for i, src in enumerate(citation_index[:40]))
 
     t = primary_ticker.upper()
     period_bs  = anchor.get(f"{t}_bs_period",  "FY2024")
@@ -2945,8 +2994,16 @@ CRITICAL RULES:
 VALIDATED JSON DATA (these numbers are ground-truth — use them exactly):
 {json.dumps(stage1_result, indent=2)}
 
-CITATION INDEX (use [N] inline after every factual sentence):
+CITATION INDEX — use [N] to cite specific agent sources:
 {_citation_block}
+
+CRITICAL: Different insights come from different agents. Use the appropriate [N] citation for each claim:
+- Business Analyst insights (moat, strategy, sentiment) → cite [Business Analyst] indices
+- Stock Research insights (earnings calls, broker reports) → cite [Stock Research] indices
+- Macro insights (themes, regime, drivers) → cite [Macro] indices
+- Insider/News insights (transactions, sentiment) → cite [Insider/News] indices
+- Web Search insights (breaking news, catalysts) → cite [Web Search] indices
+- Financial Modelling insights (DCF, technicals) → cite [Financial Modelling] indices
 
 PERIOD CONTEXT:
 - Balance sheet period: {period_bs}
@@ -2954,48 +3011,28 @@ PERIOD CONTEXT:
 - Income statement period: {period_inc}
 - Latest quarter: {_latest_q_period}
 
-AGENT SOURCES TO SYNTHESIZE:
-- BUSINESS ANALYST outputs: company overview, competitive positioning, management quality, industry dynamics
-- QUANT FUNDAMENTAL outputs: valuation multiples, financial ratios (ROE, ROIC, Piotroski, Altman Z), price performance
-- WEB SEARCH outputs: recent news, analyst actions, macro headwinds/tailwinds, market sentiment
-- FINANCIAL MODELLING outputs: DCF intrinsic value, bull/bear/base scenarios, margin forecasts
-- STOCK RESEARCH outputs: earnings call tone, broker consensus, Q&A dynamics, forward-looking catalysts
-- MACRO outputs: market regime, macro themes, top macro drivers, risk scenarios
-- INSIDER NEWS outputs: insider buy/sell activity, net positioning, news sentiment trends
+YOUR TASK:
+You are a Senior PM synthesizing all 7 agent outputs. Structure the report to answer the user's question.
+Start with ## Executive Summary. Then organize by topic (Company Overview → Financials → Valuation → 
+Growth → Risks → Macro → Verdict). Use section headers that make sense.
 
-Write EXACTLY these 11 sections in this order, using ## headers:
-## Executive Summary
-## Company Overview
-## Financial Performance
-## Key Financial Ratios & Valuation
-## Sentiment & Market Positioning
-## Growth Prospects
-## Risk Factors
-## Competitive Landscape
-## Management & Governance
-## Macroeconomic Factors
-## Analyst Verdict
+Each section format:
+1. Opening paragraph (2-4 sentences of context)
+2. Then 2-4 bullet points with bold labels
+3. Example: "- **Valuation:** P/E of 32x sits 18% above sector median, embedding 12-14% EPS growth expectations [5]."
 
-ANALYSIS DEPTH REQUIREMENTS:
-- For EVERY metric mentioned, explain the BUSINESS IMPLICATIONS — not just the number
-- Answer: What does this mean for the company's competitive position? Why should an investor care?
-- Example: Don't just say "ROIC is 58%" — explain "58% ROIC indicates exceptional capital efficiency, suggesting a durable competitive moat and strong pricing power"
-- Connect data points: How do earnings trends relate to cash flow? What drove margin expansion?
-- Forward-looking: What do current trends imply for next quarter/year?
-- Weave ALL available agent outputs together — do not treat them as silos
+SYNTHESIS REQUIREMENTS:
+- Weave ALL 7 agents together naturally. Don't leave any agent unheard.
+- Every claim must cite its source [N] from the citation index above.
+- When agents disagree, cite both and explain the tension.
+- Every number MUST appear in the JSON above. NO fabricated metrics.
+- If a metric isn't in JSON, write qualitatively without a number.
+- Never use placeholders (N/A, null, TBD) — write "data unavailable" instead.
+- Explain WHY each metric matters for the investment thesis, not just WHAT it is.
+- BANNED WORDS: robust, strong, significant, impressive — use specifics instead.
+- CRITICAL: total_assets ≠ total_liabilities ≠ total_equity. These are THREE DISTINCT values.
 
-RULES:
-- Every number you write MUST appear in the JSON data above. NO other numbers.
-- Structural period labels are allowed even if not in JSON (e.g., 12-month, 14-day RSI, 20/50/200-day moving averages).
-- Do NOT introduce metric values that are not present in the JSON.
-- If a number is not present in JSON, write a qualitative sentence without a numeric literal.
-- Never print placeholders such as N/A, n/a, NA, null, or TBD in the narrative. Use "data unavailable" wording.
-- Every sentence with a number must end with [N] citation.
-- Flowing prose paragraphs only — NO bullet points, NO lists.
-- 6-10 sentences per section minimum to ensure depth.
-- BANNED WORDS: never use "robust", "strong", "significant", "impressive" — use neutral professional language instead.
-- BALANCE SHEET CRITICAL: total_assets ≠ total_liabilities ≠ total_equity. These are THREE DISTINCT values. Never use the total_assets figure when referring to total liabilities, and vice versa.
-- Start directly with ## Executive Summary."""
+Start directly with ## Executive Summary."""
 
     try:
         prose_raw = _deepseek_generate_summarizer(
@@ -3202,9 +3239,17 @@ def _build_citation_index(
     web_outputs: List[Dict[str, Any]],
     sr_outputs: List[Dict[str, Any]],
     ba_outputs: List[Dict[str, Any]],
+    macro_outputs: List[Dict[str, Any]] = [],
+    insider_outputs: List[Dict[str, Any]] = [],
+    fm_outputs: List[Dict[str, Any]] = [],
 ) -> List[str]:
-    """Extract a flat list of citation source strings for [1], [2], ... references."""
+    """Extract a flat list of citation source strings for [1], [2], ... references.
+    
+    Now includes all 7 agents: BA, Web, SR, Macro, Insider, FM.
+    """
     sources: List[str] = []
+    
+    # Business Analyst
     for ba_o in ba_outputs:
         if not ba_o:
             continue
@@ -3213,22 +3258,51 @@ def _build_citation_index(
                 continue
             src = c.get("doc_name") or c.get("chunk_id")
             if src and src not in sources:
-                sources.append(str(src)[:120])
+                sources.append(f"[Business Analyst] {str(src)[:100]}")
+    
+    # Web Search
     for web_o in web_outputs:
         if not web_o:
             continue
         for chunk in (web_o.get("chunks") or []):
             src = chunk.get("source") or chunk.get("url") or chunk.get("title")
             if src and src not in sources:
-                sources.append(str(src)[:120])
+                sources.append(f"[Web Search] {str(src)[:100]}")
+    
+    # Stock Research
     for sr_o in sr_outputs:
         if not sr_o:
             continue
         for chunk in (sr_o.get("chunks") or []):
             src = chunk.get("source") or chunk.get("url") or chunk.get("title")
             if src and src not in sources:
-                sources.append(str(src)[:120])
-    return sources[:20]
+                sources.append(f"[Stock Research] {str(src)[:100]}")
+    
+    # Macro
+    for macro_o in macro_outputs:
+        if not macro_o:
+            continue
+        for chunk in (macro_o.get("chunks") or []):
+            src = chunk.get("source") or chunk.get("url") or chunk.get("title")
+            if src and src not in sources:
+                sources.append(f"[Macro] {str(src)[:100]}")
+    
+    # Insider & News
+    for insider_o in insider_outputs:
+        if not insider_o:
+            continue
+        for chunk in (insider_o.get("chunks") or []):
+            src = chunk.get("source") or chunk.get("url") or chunk.get("title")
+            if src and src not in sources:
+                sources.append(f"[Insider/News] {str(src)[:100]}")
+    
+    # Financial Modelling (synthetic - just note it's from FM)
+    if fm_outputs:
+        sources.append("[Financial Modelling] DCF & WACC Analysis")
+        sources.append("[Financial Modelling] Comparable Company Analysis")
+        sources.append("[Financial Modelling] Technical Analysis")
+    
+    return sources[:40]  # Increased from 20 to 40 to accommodate all agents
 
 
 def _audit_and_replace_numbers(

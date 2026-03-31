@@ -394,7 +394,7 @@ def availability_notice(avail: Dict[str, Any], tickers: List[str]) -> str:
     if "deepseek_unreachable" in degraded:
         lines.append(
             f"  • DeepSeek API is UNREACHABLE at {_DEEPSEEK_BASE_URL} — "
-            "LLM summarization and query planning unavailable."
+            "LLM summarization and query planning cannot run in this pass."
         )
     elif any("deepseek_missing_llm" in d for d in degraded):
         lines.append(
@@ -412,7 +412,7 @@ def availability_notice(avail: Dict[str, Any], tickers: List[str]) -> str:
 
     lines.append(
         "  → The analyst MUST acknowledge these gaps explicitly in the research note "
-        "and MUST NOT fabricate metrics that are unavailable."
+        "and MUST NOT fabricate metrics that are not present in source data."
     )
 
     return "\n".join(lines)

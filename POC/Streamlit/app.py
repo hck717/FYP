@@ -2320,29 +2320,30 @@ def main() -> None:
                 mime="text/markdown",
             )
 
-        # RLAIF Quality Score Display
-        rl_scores = state.get("rl_feedback_scores")
-        run_id = state.get("rl_feedback_run_id")
-        if rl_scores and run_id:
-            with st.expander("AI Quality Score (RLAIF)", expanded=False):
-                overall = rl_scores.get("overall_score", 0)
-                col1, col2, col3, col4, col5 = st.columns(5)
-                col1.metric("Overall", f"{overall:.1f}/10")
-                col2.metric("Factual", f"{rl_scores.get('factual_accuracy', 0):.1f}")
-                col3.metric("Citations", f"{rl_scores.get('citation_completeness', 0):.1f}")
-                col4.metric("Analysis", f"{rl_scores.get('analysis_depth', 0):.1f}")
-                col5.metric("Structure", f"{rl_scores.get('structure_compliance', 0):.1f}")
-                
-                if overall < 7.0:
-                    st.warning(f"⚠️ This report scored below the quality threshold (7.0). Agent blamed: {rl_scores.get('agent_blamed', 'unknown')}")
-                
-                weaknesses = rl_scores.get("weaknesses", [])
-                if weaknesses:
-                    st.markdown("**Areas for improvement:**")
-                    for w in weaknesses[:3]:
-                        st.markdown(f"- {w}")
+        # RLAIF Quality Score Display (temporarily disabled for debugging)
+        # rl_scores = state.get("rl_feedback_scores")
+        # run_id = state.get("rl_feedback_run_id")
+        # if rl_scores and run_id:
+        #     with st.expander("AI Quality Score (RLAIF)", expanded=False):
+        #         overall = rl_scores.get("overall_score", 0)
+        #         col1, col2, col3, col4, col5 = st.columns(5)
+        #         col1.metric("Overall", f"{overall:.1f}/10")
+        #         col2.metric("Factual", f"{rl_scores.get('factual_accuracy', 0):.1f}")
+        #         col3.metric("Citations", f"{rl_scores.get('citation_completeness', 0):.1f}")
+        #         col4.metric("Analysis", f"{rl_scores.get('analysis_depth', 0):.1f}")
+        #         col5.metric("Structure", f"{rl_scores.get('structure_compliance', 0):.1f}")
+        #         
+        #         if overall < 7.0:
+        #             st.warning(f"⚠️ This report scored below the quality threshold (7.0). Agent blamed: {rl_scores.get('agent_blamed', 'unknown')}")
+        #         
+        #         weaknesses = rl_scores.get("weaknesses", [])
+        #         if weaknesses:
+        #             st.markdown("**Areas for improvement:**")
+        #             for w in weaknesses[:3]:
+        #                 st.markdown(f"- {w}")
 
         # Explicit User Feedback Widget
+        run_id = state.get("rl_feedback_run_id")
         if run_id:
             _render_feedback_widget(run_id, state)
 
