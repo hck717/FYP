@@ -54,11 +54,18 @@ _HIGH_QUALITY_WEB_DOMAINS = {
     "investor.apple.com", "investor.microsoft.com", "abc.xyz", "nasdaq.com",
     "nyse.com", "federalreserve.gov", "bis.doc.gov", "ec.europa.eu", "imf.org",
     "worldbank.org", "oecd.org", "tradingeconomics.com", "finance.yahoo.com",
+    # Tech/news outlets commonly cited in equity research
+    "techcrunch.com", "theverge.com", "arstechnica.com", "wired.com",
+    "9to5mac.com", "macrumors.com", "androidauthority.com", "engadget.com",
+    "protocol.com", "axios.com", "politico.com", "theinformation.com",
+    "businessinsider.com", "forbes.com", "fortune.com", "economist.com",
+    "investopedia.com", "morningstar.com", "zacks.com", "benzinga.com",
+    "thestreet.com", "fool.com", "seekingalpha.com",
 }
 
 _LOW_QUALITY_WEB_DOMAINS = {
     "youtube.com", "youtu.be", "tiktok.com", "reddit.com", "x.com", "twitter.com",
-    "stocktwits.com", "seekingalpha.com", "fool.com", "motleyfool.com", "medium.com",
+    "stocktwits.com", "medium.com",
     "substack.com", "blogspot.com", "wordpress.com",
 }
 
@@ -706,6 +713,16 @@ def build_citation_block(
         for c in group_sorted:
             lines.append(c.footnote())
 
+    # Log per-agent citation counts for debugging
+    import logging
+    logger = logging.getLogger(__name__)
+    total_cites = sum(len(by_agent[a]) for a in agent_order)
+    logger.info(f"[citations] Total citations: {total_cites}")
+    for agent_key in agent_order:
+        count = len(by_agent[agent_key])
+        if count > 0:
+            logger.info(f"[citations]   {agent_key}: {count} citations")
+    
     chunk_id_map: Dict[str, Citation] = {c.chunk_id: c for c in citations if c.chunk_id}
     return "\n".join(lines), chunk_id_map
 

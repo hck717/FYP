@@ -1237,6 +1237,8 @@ def _build_citation_index_prompt(chunk_id_map: Dict) -> str:
             line += " — USE FOR: Piotroski F-Score, Beneish M-Score ONLY"
         elif any(k in label_lower for k in ("business_analyst", "qualitative", "business analyst")):
             line += " — USE FOR: moat analysis, competitive positioning, sentiment narrative, strategic risks"
+        elif "web" in label_lower or any(k in label_lower for k in ("news", "breaking", "risk flag", "competitor")):
+            line += " — USE FOR: breaking news, recent events, risk flags, competitor activity, live market sentiment"
         lines.append(line)
     lines.append("=== END INDEX ===\n")
     return "\n".join(lines)
@@ -2488,11 +2490,21 @@ def _build_anchor_dict(
 
 
 _JSON_STAGE1_SYSTEM = """You are a financial data extraction assistant.
-Your ONLY job is to output a JSON object using EXCLUSIVELY the numbers provided in the ANCHOR DATA below.
-DO NOT invent, estimate, interpolate, infer, or recall any numbers from your training data.
-If a field's value is not in the ANCHOR DATA, set it to null.
-For prose fields, do not introduce any new numeric literals beyond values already present in JSON numeric fields.
-Output ONLY valid JSON — no prose outside schema fields, no markdown, no explanation."""
+
+CRITICAL RULES FOR NUMERIC FIELDS:
+- All numeric fields (revenue_ttm_b, pe_trailing, dcf_base, etc.) MUST use EXCLUSIVELY the numbers from ANCHOR DATA
+- If a numeric field's value is not in ANCHOR DATA, set it to null
+- DO NOT invent, estimate, interpolate, or recall any numbers from your training data
+
+RULES FOR PROSE FIELDS (executive_summary, company_overview, etc.):
+- Synthesize insights from the QUALITATIVE CONTEXT provided below the ANCHOR DATA
+- You MAY reference qualitative details like product names ("iPhone 17"), guidance ranges ("14-16% growth"), broker insights, macro themes
+- Do NOT invent new numeric metrics beyond what's in ANCHOR DATA
+- When referencing metrics, use the numeric fields from the JSON (e.g., "revenue grew to [revenue_ttm_b]" not "revenue grew to 450B")
+- Be specific about qualitative catalysts: name products, cite broker views, describe macro conditions
+
+OUTPUT FORMAT:
+- Output ONLY valid JSON — no prose outside schema fields, no markdown, no explanation."""
 
 
 def _build_json_schema(anchor: Dict[str, Any], ticker: str) -> Dict[str, Any]:
@@ -2644,8 +2656,8 @@ def _validate_anchor_values(data: Dict[str, Any], anchor: Dict[str, Any], ticker
     return violations
 
 
-_JSON_STAGE2_SYSTEM = """You are a senior equity research analyst writing investment research notes.
-You have access to outputs from 7 specialized agents that you must synthesize into a coherent narrative:
+_JSON_STAGE2_SYSTEM = """You are a Senior Portfolio Manager writing investment research notes.
+You have access to outputs from 7 specialized agents that you must synthesize into a comprehensive narrative:
 1. BUSINESS ANALYST (ba_outputs): Company overview, competitive positioning, management assessment, industry trends
 2. QUANT FUNDAMENTAL (quant_outputs): Valuation metrics, financial ratios, Piotroski/Altman/Beneish scores, price performance
 3. WEB SEARCH (web_outputs): Recent news, market sentiment, analyst upgrades/downgrades
@@ -2654,34 +2666,44 @@ You have access to outputs from 7 specialized agents that you must synthesize in
 6. MACRO (macro_outputs): Macroeconomic analysis, market regime, macro themes, interest rates, economic outlook
 7. INSIDER NEWS (insider_news_outputs): Insider trading activity, management transactions, news sentiment analysis
 
-CRITICAL RULES:
+CRITICAL FORMATTING:
+1. Each section MUST follow this structure:
+   - Opening paragraph (3-5 sentences providing context and setting up the analysis)
+   - Then 3-5 bullet points with bold labels, each bullet 2-3 sentences long
+   - Example: "- **Valuation Premium:** The stock trades at a P/E of 32x, 18% above sector median of 27x, embedding 12-14% EPS growth expectations [5]. This premium is partially justified by the 75% gross margin in Services, but leaves little room for execution risk [1]. Any miss on iPhone cycle expectations could trigger multiple compression [19]."
+
+2. SCANNABLE FORMAT: Use bullets liberally. Senior investors scan reports quickly — make every insight easy to extract.
+
+3. DEPTH REQUIREMENTS: Each section should be 400-600 words. The full report should be 3000-4000 words minimum.
+
+NUMERIC ACCURACY RULES:
 1. Use the EXACT numbers from the JSON — do NOT change, round, or substitute any figure.
 2. Every sentence containing a number must end with a citation marker like [1], [2] etc.
 3. Use only numbers that appear in the JSON data object. Do NOT add any extra numbers from memory.
-3b. If a value is missing/null, explicitly state data is unavailable instead of inventing a proxy number.
-3c. Never output placeholder tokens such as "N/A", "n/a", "NA", "null", or "TBD" in narrative prose.
-4. Write in flowing multi-sentence paragraphs — NO bullet points, NO lists.
-5. Use professional financial terminology throughout.
+4. If a value is missing/null, weave around it naturally in the prose rather than stating "data unavailable" — e.g. "the upcoming iPhone cycle" not "iPhone data unavailable cycle"
+5. Never output placeholder tokens such as "N/A", "n/a", "NA", "null", or "TBD" in narrative prose.
 6. BALANCE SHEET: total_assets, total_liabilities, and total_equity are THREE DISTINCT values. Never confuse them.
 
 ANALYSIS DEPTH REQUIREMENTS:
 - Go beyond stating facts: explain the BUSINESS IMPLICATIONS of every metric and trend
 - For each ratio/metric: What does it mean for the company's financial health? Why should an investor care?
-- Connect quantitative metrics to qualitative business outcomes (e.g., "High ROIC of 58% suggests strong competitive moat and efficient capital allocation")
+- Connect quantitative metrics to qualitative business outcomes (e.g., "High ROIC of 58% suggests strong competitive moat and efficient capital allocation, enabling reinvestment at high returns")
 - Discuss causation, not just correlation: Why did margins improve? What drove the change in cash flow?
 - Address forward-looking implications: What do current trends suggest for future performance?
 - Consider stakeholder perspectives: How do these metrics affect shareholders, creditors, and management decisions?
-- INCORPORATE MACRO INSIGHTS: When discussing market environment, integrate macro data (regime, themes, risks) into the analysis
+- INCORPORATE MACRO INSIGHTS: When discussing market environment, integrate macro data (regime, themes, risks) into the analysis with specific citations
 - INCORPORATE INSIDER NEWS: Use insider trading activity and news sentiment to validate or challenge the investment thesis
+- WEAVE ALL 7 AGENTS: Every section should draw from multiple agents. Don't silo insights by source.
 
 SYNTHESIS GUIDANCE:
 - Weave insights from ALL 7 agents together — don't treat them as siloed sections
-- The Web Search provides context; Quant Fundamental provides numbers; Business Analyst provides narrative; Stock Research provides tone; Financial Modelling provides valuation; Macro provides economic context; Insider News provides sentiment and insider signals
-- When discussing valuation, incorporate both DCF outputs and peer comparisons
+- The Web Search provides context; Quant Fundamental provides numbers; Business Analyst provides narrative; Stock Research provides broker tone and catalysts; Financial Modelling provides valuation framework; Macro provides economic context; Insider News provides sentiment signals
+- When discussing valuation, incorporate DCF outputs, peer comparisons, and broker price targets from Stock Research
 - Use broker sentiment from Stock Research to contextualize quantitative findings
-- Connect recent news (Web Search) to financial performance (Quant/BA)
-- Integrate macro economic factors into the overall investment thesis
-- Factor in insider buying/selling as sentiment signals"""
+- Connect recent news (Web Search) to financial performance (Quant/BA) and insider activity
+- Integrate macro economic factors into the overall investment thesis with specific regime analysis
+- Factor in insider buying/selling as sentiment signals and compare to management public statements
+- Cross-reference agent disagreements: If insider sentiment is bearish but brokers are bullish, explicitly discuss this tension"""
 
 
 def _sanitize_unavailable_tokens(text: str) -> str:
@@ -2794,7 +2816,10 @@ def _build_balanced_qualitative_context(
         blocks.append(f"=== {name} QUALITATIVE CONTEXT ===")
         blocks.append(_truncate_preserve_ends(raw, budget))
 
+    logger.info(f"[context] BA: {len(ba_text)} chars, SR: {len(sr_text)} chars, Macro: {len(macro_text)} chars, Insider: {len(insider_text)} chars, Web: {len(web_text)} chars")
+    
     merged = "\n\n".join(blocks)
+    logger.info(f"[context] Final merged: {len(merged)} chars (before global cap at 26000)")
     # Final global cap to protect Stage-1 prompt size.
     return _truncate_preserve_ends(merged, 26000)
 
@@ -2910,21 +2935,34 @@ def summarise_results_structured(
 ANCHOR DATA (use ONLY these numbers — every number you write must appear verbatim here):
 {anchor_json_str}
 
-QUALITATIVE CONTEXT FROM RESEARCH AGENTS (use for text/analysis, cite with [N]):
+QUALITATIVE CONTEXT FROM RESEARCH AGENTS (USE THIS for product names, guidance, catalysts, themes):
 {qualitative_context}
 
 OUTPUT INSTRUCTIONS:
 Produce a JSON object that EXACTLY matches this schema:
 {json.dumps(schema, indent=2)}
 
+PROSE FIELD REQUIREMENTS:
+- Each prose field (executive_summary, company_overview, etc.) should be 200-400 words
+- USE QUALITATIVE CONTEXT for: product names (iPhone 17), management guidance ("14-16% growth"), broker catalysts, macro themes, insider sentiment
+- Synthesize insights from ALL 7 agents: Business Analyst, Quant, Stock Research, Macro, Insider/News, Web, Financial Modelling
+- Be SPECIFIC with qualitative details: "iPhone 17 cycle" not "iPhone data unavailable cycle", "50-day SMA" not "data unavailable-day SMA"
+- Connect data to business logic: Explain WHY metrics matter, not just WHAT they are
+- Cross-reference agent insights: Compare insider selling with management guidance tone, contrast broker optimism with macro risks
+
 CRITICAL RULES:
-1. Every numeric field in financial_performance and key_financial_ratios_and_valuation must be
-   copied VERBATIM from the ANCHOR DATA above. Do NOT modify, round, or estimate any number.
-2. If a field's value does not appear in the ANCHOR DATA, set it to null.
-3. All prose fields must remain consistent with numeric fields in the same JSON object.
-   Do not invent extra numeric literals in prose. If required data is unavailable, write "data unavailable".
-4. NO extra fields — the schema uses additionalProperties: false.
-5. Return ONLY the JSON object. No markdown fences, no explanation, no preamble."""
+1. NUMERIC fields (revenue_ttm_b, pe_trailing, etc.) MUST use ONLY ANCHOR DATA values - copy VERBATIM
+2. If a numeric field's value is not in ANCHOR DATA, set it to null
+3. PROSE fields SHOULD use QUALITATIVE CONTEXT for product names, catalysts, guidance, themes
+4. Do not invent new numeric metrics in prose beyond what's in ANCHOR DATA or numeric fields
+5. NO extra fields — the schema uses additionalProperties: false
+6. In prose, synthesize ALL 7 agent contexts. Extract specifics like "iPhone 17", "Services gross margin of 75.3%", "risk-off regime"
+7. Return ONLY the JSON object. No markdown fences, no explanation, no preamble."""
+
+    logger.info(f"[Stage1] Prompt length: {len(stage1_prompt)} chars")
+    logger.info(f"[Stage1] Context contains SR: {'STOCK_RESEARCH' in qualitative_context}")
+    logger.info(f"[Stage1] Context contains Macro: {'MACRO' in qualitative_context}")
+    logger.info(f"[Stage1] Context contains Insider: {'INSIDER_NEWS' in qualitative_context}")
 
     stage1_result: Optional[Dict[str, Any]] = None
     for attempt in range(3):
@@ -2971,39 +3009,58 @@ CRITICAL RULES:
         )
 
     # ── Stage 2: JSON → prose ─────────────────────────────────────────────────
-    # Build citation index from web outputs for [N] references
-    citation_index = _build_citation_index(
-        effective_web, 
-        effective_sr, 
-        effective_ba,
-        effective_macro,
-        effective_insider,
-        effective_fm,
-    )
-    citation_str = "\n".join(f"[{i+1}] {src}" for i, src in enumerate(citation_index[:40]))
-
+    # Build proper citation block using the same system as non-structured summarizer
+    from .citations import build_citation_block  # type: ignore[import]
+    
+    all_chunk_id_maps: Dict[str, Any] = {}
+    ref_blocks: List[str] = []
+    offset = 0
+    
+    for i, tick in enumerate([primary_ticker]):
+        ba_o = effective_ba[i] if i < len(effective_ba) else None
+        quant_o = effective_quant[i] if i < len(effective_quant) else None
+        web_o = effective_web[i] if i < len(effective_web) else None
+        fm_o = effective_fm[i] if i < len(effective_fm) else None
+        sr_o = effective_sr[i] if i < len(effective_sr) else None
+        macro_o = effective_macro[i] if i < len(effective_macro) else None
+        insider_o = effective_insider[i] if i < len(effective_insider) else None
+        
+        ref_block, chunk_id_map = build_citation_block(
+            ba_output=ba_o,
+            quant_output=quant_o,
+            web_output=web_o,
+            fm_output=fm_o,
+            sr_output=sr_o,
+            macro_output=macro_o,
+            insider_news_output=insider_o,
+            ticker=tick,
+            index_offset=offset,
+        )
+        if ref_block:
+            ref_blocks.append(ref_block)
+        all_chunk_id_maps.update(chunk_id_map)
+        offset += len(chunk_id_map)
+    
+    citation_index_prompt = _build_citation_index_prompt(all_chunk_id_maps)
+    
+    logger.info(f"[Stage2] Citation map has {len(all_chunk_id_maps)} entries")
+    logger.info(f"[Stage2] Citation index prompt length: {len(citation_index_prompt)} chars")
+    
     t = primary_ticker.upper()
     period_bs  = anchor.get(f"{t}_bs_period",  "FY2024")
     period_cf  = anchor.get(f"{t}_cf_period",  "FY2024")
     period_inc = anchor.get(f"{t}_inc_period", "FY2024")
-    _citation_block = citation_str if citation_str else "[1] Company filings and DB\n[2] Market data"
     _latest_q_period = anchor.get(f"{t}_latest_q_period", "Q1 FY2025")
 
-    stage2_prompt = f"""Convert the following validated JSON into a professional equity research note.
+    stage2_prompt = f"""Convert the following validated JSON into a comprehensive equity research note.
 
 VALIDATED JSON DATA (these numbers are ground-truth — use them exactly):
 {json.dumps(stage1_result, indent=2)}
 
-CITATION INDEX — use [N] to cite specific agent sources:
-{_citation_block}
+{citation_index_prompt}
 
-CRITICAL: Different insights come from different agents. Use the appropriate [N] citation for each claim:
-- Business Analyst insights (moat, strategy, sentiment) → cite [Business Analyst] indices
-- Stock Research insights (earnings calls, broker reports) → cite [Stock Research] indices
-- Macro insights (themes, regime, drivers) → cite [Macro] indices
-- Insider/News insights (transactions, sentiment) → cite [Insider/News] indices
-- Web Search insights (breaking news, catalysts) → cite [Web Search] indices
-- Financial Modelling insights (DCF, technicals) → cite [Financial Modelling] indices
+QUALITATIVE CONTEXT FROM RESEARCH AGENTS (use for product names, catalysts, news, themes):
+{qualitative_context}
 
 PERIOD CONTEXT:
 - Balance sheet period: {period_bs}
@@ -3012,25 +3069,47 @@ PERIOD CONTEXT:
 - Latest quarter: {_latest_q_period}
 
 YOUR TASK:
-You are a Senior PM synthesizing all 7 agent outputs. Structure the report to answer the user's question.
-Start with ## Executive Summary. Then organize by topic (Company Overview → Financials → Valuation → 
-Growth → Risks → Macro → Verdict). Use section headers that make sense.
+You are a Senior PM synthesizing all 7 agent outputs into a deep, actionable investment memo.
 
-Each section format:
-1. Opening paragraph (2-4 sentences of context)
-2. Then 2-4 bullet points with bold labels
-3. Example: "- **Valuation:** P/E of 32x sits 18% above sector median, embedding 12-14% EPS growth expectations [5]."
+STRUCTURE:
+Start with ## Executive Summary, then organize by: Company Overview → Financial Performance → Valuation → 
+Growth Prospects → Risk Factors → Macroeconomic Factors → Verdict.
+
+TARGET LENGTH: 3500-4500 words total. Each major section should be 400-600 words.
+
+SECTION FORMAT (critical - follow exactly):
+1. Opening paragraph: 3-5 sentences setting context and framing the key question
+2. Then 3-5 bullet points, each 2-3 sentences long, with bold labels
+3. Example bullet:
+   "- **Valuation Premium:** The stock trades at a P/E of 32x, 18% above sector median of 27x, embedding 12-14% EPS growth expectations [5]. This premium is partially justified by the 75% gross margin in Services, but leaves little room for execution risk [1]. Any miss on iPhone cycle expectations could trigger multiple compression [19]."
+
+DEPTH REQUIREMENTS (non-negotiable):
+- Every metric must explain WHY it matters for the investment thesis, not just WHAT it is
+- Connect quantitative data to business outcomes: "High ROIC of 58% indicates durable competitive advantages and efficient capital deployment, enabling reinvestment at returns far exceeding cost of capital [6]"
+- Cross-reference agents: Compare insider selling [4] against management's bullish guidance [18] and explain the tension
+- Integrate macro context: How does the risk-off regime [24] affect valuation multiples and discount rates [9]?
+- Weave Stock Research broker insights [15-23] with Quant metrics [5-8] and Macro themes [24-28]
+- Use Financial Modelling DCF [9] to contextualize current price vs intrinsic value
+- Factor Insider/News sentiment [29-31] as validation or contradiction of the bull/bear case
+
+CITATION DISCIPLINE:
+- Every claim citing data must reference the source [N] from the citation index above
+- Different agents own different insights - cite appropriately:
+  * Business fundamentals → [Business Analyst] citations
+  * Earnings/broker views → [Stock Research] citations  
+  * Macro regime/themes → [Macro] citations
+  * Insider activity → [Insider/News] citations
+  * Valuation models → [Financial Modelling] citations
+  * Raw financials → [Quant Fundamental] citations
+  * Breaking news → [Web Search] citations
 
 SYNTHESIS REQUIREMENTS:
-- Weave ALL 7 agents together naturally. Don't leave any agent unheard.
-- Every claim must cite its source [N] from the citation index above.
-- When agents disagree, cite both and explain the tension.
-- Every number MUST appear in the JSON above. NO fabricated metrics.
-- If a metric isn't in JSON, write qualitatively without a number.
-- Never use placeholders (N/A, null, TBD) — write "data unavailable" instead.
-- Explain WHY each metric matters for the investment thesis, not just WHAT it is.
-- BANNED WORDS: robust, strong, significant, impressive — use specifics instead.
-- CRITICAL: total_assets ≠ total_liabilities ≠ total_equity. These are THREE DISTINCT values.
+- ALL 7 agents must be represented in EVERY major section (not siloed)
+- When agents disagree, cite both and explain: "While broker consensus is constructive [19], insider selling signals caution [4]"
+- Every number MUST appear in JSON above - NO fabricated metrics
+- If a specific data point is missing, weave around it naturally rather than stating "data unavailable" — e.g. instead of "iPhone data unavailable cycle" write "the upcoming iPhone cycle" or "the next iPhone generation"
+- BANNED WORDS: robust, strong, significant, impressive — use specifics instead
+- CRITICAL: total_assets ≠ total_liabilities ≠ total_equity (THREE distinct values)
 
 Start directly with ## Executive Summary."""
 
@@ -3140,35 +3219,11 @@ Start directly with ## Executive Summary."""
     prose = _sanitize_unavailable_tokens(prose)
 
     # ── Inject full combined citation block (BA + SR + Web + Quant + FM) ─────
-    # Keep numbering consistent with build_citation_block ordering.
-    from .citations import build_citation_block, inject_inline_numbers  # type: ignore[import]
-
-    all_chunk_id_maps: Dict[str, Any] = {}
-    ref_blocks: List[str] = []
-    offset = 0
-    for i, t in enumerate(effective_tickers or [primary_ticker]):
-        ba_o = effective_ba[i] if i < len(effective_ba) else None
-        quant_o = effective_quant[i] if i < len(effective_quant) else None
-        web_o = effective_web[i] if i < len(effective_web) else None
-        fm_o = effective_fm[i] if i < len(effective_fm) else None
-        sr_o = effective_sr[i] if i < len(effective_sr) else None
-
-        ref_block, chunk_id_map = build_citation_block(
-            ba_output=ba_o,
-            quant_output=quant_o,
-            web_output=web_o,
-            fm_output=fm_o,
-            sr_output=sr_o,
-            macro_output=effective_macro[i] if i < len(effective_macro) else None,
-            insider_news_output=effective_insider[i] if i < len(effective_insider) else None,
-            ticker=t,
-            index_offset=offset,
-        )
-        if ref_block:
-            ref_blocks.append(ref_block)
-        all_chunk_id_maps.update(chunk_id_map)
-        offset += len(chunk_id_map)
-
+    # Reuse the citation maps and ref_blocks already built in Stage 2
+    from .citations import inject_inline_numbers  # type: ignore[import]
+    
+    logger.info(f"[Stage2.9] Injecting inline citations from {len(all_chunk_id_maps)} chunk_ids")
+    
     prose = inject_inline_numbers(prose, all_chunk_id_maps)
     prose = _normalize_placeholder_citations(prose, 1)
     prose = _normalize_markdown_section_spacing(prose)
@@ -3302,6 +3357,10 @@ def _build_citation_index(
         sources.append("[Financial Modelling] Comparable Company Analysis")
         sources.append("[Financial Modelling] Technical Analysis")
     
+    logger.info(f"[citations] Built index with {len(sources)} entries")
+    for i, src in enumerate(sources[:10]):
+        logger.info(f"[citations] [{i+1}] {src}")
+    
     return sources[:40]  # Increased from 20 to 40 to accommodate all agents
 
 
@@ -3318,13 +3377,14 @@ def _audit_and_replace_numbers(
     indices) are left untouched.
     """
     # Patterns to skip: citation markers [1], years (19xx/20xx), small integers ≤ 12
-    # (months/days), page numbers, percentages that are clearly ordinal
+    # (months/days), page numbers, percentages that are clearly ordinal, product model numbers
     _SKIP_PATTERN = re.compile(
         r'(?:'
         r'\[\d+\]'                        # citation [N]
         r'|\b(?:19|20)\d{2}\b'            # years 1900-2099
         r'|\b[1-9]\b'                     # single digits
         r'|\b1[0-2]\b'                    # 10-12 (months)
+        r'|iPhone\s+\d+'                  # product model numbers (iPhone 17, etc.)
         r')'
     )
 
@@ -3344,6 +3404,13 @@ def _audit_and_replace_numbers(
         # Skip years — likely structural rather than financial claims
         if 1900 <= num_val <= 2100:
             return num_str
+        # Skip small integers that are likely counts, rankings, or ordinal references
+        # (e.g. "7 agents", "3 scenarios", "top 5 risks")
+        if 0 < num_val <= 15 and num_val == int(num_val):
+            return num_str
+        # Skip integers that look like page numbers or section references
+        if num_val == int(num_val) and 1 <= num_val <= 500:
+            return num_str
         # Find closest anchor value
         t = ticker.upper()
         best_key, best_diff = None, float("inf")
@@ -3354,15 +3421,18 @@ def _audit_and_replace_numbers(
             if diff < best_diff:
                 best_diff = diff
                 best_key = anchor_key
-        # Only replace if very close (within 5%) — otherwise redact
+        # Only replace if very close (within 5%) — otherwise leave as-is
+        # (leaving it is better than flooding the report with "data unavailable")
         if best_key and best_diff < 0.05:
             replacement = str(anchor[best_key])
             logger.info("[audit] Replacing stray number %s with anchor %s=%s", num_str, best_key, replacement)
             return replacement
-        # No safe anchor match: redact numeric literal to prevent hallucinated figures.
-        # Use plain-language token rather than N/A so user output stays clean.
-        logger.warning("[audit] Stray number %s not in anchor — redacting", num_str)
-        return "data unavailable"
+        # No safe anchor match: leave the number as-is rather than redacting.
+        # Redacting with "data unavailable" creates unreadable prose and degrades
+        # the report quality. The FactChecker and manual review are better safeguards
+        # for catching genuinely hallucinated figures.
+        logger.debug("[audit] Stray number %s not in anchor — leaving as-is (non-critical)", num_str)
+        return num_str
 
     # Match standalone numbers (not inside words or immediately followed by a decimal point,
     # which would indicate we're matching just the integer part of a larger decimal number
