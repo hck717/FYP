@@ -1,114 +1,69 @@
-# Agents Layer — Overview
+# Agents Layer
 
-The `agents/` directory contains four specialised AI agents. Each agent is an
-independent LangGraph pipeline responsible for a distinct class of financial
-analysis. The orchestration layer (`orchestration/`) selects which agents to
-run, dispatches them in parallel, and synthesises their outputs into a final
-research note.
+`agents/` contains the domain agents used by the orchestration graph.
 
----
+## Current Agent Set
 
-## Architecture
-
-```
-User Query
-    │
-    ▼
-[Orchestration Planner]  ─  resolves ticker(s), selects agents, sets complexity
-    │
-    ▼ (parallel — ThreadPoolExecutor)
-┌───────┬────────────────┬───────────────────┬──────────────────────┐
-│  Web  │    Business    │      Quant        │     Financial        │
-│Search │    Analyst     │   Fundamental     │     Modelling        │
-│ Agent │     Agent      │      Agent        │       Agent          │
-└───────┴────────────────┴───────────────────┴──────────────────────┘
-    │           │                 │                    │
-    └───────────┴─────────────────┴────────────────────┘
-                          │
-                          ▼
-              [ReAct Check]  ─  retry gap agents if needed
-                          │
-                          ▼
-              [Summarizer]   ─  deepseek-r1:8b narrative
-                          │
-                          ▼
-                  Final Research Note (Markdown)
-```
-
----
-
-## Agents at a Glance
-
-| Agent | Directory | Primary Responsibility | Key Data Sources |
+| Agent | Path | Main Role | Entry Point |
 |---|---|---|---|
-| **Web Search** | `web_search/` | Live breaking news, sentiment signals | Perplexity sonar-pro API |
-| **Business Analyst** | `business_analyst/` | Qualitative moat analysis, earnings calls, broker reports | Neo4j, PostgreSQL, Ollama |
-| **Quant Fundamental** | `quant_fundamental/` | Value/quality/momentum factors, Piotroski, Beneish | PostgreSQL |
-| **Financial Modelling** | `financial_modelling/` | DCF valuation, peer comps, technicals | PostgreSQL, Neo4j |
+| Business Analyst | `agents/business_analyst/` | Qualitative analysis from local text + graph + sentiment | `python -m agents.business_analyst.agent` |
+| Quant Fundamental | `agents/quant_fundamental/` | Deterministic factor math from PostgreSQL | `python -m agents.quant_fundamental.agent` |
+| Financial Modelling | `agents/financial_modelling/` | DCF/comps/technicals/factor outputs | `python -m agents.financial_modelling.agent` |
+| Web Search | `agents/web_search/` | Real-time web updates and risk signals | `run_web_search_agent()` / `web_search_node()` |
+| Stock Research | `agents/stock_research_agent/` | Earnings call + broker report synthesis | `run_full_analysis()` |
+| Macro | `agents/macro_agent/` | Macro regime and transmission-to-ticker analysis | `run_full_analysis()` |
+| Insider News | `agents/insider_news_agent/` | Insider transactions + news synthesis | `run_full_analysis()` |
 
----
+## How Orchestration Uses Them
 
-## Shared Technology Stack
+- Planner resolves ticker(s), complexity, and enabled agents.
+- Enabled agents run in parallel branches.
+- Each branch has per-agent retry routing based on output + retry budget.
+- Summarizer merges outputs into final report.
 
-| Component | Role |
-|---|---|
-| **LangGraph** | Agent state machine / node-based workflow |
-| **LangChain** | LLM invocation, prompt management |
-| **Ollama** | Local LLM inference (`llama3.2:latest`, `deepseek-r1:8b`) |
-| **Neo4j** | Company knowledge graph + vector search (Chunk nodes) |
-| **PostgreSQL** | Historical time-series, fundamentals, sentiment trends |
-| **pgvector** | Vector embeddings for semantic search (PostgreSQL) |
+```mermaid
+flowchart LR
+    P[Planner] --> BA[Business Analyst]
+    P --> QF[Quant Fundamental]
+    P --> FM[Financial Modelling]
+    P --> WS[Web Search]
+    P --> SR[Stock Research]
+    P --> MA[Macro]
+    P --> IN[Insider News]
+    BA --> S[Summarizer]
+    QF --> S
+    FM --> S
+    WS --> S
+    SR --> S
+    MA --> S
+    IN --> S
+```
 
----
+See `orchestration/README.md` for full graph details.
 
-## Quick-Start Commands
-
-Run any agent directly from the repo root (activate `.venv` first):
+## Quick Commands
 
 ```bash
-# Business Analyst (inside Docker - recommended)
-docker exec fyp-airflow-webserver python -m agents.business_analyst.agent --ticker AAPL
-docker exec fyp-airflow-webserver python -m agents.business_analyst.agent --ticker MSFT --task "What is Microsoft's competitive moat?"
-
-# Business Analyst (from host)
-source .venv/bin/activate
-python -m agents.business_analyst.agent --ticker AAPL --task "What is Apple's competitive moat?"
+# Business Analyst
+python -m agents.business_analyst.agent --ticker AAPL --task "What is Apple's moat?"
 
 # Quant Fundamental
-python -m agents.quant_fundamental.agent --ticker NVDA
-python -m agents.quant_fundamental.agent --prompt "Compare MSFT vs AAPL fundamentals"
+python -m agents.quant_fundamental.agent --ticker AAPL
 
 # Financial Modelling
-python -m agents.financial_modelling.agent --ticker TSLA
-python -m agents.financial_modelling.agent --ticker GOOGL --log-level DEBUG
+python -m agents.financial_modelling.agent --ticker AAPL
 ```
 
----
+Web Search, Macro, Insider News, and Stock Research are typically called through orchestration, but can be invoked programmatically from their `agent.py` wrappers.
 
-## Configuration
+## Shared Infrastructure
 
-All agents use environment variables for configuration. Key settings:
+- PostgreSQL: structured tables + vectorized text tables.
+- Neo4j: graph entities and chunk retrieval.
+- DeepSeek API: planner/summarizer and several agent LLM calls.
+- Ollama: embeddings and selected local model fallback paths.
 
-| Variable | Description | Default |
-|---|---|---|
-| `OLLAMA_BASE_URL` | Ollama API URL | `http://localhost:11434` (host) or `http://host.docker.internal:11434` (Docker) |
-| `NEO4J_URI` | Neo4j bolt URI | `bolt://localhost:7687` |
-| `POSTGRES_HOST` | PostgreSQL host | `localhost` |
+## Documentation Metadata
 
----
-
-## Data Flow
-
-1. **Ingestion** (Airflow DAG): EODHD API → PostgreSQL + Neo4j
-2. **Text Processing**: PDF earnings calls + broker reports → Neo4j chunks
-3. **Agent Execution**: Query → Retrieval → Analysis → Citation
-4. **Synthesis**: All agent outputs → Final research note
-
----
-
-## Environment
-
-- **Python**: 3.11+
-- **Ollama**: Must be running with models pulled
-- **Docker**: docker-compose up -d (PostgreSQL, Neo4j, Airflow)
-- **No timeout**: Agent requests default to no timeout for quality analysis
+- Last updated: 2026-04-08
+- Source of truth for branch routing: `orchestration/graph.py`
