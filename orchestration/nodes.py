@@ -41,6 +41,49 @@ logger = logging.getLogger(__name__)
 
 _MAX_REACT_ITERATIONS = 3  # safety cap (legacy sequential path only)
 
+_LANGUAGE_ALIASES = {
+    "english": "english",
+    "cantonese": "cantonese",
+    "cantones": "cantonese",
+    "yue": "cantonese",
+    "mandarin": "mandarin",
+    "mandrain": "mandarin",
+    "mandarine": "mandarin",
+    "zh": "mandarin",
+    "cn": "mandarin",
+    "chinese": "mandarin",
+    "spanish": "spanish",
+    "french": "french",
+    "german": "german",
+    "japanese": "japanese",
+    "ja": "japanese",
+    "jp": "japanese",
+    "jpn": "japanese",
+    "korean": "korean",
+    "ko": "korean",
+    "kr": "korean",
+    "portuguese": "portuguese",
+    "italian": "italian",
+    "dutch": "dutch",
+    "russian": "russian",
+    "arabic": "arabic",
+    "hindi": "hindi",
+    "thai": "thai",
+    "vietnamese": "vietnamese",
+    "indonesian": "indonesian",
+}
+
+
+def _normalize_output_language(value: Optional[str]) -> Optional[str]:
+    """Normalize language value to canonical keys used by summarizer/translator."""
+    if not value:
+        return None
+    raw = str(value).strip().lower()
+    if not raw:
+        return None
+    lang = _LANGUAGE_ALIASES.get(raw, raw)
+    return None if lang == "english" else lang
+
 
 def _build_local_fallback_summary(
     user_query: str,
@@ -267,7 +310,8 @@ def node_planner(state: OrchestrationState) -> OrchestrationState:
     user_query = state.get("user_query", "")
     logger.info("[planner] Analysing query: %r", user_query)
 
-    # Detect language requirement from user query
+    # Detect language requirement from user query.
+    # UI/initial-state language setting takes precedence over query inference.
     output_language: Optional[str] = None
     query_lower = user_query.lower()
     language_keywords = {
@@ -294,40 +338,9 @@ def node_planner(state: OrchestrationState) -> OrchestrationState:
             logger.info("[planner] Detected language requirement: %s", output_language)
             break
 
-    # Normalize UI labels to canonical language keys expected by translators/scorers.
-    if isinstance(output_language, str):
-        _lang_map = {
-            "english": "english",
-            "cantonese": "cantonese",
-            "cantones": "cantonese",
-            "yue": "cantonese",
-            "mandarin": "mandarin",
-            "mandrain": "mandarin",
-            "mandarine": "mandarin",
-            "zh": "mandarin",
-            "cn": "mandarin",
-            "chinese": "mandarin",
-            "spanish": "spanish",
-            "french": "french",
-            "german": "german",
-            "japanese": "japanese",
-            "ja": "japanese",
-            "jp": "japanese",
-            "jpn": "japanese",
-            "korean": "korean",
-            "ko": "korean",
-            "kr": "korean",
-            "portuguese": "portuguese",
-            "italian": "italian",
-            "dutch": "dutch",
-            "russian": "russian",
-            "arabic": "arabic",
-            "hindi": "hindi",
-            "thai": "thai",
-            "vietnamese": "vietnamese",
-            "indonesian": "indonesian",
-        }
-        output_language = _lang_map.get(output_language.strip().lower(), output_language.strip().lower())
+    detected_output_language = _normalize_output_language(output_language)
+    preset_output_language = _normalize_output_language(cast(Optional[str], state.get("output_language")))
+    output_language = preset_output_language or detected_output_language
 
     # --- in-context learning: inject low-score + latest human feedback context ---
     worst_case_context: str = ""
@@ -541,12 +554,8 @@ def node_planner(state: OrchestrationState) -> OrchestrationState:
         "data_availability": data_availability,
         "episodic_hints": episodic_hints,
         "planner_trace": planner_trace,
-        # Prefer language detected from query text; fall back to UI-supplied value in state
-        "output_language": (
-            (str(state.get("output_language") or "").strip().lower() if state.get("output_language") else None)
-            if not output_language
-            else output_language
-        ),
+        # Enforce user preset when supplied; otherwise use query-detected language.
+        "output_language": output_language,
         "react_steps": [],
         "react_iteration": 0,
         "react_max_iterations": react_max,
@@ -1128,7 +1137,7 @@ def node_summarizer(state: OrchestrationState) -> OrchestrationState:
     user_query    = state.get("user_query", "")
     tickers       = state.get("tickers") or []
     ticker        = state.get("ticker")
-    output_language = state.get("output_language")
+    output_language = _normalize_output_language(cast(Optional[str], state.get("output_language")))
 
     # Prefer the multi-output lists; fall back to legacy single-output aliases.
     # Cast to List[Dict[str, Any]] by filtering out any None values.
@@ -1221,9 +1230,8 @@ def node_summarizer(state: OrchestrationState) -> OrchestrationState:
             errors=errors,
         )
 
-    # Final safeguard: ensure UI-selected output_language is respected even if
-    # the structured summarizer path returned untranslated content.
-    if output_language and "summarizer" not in errors:
+    # Final safeguard: always enforce selected output language on the final summary.
+    if output_language:
         try:
             from .llm import translate_text  # type: ignore[import]
             final_summary = translate_text(final_summary, str(output_language))

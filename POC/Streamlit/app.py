@@ -102,6 +102,27 @@ EXAMPLE_QUERIES = [
     "What are the latest risks and news for AAPL?",
 ]
 
+# Canonical language keys expected by orchestration translation/scoring paths.
+_UI_OUTPUT_LANGUAGE_MAP = {
+    "English": "english",
+    "Cantonese": "cantonese",
+    "Mandarin": "mandarin",
+    "Spanish": "spanish",
+    "French": "french",
+    "German": "german",
+    "Japanese": "japanese",
+    "Korean": "korean",
+    "Portuguese": "portuguese",
+    "Italian": "italian",
+    "Dutch": "dutch",
+    "Russian": "russian",
+    "Arabic": "arabic",
+    "Hindi": "hindi",
+    "Thai": "thai",
+    "Vietnamese": "vietnamese",
+    "Indonesian": "indonesian",
+}
+
 # Node display labels / descriptions
 NODE_LABELS = {
     "planner":         ("Planning", "Resolving ticker, selecting agents, setting complexity…"),
@@ -120,6 +141,22 @@ st.markdown(
     :root {
         --ui-font: 'Inter', system-ui, -apple-system, 'Segoe UI', sans-serif;
         --num-font: 'JetBrains Mono', 'SF Mono', Monaco, monospace;
+    }
+
+    [data-theme="light"], .stApp[data-theme="light"] {
+        --text-main: #1a1a1a;
+        --text-muted: #4b5563;
+        --line-subtle: rgba(0, 0, 0, 0.1);
+    }
+
+    [data-theme="dark"], .stApp[data-theme="dark"] {
+        --text-main: #e6eaf0;
+        --text-muted: #a8b3c2;
+        --line-subtle: rgba(230, 234, 240, 0.14);
+    }
+
+    /* Fallback for default (dark mode default) */
+    :root, [data-theme="dark"] {
         --text-main: #e6eaf0;
         --text-muted: #a8b3c2;
         --line-subtle: rgba(230, 234, 240, 0.14);
@@ -534,6 +571,46 @@ def _safe_get(d: Any, *keys: str, default: Any = None) -> Any:
             return default
         cur = cur.get(k, default)
     return cur
+
+
+def _normalize_output_language(value: Optional[str]) -> Optional[str]:
+    """Normalize UI language labels / free-text to canonical language keys."""
+    if not value:
+        return None
+    raw = str(value).strip()
+    if not raw:
+        return None
+
+    if raw in _UI_OUTPUT_LANGUAGE_MAP:
+        lang = _UI_OUTPUT_LANGUAGE_MAP[raw]
+    else:
+        lang = raw.lower()
+
+    return None if lang == "english" else lang
+
+
+def _enforce_summary_language(
+    state: Dict[str, Any],
+    expected_language: Optional[str],
+) -> Dict[str, Any]:
+    """UI-level safeguard: force final_summary to the selected language."""
+    if not expected_language:
+        state["output_language"] = None
+        return state
+
+    summary = str(state.get("final_summary") or "")
+    if not summary.strip():
+        state["output_language"] = expected_language
+        return state
+
+    try:
+        from orchestration.llm import translate_text  # type: ignore[import]
+        state["final_summary"] = translate_text(summary, expected_language)
+        state["output_language"] = expected_language
+    except Exception as exc:
+        st.warning(f"Language translation safeguard failed: {exc}")
+        state["output_language"] = expected_language
+    return state
 
 
 # ── Sidebar: data availability ────────────────────────────────────────────────
@@ -2249,9 +2326,11 @@ def main() -> None:
         st.subheader("Live Progress")
         # Get output language from the widget's session state
         output_lang = st.session_state.get("output_language", "English")
-        # Convert to the format expected by orchestration (None for English)
-        output_lang_param = output_lang if output_lang != "English" else None
+        output_lang_param = _normalize_output_language(output_lang)
         final_state = _run_with_streaming(query.strip(), output_lang_param)
+
+        if final_state:
+            final_state = _enforce_summary_language(final_state, output_lang_param)
 
         if final_state:
             st.session_state["last_state"] = final_state
@@ -2320,27 +2399,34 @@ def main() -> None:
                 mime="text/markdown",
             )
 
-        # RLAIF Quality Score Display (temporarily disabled for debugging)
-        # rl_scores = state.get("rl_feedback_scores")
-        # run_id = state.get("rl_feedback_run_id")
-        # if rl_scores and run_id:
-        #     with st.expander("AI Quality Score (RLAIF)", expanded=False):
-        #         overall = rl_scores.get("overall_score", 0)
-        #         col1, col2, col3, col4, col5 = st.columns(5)
-        #         col1.metric("Overall", f"{overall:.1f}/10")
-        #         col2.metric("Factual", f"{rl_scores.get('factual_accuracy', 0):.1f}")
-        #         col3.metric("Citations", f"{rl_scores.get('citation_completeness', 0):.1f}")
-        #         col4.metric("Analysis", f"{rl_scores.get('analysis_depth', 0):.1f}")
-        #         col5.metric("Structure", f"{rl_scores.get('structure_compliance', 0):.1f}")
-        #         
-        #         if overall < 7.0:
-        #             st.warning(f"⚠️ This report scored below the quality threshold (7.0). Agent blamed: {rl_scores.get('agent_blamed', 'unknown')}")
-        #         
-        #         weaknesses = rl_scores.get("weaknesses", [])
-        #         if weaknesses:
-        #             st.markdown("**Areas for improvement:**")
-        #             for w in weaknesses[:3]:
-        #                 st.markdown(f"- {w}")
+        # RLAIF Quality Score Display
+        rl_scores = state.get("rl_feedback_scores")
+        run_id = state.get("rl_feedback_run_id")
+        if rl_scores:
+            with st.expander("AI Quality Score (RLAIF)", expanded=False):
+                overall = float(rl_scores.get("overall_score") or 0)
+                col1, col2, col3, col4, col5, col6 = st.columns(6)
+                col1.metric("Overall", f"{overall:.1f}/10")
+                col2.metric("Factual", f"{float(rl_scores.get('factual_accuracy') or 0):.1f}")
+                col3.metric("Citations", f"{float(rl_scores.get('citation_completeness') or 0):.1f}")
+                col4.metric("Analysis", f"{float(rl_scores.get('analysis_depth') or 0):.1f}")
+                col5.metric("Structure", f"{float(rl_scores.get('structure_compliance') or 0):.1f}")
+                col6.metric("Language", f"{float(rl_scores.get('language_quality') or 0):.1f}")
+
+                if overall < 7.0:
+                    st.warning(
+                        "⚠️ This report scored below the quality threshold (7.0). "
+                        f"Agent blamed: {rl_scores.get('agent_blamed', 'unknown')}"
+                    )
+
+                weaknesses = rl_scores.get("weaknesses") or []
+                if weaknesses:
+                    st.markdown("**Areas for improvement:**")
+                    for w in weaknesses[:3]:
+                        st.markdown(f"- {w}")
+
+                if run_id:
+                    st.caption(f"Run ID: {run_id}")
 
         # Explicit User Feedback Widget
         run_id = state.get("rl_feedback_run_id")
