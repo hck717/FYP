@@ -61,7 +61,7 @@ full = run_full_analysis(ticker="AAPL")
 
 From `agents/business_analyst/config.py`:
 
-- `BUSINESS_ANALYST_MODEL` / `LLM_MODEL_BUSINESS_ANALYST` (default `deepseek-reasoner`)
+- `BUSINESS_ANALYST_MODEL` / `LLM_MODEL_BUSINESS_ANALYST` (default `deepseek-v4-pro`)
 - `DEEPSEEK_API_KEY`
 - `POSTGRES_*`
 - `NEO4J_*`

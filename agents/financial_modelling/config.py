@@ -57,7 +57,7 @@ class FinancialModellingConfig:
     llm_model: str = field(
         default_factory=lambda: os.getenv(
             "LLM_MODEL_FINANCIAL_MODELING",
-            os.getenv("LLM_MODEL_FINANCIAL_MODELLING", "deepseek-reasoner"),
+            os.getenv("LLM_MODEL_FINANCIAL_MODELLING", "deepseek-v4-pro"),
         )
     )
     llm_temperature: float = field(

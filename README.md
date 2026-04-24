@@ -157,7 +157,7 @@ Core:
 Model-related:
 
 - `ORCHESTRATION_PLANNER_MODEL` (default `deepseek-chat`)
-- `ORCHESTRATION_SUMMARIZER_MODEL` (default `deepseek-reasoner`)
+- `ORCHESTRATION_SUMMARIZER_MODEL` (default `deepseek-v4-pro`)
 - `LLM_MODEL_QUANT_FUNDAMENTAL`
 - `LLM_MODEL_FINANCIAL_MODELING`
 

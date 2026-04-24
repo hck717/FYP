@@ -79,13 +79,14 @@ _PG_DB          = os.getenv("POSTGRES_DB",           "airflow")
 _PG_USER        = os.getenv("POSTGRES_USER",         "airflow")
 _PG_PASS        = os.getenv("POSTGRES_PASSWORD",     "airflow")
 _DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
-_LLM_MODEL      = os.getenv("LLM_MODEL_BUSINESS_ANALYST", "deepseek-reasoner")
+_LLM_MODEL      = os.getenv("LLM_MODEL_BUSINESS_ANALYST", "deepseek-v4-pro")
 _EMBED_MODEL    = os.getenv("EMBEDDING_MODEL",       "nomic-embed-text:v1.5")
 
 # DeepSeek model mapping for compatibility
 _DEEPSEEK_MODELS = {
     "deepseek-chat": "deepseek-chat",
     "deepseek-reasoner": "deepseek-chat",  # fallback if reasoner not available
+    "deepseek-v4-pro": "deepseek-chat",    # fallback if v4-pro not available
 }
 
 _SUPPORTED_TICKERS = ["AAPL", "MSFT", "GOOGL", "TSLA", "NVDA"]

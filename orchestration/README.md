@@ -64,7 +64,7 @@ flowchart LR
 From `orchestration/llm.py` defaults:
 
 - Planner model: `deepseek-chat`
-- Summarizer model: `deepseek-reasoner`
+- Summarizer model: `deepseek-v4-pro`
 - Translation model: defaults to summarizer model unless overridden
 
 Primary env vars:

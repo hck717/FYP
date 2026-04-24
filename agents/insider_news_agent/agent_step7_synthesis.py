@@ -1,5 +1,5 @@
 """
-Step 7: DeepSeek-reasoner synthesis with 3 concurrent LLM tasks.
+Step 7: DeepSeek-v4-pro synthesis with 3 concurrent LLM tasks.
 
 For insider + news analysis, we run:
   1. **Task A — Insider Trading Pattern Analysis**: Analyze insider activity,
@@ -9,7 +9,7 @@ For insider + news analysis, we run:
   3. **Task C — Combined Investment Thesis**: Synthesize insider + news signals
      into coherent investment thesis with bull/bear cases and recommendation.
 
-Uses **deepseek-reasoner** model (not deepseek-chat) with temperature=0
+Uses **deepseek-v4-pro** model (not deepseek-chat) with temperature=0
 for extended thinking capability.
 
 Run:
@@ -40,7 +40,7 @@ _llm: "ChatOpenAI | None" = None
 
 
 def _get_llm() -> "ChatOpenAI":
-    """Initialize deepseek-reasoner LLM (lazy singleton)."""
+    """Initialize deepseek-v4-pro LLM (lazy singleton)."""
     global _llm
     if _llm is None:
         api_key = os.environ.get("DEEPSEEK_API_KEY", "")
@@ -52,11 +52,11 @@ def _get_llm() -> "ChatOpenAI":
             category=UserWarning,
         )
         _llm = ChatOpenAI(
-            model="deepseek-reasoner",
+            model="deepseek-v4-pro",
             base_url="https://api.deepseek.com",
             api_key=SecretStr(api_key),
             temperature=0,
-            model_kwargs={"max_tokens": 8000},
+            model_kwargs={"max_tokens": 8000, "reasoning_effort": "high"},  # Enable thinking mode
         )
     return _llm
 

@@ -1,6 +1,6 @@
 """LLM interaction utilities for the Business Analyst agent.
 
-LLM backend: DeepSeek API (deepseek-reasoner) via the openai-compatible SDK.
+LLM backend: DeepSeek API (deepseek-v4-pro) via the openai-compatible SDK.
 Ollama is retained for embeddings only (nomic-embed-text:v1.5); it is NOT used
 for any generation in this module.
 
@@ -260,6 +260,7 @@ class LLMClient:
             ],
             max_tokens=self.config.llm_max_tokens,
             temperature=self.config.llm_temperature,
+            reasoning_effort="high",  # Enable thinking mode for v4-pro/reasoner models
         )
 
         message = response.choices[0].message

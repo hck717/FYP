@@ -740,12 +740,13 @@ def _moe_persona_valuation(
                 {"role": "system", "content": f"You are the {persona_name} analyst in a DCF review committee."},
                 {"role": "user", "content": prompt},
             ]
-            # Attempt 1: primary model (deepseek-reasoner)
+            # Attempt 1: primary model (deepseek-v4-pro)
             response = client.chat.completions.create(
                 model=config.llm_model,
                 messages=messages,
                 temperature=0.5,
                 max_tokens=_PERSONA_MAX_TOKENS,
+                reasoning_effort="high",  # Enable thinking mode
             )
             content = response.choices[0].message.content or ""
             cleaned = _clean_response(content).strip()
@@ -871,6 +872,7 @@ def _node_moe_consensus(
                 ],
                 temperature=0.3,
                 max_tokens=500,
+                reasoning_effort="high",  # Enable thinking mode
             )
             content = response.choices[0].message.content or ""
             consensus_narrative = _clean_response(content).strip() or consensus_narrative
@@ -1747,6 +1749,7 @@ def _generate_summary_deepseek(config: FinancialModellingConfig, prompt: str) ->
             ],
             temperature=config.llm_temperature,
             max_tokens=config.llm_max_tokens,
+            reasoning_effort="high",  # Enable thinking mode
         )
         msg = response.choices[0].message
         content = msg.content or getattr(msg, "reasoning_content", None) or ""

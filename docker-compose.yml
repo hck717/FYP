@@ -57,9 +57,9 @@ x-airflow-common:
 
     # Embedding model — lock to tagged version to prevent silent model drift.
     # Override with EMBEDDING_MODEL env var if you pull a different version.
-    LLM_MODEL_BUSINESS_ANALYST: deepseek-reasoner
+    LLM_MODEL_BUSINESS_ANALYST: deepseek-v4-pro
     LLM_MODEL_QUANTITATIVE: llama3.2:3b
-    LLM_MODEL_FINANCIAL_MODELING: deepseek-reasoner
+    LLM_MODEL_FINANCIAL_MODELING: deepseek-v4-pro
     EMBEDDING_MODEL: nomic-embed-text:v1.5
     EMBEDDING_MODEL_VERSION: "1.0"
     EMBEDDING_DIMENSION: 768
@@ -74,7 +74,7 @@ x-airflow-common:
     BUSINESS_ANALYST_MAX_CHUNKS: 50
     BUSINESS_ANALYST_CHUNK_SIZE: 1000
     BUSINESS_ANALYST_OVERLAP: 200
-    # DeepSeek API — max output tokens for deepseek-reasoner (supports up to 32k)
+    # DeepSeek API — max output tokens for deepseek-v4-pro (supports up to 32k)
     BUSINESS_ANALYST_MAX_TOKENS: 32000
 
     # BA agent tuning — all configurable without code changes

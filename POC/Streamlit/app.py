@@ -202,6 +202,21 @@ st.markdown(
 
     .report-wrap p, .report-wrap li {
         max-width: 78ch;
+        word-break: break-word;
+        word-wrap: break-word;
+        overflow-wrap: break-word;
+        line-height: 1.6;
+        hyphens: auto;
+    }
+
+    .report-wrap {
+        overflow-x: hidden;
+    }
+
+    /* Ensure text in markdown doesn't overflow */
+    .report-wrap * {
+        word-break: break-word;
+        overflow-wrap: break-word;
     }
 
     .stCaption, small, .metric-label {
@@ -250,7 +265,7 @@ st.markdown(
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _clean_text_for_display(text: str) -> str:
-    """Clean text to fix rendering issues with invisible Unicode characters."""
+    """Clean text to fix rendering issues with invisible Unicode characters and word wrapping."""
     if not text:
         return text
     import re
@@ -261,30 +276,94 @@ def _clean_text_for_display(text: str) -> str:
     # Normalise line endings
     text = text.replace('\r\n', '\n').replace('\r', '\n')
 
+    # Fix concatenated text where spaces are missing between words (e.g., "wordanother" -> "word another")
+    # Look for patterns where lowercase/number is followed directly by uppercase (likely word boundary)
+    # But be careful not to break acronyms and proper nouns
+    text = re.sub(r'([a-z0-9])([A-Z])', r'\1 \2', text)
+    
+    # Also handle cases where a period/punctuation is directly followed by word without space
+    # e.g., "end.Next" -> "end. Next"
+    text = re.sub(r'([.!?:;,])([A-Z])', r'\1 \2', text)
+
+    # Escape dollar signs that might be interpreted as LaTeX by Streamlit
+    # Match single $ that aren't part of currency amounts (e.g., "$100")
+    # Look for $ not followed by digits or $ already escaped
+    text = re.sub(r'\$(?![0-9,.])', r'\\$', text)
+    text = re.sub(r'(?<![\\])\$(?![0-9,.])', r'\\$', text)
+
+    return text
+
+
+def _escape_markdown_special_chars(text: str) -> str:
+    """Escape special markdown characters that could break rendering."""
+    if not text:
+        return text
+    
+    import re
+    
+    # Escape characters that have special meaning in markdown but we want to display literally
+    # But be careful not to break intentional markdown formatting
+    
+    # Escape backslashes first (to avoid double-escaping)
+    text = text.replace('\\', '\\\\')
+    
+    # Escape dollar signs that aren't part of currency (already done in _clean_text_for_display)
+    # but we'll do it again here for safety
+    text = re.sub(r'(?<!\d)\$(?!\d)', r'\$', text)
+    
+    # Escape pipe characters that might break tables
+    # But preserve markdown table pipes
+    text = re.sub(r'\|(?!.*\|.*\n)', r'\\|', text)
+    
     return text
 
 
 def _sanitize_llm_markdown(text: str) -> str:
-    """Sanitize model markdown so headings and HTML cannot break layout."""
+    """Sanitize model markdown so headings, LaTeX, and HTML cannot break layout."""
     if not text:
         return text
 
     import re
 
     cleaned = _clean_text_for_display(text)
+    
     # Remove raw HTML heading tags if model emits them.
     cleaned = re.sub(r"<h[1-6][^>]*>.*?</h[1-6]>", "", cleaned, flags=re.IGNORECASE | re.DOTALL)
+    
+    # Remove LaTeX math blocks that might break Streamlit rendering
+    # Remove $...$ (inline math)
+    cleaned = re.sub(r'\$[^$\n]+\$', lambda m: m.group(0).replace('$', '\\$'), cleaned)
+    
+    # Remove $$...$$ (display math)
+    cleaned = re.sub(r'\$\$[^$]+\$\$', lambda m: m.group(0).replace('$', '\\$'), cleaned)
+    
+    # Remove \(...\) and \[...\] (LaTeX delimiters)
+    cleaned = re.sub(r'\\\([^)]*\\\)', '', cleaned)
+    cleaned = re.sub(r'\\\[[^\]]*\\\]', '', cleaned)
+    
+    # Remove HTML/XML-like tags that aren't markdown (e.g., <sub>, <sup>, <font>)
+    cleaned = re.sub(r'<(?!/?(?:b|i|em|strong|code|pre|a|ul|ol|li|p|div|span|blockquote|hr)[>\s/])[^>]*>', '', cleaned, flags=re.IGNORECASE)
+    
     # Downgrade all ATX headings to level-3 for consistent typography.
     cleaned = re.sub(r"(?m)^\s*#{1,2}\s+", "### ", cleaned)
     cleaned = re.sub(r"(?m)^\s*#{3,}\s+", "### ", cleaned)
+    
     # Ensure section headers are always on their own lines (prevents
     # "... sentence. ## Header" from rendering as plain paragraph text).
     cleaned = re.sub(r"(?<!\n)\s*(##\s+)", r"\n\n\1", cleaned)
+    
     # Ensure a blank line after each section header for paragraph separation.
     cleaned = re.sub(r"(?m)^(###\s+[^\n]+)\n(?!\n)", r"\1\n\n", cleaned)
 
     # Collapse excessive blank lines from malformed LLM markdown.
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    
+    # Remove any remaining problematic escape sequences
+    cleaned = re.sub(r'\\[nrtfvb]', ' ', cleaned)  # Remove escape chars but keep space
+    
+    # Escape special markdown characters
+    cleaned = _escape_markdown_special_chars(cleaned)
+    
     return cleaned.strip()
 
 
@@ -757,7 +836,13 @@ def _render_business_analyst(output: Dict[str, Any], ticker: str) -> None:
             narrative = moat.get("summary") or moat.get("narrative") or ""
         if narrative:
             with st.expander("Full narrative"):
-                st.markdown(narrative)
+                # Clean and wrap narrative text properly
+                narrative_clean = _clean_text_for_display(narrative)
+                st.markdown(
+                    f'<div style="word-break: break-word; overflow-wrap: break-word; '
+                    f'line-height: 1.6;">{narrative_clean}</div>',
+                    unsafe_allow_html=True
+                )
 
         # Missing context
         missing = output.get("missing_context") or []
@@ -835,7 +920,13 @@ def _render_quant_fundamental(output: Dict[str, Any], ticker: str) -> None:
         narrative = output.get("quantitative_summary") or output.get("summary") or ""
         if narrative:
             with st.expander("Quantitative narrative"):
-                st.markdown(narrative)
+                # Clean and wrap narrative text properly
+                narrative_clean = _clean_text_for_display(narrative)
+                st.markdown(
+                    f'<div style="word-break: break-word; overflow-wrap: break-word; '
+                    f'line-height: 1.6;">{narrative_clean}</div>',
+                    unsafe_allow_html=True
+                )
 
         # Thinking trace
         _render_thinking_trace(output.get("thinking_trace") or [])
@@ -931,18 +1022,39 @@ def _render_financial_modelling(output: Dict[str, Any], ticker: str) -> None:
         if consensus_narrative or personas:
             with st.expander("MoE Consensus reasoning", expanded=False):
                 if consensus_narrative:
-                    st.markdown(f"**Consensus:** {consensus_narrative}")
+                    # Clean and wrap narrative text properly
+                    cons_clean = _clean_text_for_display(consensus_narrative)
+                    st.markdown(
+                        f'<div style="word-break: break-word; overflow-wrap: break-word; '
+                        f'line-height: 1.6;">**Consensus:** {cons_clean}</div>',
+                        unsafe_allow_html=True
+                    )
                 for p in personas:
                     name_p = p.get("name") or p.get("persona") or "Agent"
                     narr_p = p.get("narrative") or p.get("reasoning") or ""
                     if narr_p:
-                        st.markdown(f"**{name_p}:** {narr_p}")
+                        # Clean and wrap persona narrative text properly
+                        persona_clean = _clean_text_for_display(narr_p)
+                        st.markdown(
+                            f'<div style="word-break: break-word; overflow-wrap: break-word; '
+                            f'line-height: 1.6;">**{name_p}:** {persona_clean}</div>',
+                            unsafe_allow_html=True
+                        )
 
         # Narrative
         narrative = output.get("quantitative_summary") or output.get("summary") or ""
         if narrative:
             with st.expander("Full narrative"):
-                st.markdown(narrative)
+                # Clean and wrap narrative text properly to prevent LaTeX interpretation
+                narrative_clean = _sanitize_llm_markdown(narrative)
+                import html
+                escaped_narrative = html.escape(narrative_clean)
+                st.markdown(
+                    f'<div style="word-break: break-word; overflow-wrap: break-word; '
+                    f'line-height: 1.6; font-family: -apple-system, BlinkMacSystemFont, sans-serif;">'
+                    f'{escaped_narrative}</div>',
+                    unsafe_allow_html=True
+                )
 
         # Thinking trace
         _render_thinking_trace(output.get("thinking_trace") or [])
@@ -2065,14 +2177,24 @@ def main() -> None:
         # ── API Settings ───────────────────────────────────────────────────────
         st.markdown("### API Settings")
         
-        # DeepSeek API Key
+        # DeepSeek API Key (auto-loaded from env in Docker)
+        env_deepseek_api_key = os.getenv("DEEPSEEK_API_KEY", "")
+        default_deepseek_api_key = st.session_state.get("deepseek_api_key") or env_deepseek_api_key
+
         deepseek_api_key = st.text_input(
             "DeepSeek API Key",
             type="password",
-            value=st.session_state.get("deepseek_api_key", ""),
+            value=default_deepseek_api_key,
             help="Enter your DeepSeek API key. Get one at https://platform.deepseek.com",
             key="deepseek_key_input"
         )
+
+        if deepseek_api_key:
+            st.session_state["deepseek_api_key"] = deepseek_api_key
+            os.environ["DEEPSEEK_API_KEY"] = deepseek_api_key
+            # Treat env-provided key as ready to use; explicit test is optional.
+            if "api_verified" not in st.session_state:
+                st.session_state["api_verified"] = True
         
         # Test API button
         if st.button("Test API Connection", key="test_api_btn"):
@@ -2105,7 +2227,9 @@ def main() -> None:
                 st.success("✓ API verified")
         
         # Show API status
-        if not st.session_state.get("api_verified"):
+        if deepseek_api_key:
+            st.success("✓ DeepSeek key loaded")
+        else:
             st.warning("⚠️ API key required for analysis")
 
         st.divider()
@@ -2307,10 +2431,11 @@ def main() -> None:
 
     # ── Run ───────────────────────────────────────────────────────────────────
     if run_btn:
-        # Check API key is verified
-        if not st.session_state.get("api_verified"):
-            st.error("Please enter and verify your DeepSeek API key in the sidebar first!")
-            st.info("1. Enter your DeepSeek API key in the sidebar\n2. Click 'Test API Connection'\n3. Wait for '✓ API key is valid!' message")
+        # Check DeepSeek API key is present (auto-loaded from docker-compose env)
+        deepseek_api_key = st.session_state.get("deepseek_api_key") or os.getenv("DEEPSEEK_API_KEY", "")
+        if not deepseek_api_key:
+            st.error("Please set a DeepSeek API key in environment or sidebar.")
+            st.info("Tip: docker-compose already passes DEEPSEEK_API_KEY to the streamlit service.")
             st.stop()
         
         query = query or ""
@@ -2386,10 +2511,20 @@ def main() -> None:
                 st.code(final_summary_clean[:2000], language="markdown")
             
             if show_raw:
-                st.text(final_summary_clean)
+                # Use plain text display with proper wrapping (not markdown to avoid interpretation)
+                import html
+                escaped_text = html.escape(final_summary_clean)
+                st.markdown(
+                    f'<pre style="white-space: pre-wrap; word-wrap: break-word; '
+                    f'overflow-wrap: break-word; font-family: monospace; '
+                    f'padding: 1rem; background-color: #f0f0f0; border-radius: 4px; '
+                    f'line-height: 1.5; font-size: 0.9em; color: #333;">{escaped_text}</pre>',
+                    unsafe_allow_html=True
+                )
             else:
+                # For markdown view, ensure proper rendering with escaped special chars
                 st.markdown('<div class="report-wrap">', unsafe_allow_html=True)
-                st.markdown(final_summary_clean)
+                st.markdown(final_summary_clean, unsafe_allow_html=False)  # Disable HTML to prevent injection
                 st.markdown('</div>', unsafe_allow_html=True)
             
             st.download_button(
@@ -2405,13 +2540,12 @@ def main() -> None:
         if rl_scores:
             with st.expander("AI Quality Score (RLAIF)", expanded=False):
                 overall = float(rl_scores.get("overall_score") or 0)
-                col1, col2, col3, col4, col5, col6 = st.columns(6)
+                col1, col2, col3, col4, col5 = st.columns(5)
                 col1.metric("Overall", f"{overall:.1f}/10")
-                col2.metric("Factual", f"{float(rl_scores.get('factual_accuracy') or 0):.1f}")
-                col3.metric("Citations", f"{float(rl_scores.get('citation_completeness') or 0):.1f}")
-                col4.metric("Analysis", f"{float(rl_scores.get('analysis_depth') or 0):.1f}")
-                col5.metric("Structure", f"{float(rl_scores.get('structure_compliance') or 0):.1f}")
-                col6.metric("Language", f"{float(rl_scores.get('language_quality') or 0):.1f}")
+                col2.metric("Citations", f"{float(rl_scores.get('citation_completeness') or 0):.1f}")
+                col3.metric("Analysis", f"{float(rl_scores.get('analysis_depth') or 0):.1f}")
+                col4.metric("Structure", f"{float(rl_scores.get('structure_compliance') or 0):.1f}")
+                col5.metric("Language", f"{float(rl_scores.get('language_quality') or 0):.1f}")
 
                 if overall < 7.0:
                     st.warning(

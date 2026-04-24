@@ -5,7 +5,7 @@ can rely on a single source of truth. The defaults match the values already
 documented inside docker-compose.yml, .env, and agents/business_analyst/README.md.
 
 Changes vs original:
-  - LLM provider switched from Ollama to DeepSeek API (deepseek-reasoner model).
+  - LLM provider switched from Ollama to DeepSeek API (deepseek-v4-pro model).
   - ollama_base_url retained for embeddings only (nomic-embed-text:v1.5 via Ollama).
   - deepseek_api_key field added (reads DEEPSEEK_API_KEY env var).
   - llm_num_ctx removed (Ollama-only; DeepSeek API uses max_tokens instead).
@@ -57,10 +57,10 @@ class BusinessAnalystConfig:
     postgres_user: str = field(default_factory=lambda: _env("POSTGRES_USER", "airflow"))
     postgres_password: str = field(default_factory=lambda: _env("POSTGRES_PASSWORD", "airflow"))
 
-    # LLM — DeepSeek API (deepseek-reasoner) for all generation.
+    # LLM — DeepSeek API (deepseek-v4-pro) for all generation.
     # Ollama is NOT used for LLM generation; see ollama_base_url below for embeddings.
     llm_provider: str = field(default_factory=lambda: os.getenv("BUSINESS_ANALYST_LLM_PROVIDER", "deepseek"))
-    llm_model: str = field(default_factory=lambda: os.getenv("BUSINESS_ANALYST_MODEL", os.getenv("LLM_MODEL_BUSINESS_ANALYST", "deepseek-reasoner")))
+    llm_model: str = field(default_factory=lambda: os.getenv("BUSINESS_ANALYST_MODEL", os.getenv("LLM_MODEL_BUSINESS_ANALYST", "deepseek-v4-pro")))
     llm_temperature: float = field(default_factory=lambda: float(os.getenv("BUSINESS_ANALYST_TEMPERATURE", "0.2")))
     # max_tokens controls DeepSeek API output budget (replaces Ollama's num_predict/num_ctx).
     llm_max_tokens: int = field(default_factory=lambda: int(os.getenv("BUSINESS_ANALYST_MAX_TOKENS", "12000")))

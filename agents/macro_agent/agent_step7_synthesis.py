@@ -1,5 +1,5 @@
 """
-Step 7: DeepSeek-reasoner synthesis with 3 concurrent LLM tasks.
+Step 7: DeepSeek-v4-pro synthesis with 3 concurrent LLM tasks.
 
 For macro analysis, we run:
   1. **Task A — Macro Regime Detection**: Identify regime (risk-on/off/stagflation) 
@@ -8,7 +8,7 @@ For macro analysis, we run:
      summarize thesis and link to target ticker.
   3. **Task C — Impact Synthesis**: Top 2-3 macro drivers + top risk scenario.
 
-Uses **deepseek-reasoner** model (not deepseek-chat) with temperature=0
+Uses **deepseek-v4-pro** model (not deepseek-chat) with temperature=0
 for extended thinking / chain-of-thought capability.
 
 Output per task: {"task": ..., "analysis": ..., "citations_found": [...]}
@@ -53,11 +53,11 @@ def _get_llm() -> "ChatOpenAI":
             category=UserWarning,
         )
         _llm = ChatOpenAI(
-            model="deepseek-reasoner",  # Use reasoner model (not deepseek-chat)
+            model="deepseek-v4-pro",  # Use v4-pro model with thinking mode
             base_url="https://api.deepseek.com",
             api_key=SecretStr(api_key),
             temperature=0,
-            model_kwargs={"max_tokens": 8000},  # Reasoner needs more tokens for thinking
+            model_kwargs={"max_tokens": 8000, "reasoning_effort": "high"},  # Enable thinking mode
         )
     return _llm
 

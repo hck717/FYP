@@ -29,7 +29,7 @@ _PLANNER_MODEL = os.getenv(
 )
 _SUMMARIZER_MODEL = os.getenv(
     "ORCHESTRATION_SUMMARIZER_MODEL",
-    "deepseek-reasoner",
+    "deepseek-v4-pro",
 )
 _TRANSLATION_MODEL = os.getenv("ORCHESTRATION_TRANSLATION_MODEL", _SUMMARIZER_MODEL)
 _REQUEST_TIMEOUT_ENV = os.getenv("ORCHESTRATION_LLM_TIMEOUT", "").strip()
@@ -162,6 +162,9 @@ def _deepseek_generate(
         "max_tokens": max_tokens,
         "stream": False,
     }
+    # Enable thinking mode for reasoning models
+    if "v4-pro" in model or "reasoner" in model:
+        payload["reasoning_effort"] = "high"
     _timeout = timeout if timeout is not None else _REQUEST_TIMEOUT
     try:
         resp = requests.post(
@@ -203,7 +206,7 @@ def _deepseek_generate(
 def _summarizer_model_max_output_tokens(model_name: str) -> int:
     """Return known max output-token caps for DeepSeek models."""
     m = (model_name or "").lower()
-    if "reasoner" in m:
+    if "reasoner" in m or "v4-pro" in m:
         return 64000
     if "chat" in m:
         return 8192
@@ -2824,6 +2827,31 @@ def _build_balanced_qualitative_context(
     return _truncate_preserve_ends(merged, 26000)
 
 
+def _merge_reference_blocks(ref_blocks: List[str]) -> str:
+    """Merge per-ticker reference blocks into one single References section."""
+    if not ref_blocks:
+        return ""
+
+    merged_sections: List[str] = []
+    for block in ref_blocks:
+        if not block:
+            continue
+        body = re.sub(
+            r"^\s*---\s*\n###\s+References\s*\n?",
+            "",
+            block.strip(),
+            count=1,
+            flags=re.IGNORECASE,
+        ).strip()
+        if body:
+            merged_sections.append(body)
+
+    if not merged_sections:
+        return ""
+
+    return "\n\n---\n### References\n" + "\n".join(merged_sections)
+
+
 def summarise_results_structured(
     user_query: str,
     tickers: List[str],
@@ -3227,7 +3255,7 @@ Start directly with ## Executive Summary."""
     prose = inject_inline_numbers(prose, all_chunk_id_maps)
     prose = _normalize_placeholder_citations(prose, 1)
     prose = _normalize_markdown_section_spacing(prose)
-    combined_ref_block = "\n".join(ref_blocks) if ref_blocks else ""
+    combined_ref_block = _merge_reference_blocks(ref_blocks)
     if combined_ref_block:
         prose = prose.rstrip() + "\n" + combined_ref_block
     else:
@@ -3516,7 +3544,7 @@ def summarise_results(
         # Advance offset by the number of new citations added
         offset += len(chunk_id_map)
 
-    combined_ref_block = "\n".join(ref_blocks) if ref_blocks else ""
+    combined_ref_block = _merge_reference_blocks(ref_blocks)
     citation_index_prompt = _build_citation_index_prompt(all_chunk_id_maps)
 
     # ── 2. Build context for LLM ─────────────────────────────────────────────

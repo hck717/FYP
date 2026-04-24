@@ -44,7 +44,7 @@ flowchart TD
 Key variables from `agents/financial_modelling/config.py`:
 
 - `FM_LLM_PROVIDER` (default `deepseek`)
-- `LLM_MODEL_FINANCIAL_MODELING` (default `deepseek-reasoner`)
+- `LLM_MODEL_FINANCIAL_MODELING` (default `deepseek-v4-pro`)
 - `DEEPSEEK_API_KEY`
 - `POSTGRES_*`
 - `NEO4J_URI`, `NEO4J_USER`, `NEO4J_PASSWORD`
