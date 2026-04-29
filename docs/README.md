@@ -28,8 +28,13 @@ Central index for repository documentation, grouped by audience and use case.
 ## Operations and Environment
 
 - Local data directory notes: `data/README.md`
-- Setup guide: `docs/setup_guide.md`
-- Hosting Streamlit with ngrok: `docs/HOSTING_WITH_NGROK.md`
+- Deployment and Hosting (Cloud/ngrok): `docs/DEPLOYMENT.md`
+
+## Archive and Reference
+
+- Legacy architecture setup guide: `docs/archive/legacy_architecture_setup.md`
+- Sample outputs from agents: `docs/example_outputs/`
+- Developer notes: `ingestion/notes/`
 
 ## Documentation Governance
 

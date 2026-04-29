@@ -1,7 +1,7 @@
 """Streamlit UI for The Agentic Investment Analyst.
 
 Run from the repo root:
-    streamlit run POC/streamlit/app.py
+    streamlit run ui/app.py
 
 Architecture:
     This app wraps the orchestration layer (orchestration/graph.py) and streams

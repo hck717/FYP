@@ -119,6 +119,13 @@ docker exec fyp-airflow-webserver python /opt/airflow/ingestion/etl/inspect_db.p
 - Macro data is stored under `_MACRO` and loaded through dedicated macro tasks.
 - `inspect_db.py` is the recommended post-run sanity check command.
 
+## Developer Notes
+
+Archived scratchpads and development notes can be found in `ingestion/notes/`:
+- `DATA_CHECK_COMMANDS.md`
+- `DATA_DESTINATIONS.md`
+- `data_needed.txt`
+
 ## Documentation Metadata
 
 - Last updated: 2026-04-08

@@ -130,7 +130,7 @@ echo -e "${GREEN}Starting Streamlit...${NC}"
 export STREAMLIT_SERVER_PORT="$STREAMLIT_PORT"
 export STREAMLIT_SERVER_HEADLESS=true
 
-cd "$(dirname "$0")/POC/streamlit"
+cd "$(dirname "$0")/ui"
 "$STREAMLIT_CMD" run app.py --server.port "$STREAMLIT_PORT" --server.headless true > /tmp/streamlit.log 2>&1 &
 STREAMLIT_PID=$!
 

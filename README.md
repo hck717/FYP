@@ -62,7 +62,7 @@ PY
 Run Streamlit UI:
 
 ```bash
-streamlit run POC/streamlit/app.py
+streamlit run ui/app.py
 ```
 
 ## Local Endpoints
@@ -72,6 +72,47 @@ streamlit run POC/streamlit/app.py
 - PostgreSQL: `localhost:5432`
 - Ollama API: `http://localhost:11434`
 - Streamlit: `http://localhost:8501`
+
+## Deployment & Hosting
+
+### Option 1: Cloud Deployment (AWS, GCP, DigitalOcean)
+
+For a robust, permanent deployment, host the platform on a cloud Virtual Machine (VM).
+- **Requirements:** Linux VM (Ubuntu 22.04+), 4-8 vCPUs, 16GB RAM, 50GB SSD.
+- **Network:** Open ports 8501 (Streamlit), 8080 (Airflow), and 7474 (Neo4j).
+
+1. Clone the repository to the VM.
+2. Create a `.env` file with `EODHD_API_KEY`, `DEEPSEEK_API_KEY`, `POSTGRES_*`, and `NEO4J_*` credentials.
+3. Run `docker compose up -d --build`.
+4. Access via `http://<your-vm-public-ip>:8501`.
+
+*Alternatively, you can host just the frontend on [Streamlit Cloud](https://share.streamlit.io), but you must use externally hosted PostgreSQL and Neo4j databases.*
+
+### Option 2: Local Tunneling with ngrok (Quick Sharing)
+
+If you want to share your app running on your personal machine *without* deploying it to the cloud, use ngrok.
+
+**Prerequisites:**
+1. **ngrok account** - Sign up at https://dashboard.ngrok.com
+2. **Docker & Docker Compose** installed
+3. **ngrok auth token** from your dashboard
+
+**Quick Start Script:**
+```bash
+# Navigate to your project directory
+cd /Users/brianho/FYP
+
+# Run the startup script with your ngrok token
+./start_with_ngrok.sh YOUR_NGROK_AUTH_TOKEN
+```
+
+The script will:
+- Start PostgreSQL and Neo4j
+- Start ngrok tunnel on port 8501
+- Start Streamlit app
+- Display your public URL (or check `http://localhost:4040`)
+
+*For full deployment details and troubleshooting, see **[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)**.*
 
 ## Core Runtime Flow
 

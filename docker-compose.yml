@@ -280,7 +280,7 @@ services:
       - OLLAMA_BASE_URL=http://ollama:11434
       - NGROK_AUTHTOKEN=${NGROK_AUTHTOKEN:-}
     volumes:
-      - ./POC/streamlit:/app
+      - ./ui:/app
       - ./agents:/app/agents
       - ./orchestration:/app/orchestration
       - ./charts:/app/charts

@@ -1,8 +1,59 @@
-# Hosting the FYP App with ngrok Tunnel
+# Deployment Guide: Cloud Hosting and Local Tunnels
 
-This guide explains how to host your FYP (Final Year Project) app with an ngrok tunnel so you can share it with others without deploying to the cloud.
+This guide explains how to deploy your FYP (Final Year Project) app to the cloud for a permanent setup, as well as how to use an ngrok tunnel to quickly share your local environment.
 
-## Why ngrok?
+---
+
+## 1. Cloud Deployment (AWS, GCP, DigitalOcean)
+
+For a robust, permanent deployment, you should host the platform on a cloud Virtual Machine (VM). Since the application relies on Docker Compose (which spins up Airflow, PostgreSQL, Neo4j, and Streamlit), a standard Linux VM is the most reliable approach.
+
+### Requirements
+- **Compute:** A Linux VM (Ubuntu 22.04+ recommended) with at least 4-8 vCPUs and 16GB RAM (Airflow, Neo4j, and Postgres are memory-intensive).
+- **Storage:** Minimum 50GB SSD.
+- **Network:** Port 8501 (Streamlit), 8080 (Airflow), and 7474 (Neo4j) must be open in your cloud provider's firewall if you intend to access them externally.
+
+### Step-by-Step Deployment
+
+1. **Provision the VM** on your preferred cloud provider.
+2. **Install Docker and Docker Compose** on the VM.
+3. **Clone the Repository:**
+   ```bash
+   git clone https://github.com/your-username/your-repo.git
+   cd your-repo
+   ```
+4. **Configure Environment Variables:**
+   Create a `.env` file in the root directory based on the expected variables:
+   ```bash
+   EODHD_API_KEY=your_key
+   DEEPSEEK_API_KEY=your_key
+   POSTGRES_USER=airflow
+   POSTGRES_PASSWORD=airflow
+   POSTGRES_DB=airflow
+   NEO4J_URI=bolt://neo4j:7687
+   NEO4J_USER=neo4j
+   NEO4J_PASSWORD=SecureNeo4jPass2025!
+   ```
+5. **Start the Infrastructure:**
+   ```bash
+   docker compose up -d --build
+   ```
+6. **Access the Application:**
+   Navigate to `http://<your-vm-public-ip>:8501` to view the Streamlit UI.
+
+### Alternative: Streamlit Cloud
+If you only want to host the frontend (UI) on [Streamlit Cloud](https://share.streamlit.io):
+1. You **must** host your PostgreSQL and Neo4j databases externally (e.g., AWS RDS for Postgres, AuraDB for Neo4j).
+2. Connect your GitHub repo to Streamlit Cloud.
+3. Set the `POSTGRES_HOST`, `NEO4J_URI`, and API keys in the Streamlit Cloud Secrets configuration.
+
+---
+
+## 2. Local Tunneling with ngrok (Quick Sharing)
+
+If you want to share your app running on your personal machine *without* deploying it to the cloud, use ngrok.
+
+### Why ngrok?
 
 - **No cloud deployment needed** - Runs locally on your machine
 - **Instant sharing** - Get a public URL in seconds
@@ -94,7 +145,7 @@ docker-compose ps
 ngrok http 8501
 
 # Terminal 2: Start Streamlit
-cd POC/streamlit
+cd ui
 streamlit run app.py
 ```
 
@@ -103,7 +154,7 @@ Or run both in one command:
 ```bash
 # Start ngrok in background, then streamlit
 ngrok http 8501 &
-streamlit run POC/streamlit/app.py
+streamlit run ui/app.py
 ```
 
 ---
