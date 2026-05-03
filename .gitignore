@@ -1,6 +1,9 @@
 # ─── Secrets & Environment ──────────────────────────────────────────────────
-.env
-.env.*
+# .env is now committed with default values for new users
+# To override locally, create .env.local (in gitignore below)
+.env.local
+.env.*.local
+.env.prod
 !.env.example
 
 # ─── Agent Data (scraped CSVs, JSONs — never commit raw data) ───────────────

@@ -41,12 +41,9 @@ x-airflow-common:
     # Neo4j – fully hard-coded auth
     NEO4J_AUTH: neo4j/SecureNeo4jPass2025!
 
-    # API keys (using the values you provided earlier)
-    FMP_API_KEY: 6kqjitcYPxyr60Xy1Jfem92Q1z9LfCHM
-    EODHD_API_KEY: 6957671cac2858.27368157
 
     # DeepSeek API — used by the Business Analyst and Financial Modelling agents
-    DEEPSEEK_API_KEY: sk-9fe1b0635ca341f3bccbe222132e3461
+    DEEPSEEK_API_KEY: your-deepseek-api-key-here
     BUSINESS_ANALYST_LLM_PROVIDER: deepseek
     FM_LLM_PROVIDER: deepseek
 
@@ -285,10 +282,7 @@ services:
       - ./orchestration:/app/orchestration
       - ./charts:/app/charts
     command: >
-      sh -c "pip install -q pyngrok streamlit && 
-             ngrok http 8501 --log=stdout > /tmp/ngrok.log 2>&1 &
-             sleep 3 &&
-             cat /tmp/ngrok.log &&
+      sh -c "pip install -q streamlit && 
              streamlit run app.py --server.port 8501 --server.headless true --server.address 0.0.0.0"
     depends_on:
       postgres:
