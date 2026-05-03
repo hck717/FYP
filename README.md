@@ -7,6 +7,7 @@ An end-to-end multi-agent equity research platform that combines deterministic f
 - [System Overview](#system-overview)
 - [Current Orchestrated Agents](#current-orchestrated-agents)
 - [Quick Start](#quick-start)
+- [Configuring API Keys](#configuring-api-keys)
 - [Deployment Guide](#deployment-guide)
 - [Local Endpoints](#local-endpoints)
 - [Core Runtime Flow](#core-runtime-flow)
@@ -135,6 +136,275 @@ result = run("What is Apple's recent stock performance?")
 print(result["final_summary"])
 PY
 ```
+
+---
+
+## Configuring API Keys
+
+The repository includes placeholder API keys for local testing. For full functionality, you'll need to configure your own keys in two places:
+
+### Overview
+
+| API Key | Location | Required? | Use Case |
+|---------|----------|-----------|----------|
+| **EODHD_API_KEY** | `.env` file | Optional | Financial market data (stocks, indexes, commodities) |
+| **PERPLEXITY_API_KEY** | `.env` file | Optional | Real-time web search & news intelligence |
+| **DEEPSEEK_API_KEY** | `docker-compose.yml` | Required | LLM for agent analysis & reasoning |
+| **FMP_API_KEY** | `.env` file | Optional | Alternative financial data source (valuation, ratios) |
+
+**Quick Summary:**
+- **For testing locally:** Current placeholders work for basic queries
+- **For full features:** Add DEEPSEEK_API_KEY (required), PERPLEXITY_API_KEY (recommended), and financial data keys (optional)
+- **For production:** All keys must be configured with real/paid API credentials
+
+---
+
+### Step 1: Configure `.env` File (Financial Data & Search)
+
+The `.env` file is in your project root directory. Edit it to add your API keys:
+
+#### 1a. Get EODHD API Key (Optional - Financial Data)
+
+```bash
+# Get free key at: https://eodhd.com
+# Steps:
+# 1. Visit https://eodhd.com/register
+# 2. Sign up (free tier available)
+# 3. Copy your API key from dashboard
+# 4. Paste into .env
+
+# Edit .env
+nano .env  # or use your preferred editor
+```
+
+Find this line in `.env`:
+```env
+EODHD_API_KEY=your-key
+```
+
+Replace `your-key` with your actual EODHD API key:
+```env
+EODHD_API_KEY=abc123def456ghi789jkl
+```
+
+**Free Tier:** 20 requests/day (perfect for testing)
+**Paid Tier:** Unlimited requests (for production)
+
+#### 1b. Get Perplexity API Key (Optional - Real-time Web Search)
+
+```bash
+# Get key at: https://www.perplexity.ai
+# Steps:
+# 1. Visit https://www.perplexity.ai
+# 2. Sign in (free account or paid)
+# 3. Navigate to Settings → API Keys
+# 4. Create new API key
+# 5. Paste into .env
+```
+
+Find this line in `.env`:
+```env
+PERPLEXITY_API_KEY=your-perplexity-api-key-here
+```
+
+Replace with your actual key:
+```env
+PERPLEXITY_API_KEY=ppl-abc123def456
+```
+
+**Free Tier:** Limited requests (for testing)
+**Paid Tier:** Unlimited web search queries (recommended for production)
+
+#### 1c. Get FMP API Key (Optional - Alternative Financial Data)
+
+```bash
+# Get free key at: https://financialmodelingprep.com
+# Steps:
+# 1. Visit https://financialmodelingprep.com/developer/docs
+# 2. Sign up (free tier available)
+# 3. Copy your API key
+# 4. Paste into .env
+```
+
+Find this line in `.env`:
+```env
+FMP_API_KEY=your-key
+```
+
+Replace with your actual key:
+```env
+FMP_API_KEY=fmp_xyz789abc123
+```
+
+**Example:** Your `.env` file should look like this after configuration:
+
+```env
+# Financial Data APIs
+EODHD_API_KEY=abc123def456ghi789jkl
+FMP_API_KEY=fmp_xyz789abc123
+PERPLEXITY_API_KEY=ppl-abc123def456
+
+# Database (keep defaults for local)
+POSTGRES_HOST=localhost
+POSTGRES_PORT=5432
+POSTGRES_USER=airflow
+POSTGRES_PASSWORD=airflow
+# ... rest of .env file
+```
+
+**Verify:** After editing, restart services:
+```bash
+docker compose restart orchestration
+```
+
+---
+
+### Step 2: Configure `docker-compose.yml` (DeepSeek LLM - REQUIRED)
+
+The DeepSeek API key is configured in `docker-compose.yml`. This is **required** for the system to work.
+
+#### 2a. Get DeepSeek API Key
+
+```bash
+# Get key at: https://platform.deepseek.com
+# Steps:
+# 1. Visit https://platform.deepseek.com/sign_up
+# 2. Sign up (requires email verification)
+# 3. Add payment method (free trial credits available)
+# 4. Navigate to API Keys in dashboard
+# 5. Create new API key
+# 6. Copy the full key (starts with 'sk-')
+```
+
+#### 2b. Update `docker-compose.yml`
+
+Locate line 276 in `docker-compose.yml`:
+
+```yaml
+services:
+  orchestration:
+    # ... other config ...
+    environment:
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-sk-9fe1b0635ca341f3bccbe222132e3461}
+```
+
+There are two ways to configure this:
+
+**Option A: Direct Edit (Quickest)**
+
+Edit `docker-compose.yml` and replace the placeholder:
+
+```bash
+nano docker-compose.yml
+```
+
+Find line 276:
+```yaml
+DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-sk-9fe1b0635ca341f3bccbe222132e3461}
+```
+
+Replace with your key:
+```yaml
+DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-sk-your-actual-deepseek-key-here}
+```
+
+**Option B: Environment Variable (Recommended for Security)**
+
+Instead of editing `docker-compose.yml`, set it as an environment variable before starting services:
+
+```bash
+# Set the environment variable
+export DEEPSEEK_API_KEY=sk-your-actual-deepseek-key-here
+
+# Start services
+docker compose up -d --build
+
+# Verify it's set
+docker compose exec orchestration env | grep DEEPSEEK
+```
+
+Or add it to your `.env.local` file (not tracked by git):
+
+```bash
+# Create .env.local (not committed to git)
+echo "DEEPSEEK_API_KEY=sk-your-actual-deepseek-key-here" >> .env.local
+```
+
+Then load it before starting:
+```bash
+source .env.local
+docker compose up -d --build
+```
+
+#### 2c. Verify Configuration
+
+After updating, restart the orchestration service:
+
+```bash
+# Restart orchestration service with new DeepSeek key
+docker compose restart orchestration
+
+# Verify the service is running
+docker compose ps | grep orchestration
+
+# Check logs for successful initialization
+docker compose logs orchestration | grep -i deepseek
+```
+
+---
+
+### Step 3: Verify All Keys are Working
+
+Run the validation script to confirm all APIs are properly configured:
+
+```bash
+# Run validation
+./scripts/validate-deployment.sh
+
+# Expected output includes:
+# ✓ DEEPSEEK_API_KEY is configured
+# ✓ EODHD_API_KEY is configured (if set)
+# ✓ PERPLEXITY_API_KEY is configured (if set)
+# ✓ FMP_API_KEY is configured (if set)
+```
+
+Test a sample query to verify APIs are working:
+
+```bash
+python - <<'PY'
+from orchestration.graph import run
+
+# This query will use DEEPSEEK for reasoning + PERPLEXITY for web search
+result = run("What are the latest news about Apple's stock?")
+print(result["final_summary"])
+PY
+```
+
+---
+
+### Troubleshooting API Configuration
+
+**Q: "Invalid API key" error**
+- ✓ Check that you copied the entire key (no extra spaces)
+- ✓ Verify the key is active in your API dashboard
+- ✓ Restart services: `docker compose restart orchestration`
+
+**Q: "DEEPSEEK_API_KEY not found"**
+- ✓ This is required! Go to https://platform.deepseek.com and create an API key
+- ✓ Make sure you've updated `docker-compose.yml` line 276
+- ✓ Restart: `docker compose restart orchestration`
+
+**Q: "Connection timeout to API"**
+- ✓ Check your internet connection
+- ✓ Verify API credentials are correct
+- ✓ Check API quota limits in your dashboard
+- ✓ Some APIs require paid subscription for high-volume requests
+
+**Q: Where do I find my API key in my dashboard?**
+- **EODHD:** https://eodhd.com/account → API Key section
+- **Perplexity:** https://www.perplexity.ai → Settings → API Keys
+- **DeepSeek:** https://platform.deepseek.com → API Keys → View Key
+- **FMP:** https://financialmodelingprep.com/developer/docs → API Key section
 
 ---
 
