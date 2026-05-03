@@ -42,11 +42,11 @@ x-airflow-common:
     NEO4J_AUTH: neo4j/SecureNeo4jPass2025!
 
     # API keys (using the values you provided earlier)
-    FMP_API_KEY: 6kqjitcYPxyr60Xy1Jfem92Q1z9LfCHM
-    EODHD_API_KEY: 6957671cac2858.27368157
+    FMP_API_KEY: 
+    EODHD_API_KEY: 
 
     # DeepSeek API — used by the Business Analyst and Financial Modelling agents
-    DEEPSEEK_API_KEY: sk-9fe1b0635ca341f3bccbe222132e3461
+    DEEPSEEK_API_KEY: 
     BUSINESS_ANALYST_LLM_PROVIDER: deepseek
     FM_LLM_PROVIDER: deepseek
 
